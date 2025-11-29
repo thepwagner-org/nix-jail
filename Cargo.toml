@@ -1,0 +1,90 @@
+[package]
+name = "nix-jail"
+version = "0.2.0"
+edition = "2021"
+
+[lints.rust]
+# === MEMORY SAFETY ===
+unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "forbid"
+
+# === SECURITY ===
+non_ascii_idents = "forbid"
+missing_unsafe_on_extern = "forbid"
+
+# === CODE QUALITY ===
+unused_results = "warn"  # TODO: Fix 65+ violations, then change to "deny"
+missing_debug_implementations = "warn"
+variant_size_differences = "warn"
+
+[lints.clippy]
+# === DEVELOPMENT MARKERS ===
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+# === PANIC PREVENTION (warn for now, deny after fixing) ===
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+# === OUTPUT CONTROL ===
+print_stdout = "deny"
+print_stderr = "deny"
+exit = "deny"
+
+[dependencies]
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "time", "process", "io-util", "sync", "net", "signal"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+ulid = "1.2"
+clap = { version = "4.5", features = ["derive"] }
+tempfile = "3.0"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9"
+rand = "0.8"
+hex = "0.4"
+sha2 = "0.10"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "ansi"] }
+opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.32"
+chrono = "0.4"
+nu-ansi-term = "0.50"
+
+# Proxy dependencies
+hyper = { version = "1.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+http-body-util = "0.1"
+ipnetwork = "0.21"
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rcgen = "0.14"
+bytes = "1.0"
+webpki-roots = "1.0"
+time = "0.3"
+httparse = "1.9"
+regex = "1.12.2"
+nix = { version = "0.30", features = ["signal"] }
+moka = { version = "0.12", features = ["future", "sync"] }
+tokio-retry = "0.3"
+git2 = { version = "0.20.2", features = ["https", "vendored-openssl", "vendored-libgit2"] }
+octocrab = "0.48"
+
+# Network namespace management (Linux only)
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = "0.18"
+futures = "0.3"
+
+[build-dependencies]
+tonic-build = "0.14"
+tonic-prost-build = "0.14"

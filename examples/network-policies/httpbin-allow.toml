@@ -1,0 +1,8 @@
+# Allow access to httpbin.org/get only (demonstrates path-based filtering)
+# Used for testing HTTP/HTTPS requests through the proxy
+
+[[rules]]
+action = "allow"
+[rules.pattern]
+host = "httpbin\\.org"
+path = "/get"

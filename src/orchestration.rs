@@ -1,0 +1,1150 @@
+//! Job orchestration and execution coordination
+//!
+//! This module handles the complex orchestration of:
+//! - Workspace preparation
+//! - Proxy management
+//! - Job execution
+//! - Log streaming
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::SystemTime;
+use tokio::sync::{broadcast, mpsc};
+use tonic::Status;
+use tracing::Instrument;
+
+use crate::config::{Credential, CredentialType};
+use crate::executor::{create_executor, ExecutionConfig, HardeningProfile};
+use crate::jail::{LogEntry, LogSource, NetworkPolicy};
+use crate::job_dir::JobDirectory;
+use crate::job_workspace::JobWorkspace;
+use crate::proxy_manager::ProxyManager;
+use crate::storage::{JobMetadata, JobStatus, JobStorage, LogEntry as StorageLogEntry};
+use crate::streaming;
+use crate::workspace;
+
+/// Extract credential names referenced in a network policy
+fn extract_credential_names(policy: Option<&NetworkPolicy>) -> HashSet<String> {
+    let mut names = HashSet::new();
+
+    if let Some(policy) = policy {
+        for rule in &policy.rules {
+            if let Some(ref cred_name) = rule.credential {
+                let _ = names.insert(cred_name.clone());
+            }
+        }
+    }
+
+    names
+}
+
+/// Filter credentials to only those referenced in the policy
+fn filter_credentials<'a>(
+    all_credentials: &'a [Credential],
+    policy: Option<&NetworkPolicy>,
+) -> Vec<&'a Credential> {
+    let referenced_names = extract_credential_names(policy);
+
+    all_credentials
+        .iter()
+        .filter(|c| referenced_names.contains(&c.name))
+        .collect()
+}
+
+/// Check if any of the credentials has the specified type
+fn has_credential_with_type(credentials: &[&Credential], cred_type: CredentialType) -> bool {
+    credentials.iter().any(|c| c.credential_type == cred_type)
+}
+
+/// Serve stored logs for a completed job
+pub async fn serve_stored_logs(
+    job_id: String,
+    storage: JobStorage,
+    tx: mpsc::Sender<Result<LogEntry, Status>>,
+) {
+    tracing::debug!(job_id = %job_id, "serving stored logs");
+
+    // Spawn task to serve stored logs (intentionally detached, communicates via channel)
+    drop(tokio::spawn(async move {
+        match storage.get_logs(&job_id) {
+            Ok(logs) => {
+                for log in logs {
+                    let timestamp_secs = log
+                        .timestamp
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+
+                    let entry = LogEntry {
+                        content: log.message,
+                        timestamp: Some(prost_types::Timestamp {
+                            seconds: timestamp_secs,
+                            nanos: 0,
+                        }),
+                        source: log.source,
+                    };
+
+                    if tx.send(Ok(entry)).await.is_err() {
+                        tracing::warn!(job_id = %job_id, "client disconnected while serving logs");
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(job_id = %job_id, error = %e, "failed to get logs");
+                let _ = tx
+                    .send(Err(Status::internal("Failed to retrieve logs")))
+                    .await;
+            }
+        }
+    }));
+}
+
+/// Execute a job and stream logs in real-time via broadcast channel
+///
+/// This function is designed to be spawned as a background task by the caller.
+/// It uses a broadcast channel to allow multiple clients to subscribe to the same job's output.
+/// Note: This function is called from within an instrumented span created by the service layer.
+pub async fn execute_job(
+    job: JobMetadata,
+    storage: JobStorage,
+    config: crate::config::ServerConfig,
+    tx: broadcast::Sender<Result<LogEntry, Status>>,
+    registry: crate::job_registry::JobRegistry,
+    job_root: Arc<dyn crate::root::JobRoot>,
+    job_workspace: Arc<dyn JobWorkspace>,
+) {
+    tracing::debug!(status = %job.status.to_string(), "executing job");
+
+    // Create platform-specific executor early so we can use its methods
+    let executor = create_executor();
+
+    let job_id = job.id.clone();
+    let packages = job.packages.clone();
+    let script = job.script.clone();
+    let repo = job.repo.clone();
+    let path = job.path.clone();
+    let git_ref = job.git_ref.clone();
+    let is_exec_mode = !packages.is_empty();
+    // Fetch GitHub token if needed for git cloning
+    let github_token = if !repo.is_empty() {
+        // Look for GitHub credential in server config
+        if let Some(github_cred) = config
+            .credentials
+            .iter()
+            .find(|c| c.credential_type == crate::config::CredentialType::GitHub)
+        {
+            match crate::config::fetch_credential_token(github_cred).await {
+                Ok(token) => {
+                    tracing::info!(job_id = %job_id, "fetched github token for private repository access");
+                    Some(token)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        error = %e,
+                        "failed to fetch github token, will attempt public clone"
+                    );
+                    None
+                }
+            }
+        } else {
+            tracing::debug!(job_id = %job_id, "no github credential configured, cloning as public repository");
+            None
+        }
+    } else {
+        None
+    };
+
+    // Create job directory structure
+    let state_dir = match config.state_dir.canonicalize() {
+        Ok(path) => path,
+        Err(e) => {
+            send_error(
+                &job_id,
+                format!("Failed to resolve state_dir to absolute path: {}", e),
+                &storage,
+                &tx,
+            )
+            .await;
+            let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+            return;
+        }
+    };
+
+    let job_dir = match JobDirectory::new(&state_dir, &job_id) {
+        Ok(dir) => dir,
+        Err(e) => {
+            send_error(
+                &job_id,
+                format!("Failed to create job directory: {}", e),
+                &storage,
+                &tx,
+            )
+            .await;
+            let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+            return;
+        }
+    };
+
+    // Set up workspace (git clone, caching, etc.)
+    let workspace_dir = {
+        let result = job_workspace
+            .setup(
+                &job_dir.workspace,
+                &repo,
+                git_ref.as_deref(),
+                Some(&path),
+                github_token.as_deref(),
+            )
+            .instrument(tracing::info_span!("setup_workspace"))
+            .await;
+        match result {
+            Ok(dir) => {
+                tracing::info!(
+                    workspace_dir = %dir.display(),
+                    "workspace prepared"
+                );
+                dir
+            }
+            Err(e) => {
+                send_error(
+                    &job_id,
+                    format!("Failed to prepare workspace: {}", e),
+                    &storage,
+                    &tx,
+                )
+                .await;
+                let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+                return;
+            }
+        }
+    };
+
+    // Detect flake.nix in workspace
+    let has_flake = workspace::flake::detect_flake(&workspace_dir);
+
+    // Capture git state before execution (if push enabled and repo provided)
+    let (head_before, base_branch) = if job.push && !repo.is_empty() {
+        let head = workspace::git_refs::get_head_commit(&workspace_dir).ok();
+        let branch = workspace::git_refs::get_current_branch(&workspace_dir).ok();
+        (head, branch)
+    } else {
+        (None, None)
+    };
+
+    // Only start proxy if network policy has rules
+    let has_network_rules = job
+        .network_policy
+        .as_ref()
+        .map(|policy| !policy.rules.is_empty())
+        .unwrap_or(false);
+
+    // Phase 1: Create proxy config (early) - doesn't create root directory
+    // The actual proxy start is delayed until after prepare_root creates the root
+    let proxy_config_path = if has_network_rules {
+        // Filter credentials to only those referenced in the network policy
+        let filtered_credentials =
+            filter_credentials(&config.credentials, job.network_policy.as_ref());
+
+        // Generate proxy authentication credentials
+        let proxy_username = Some(format!("job-{}", job_id));
+        let proxy_password = Some(workspace::generate_proxy_password());
+
+        // Create proxy config in job_dir.base (outside sandbox)
+        // CA cert will be written to job_dir.root/etc/ssl/certs/ (host path)
+        // Inside sandbox, it appears at CA_CERT_CHROOT_PATH
+        let ca_cert_host_path =
+            crate::proxy_manager::ProxyManager::ca_cert_host_path(&job_dir.root);
+        let config_result = workspace::write_proxy_config(
+            &job_dir.base,
+            &ca_cert_host_path,
+            executor.proxy_listen_addr(),
+            job.network_policy.clone(),
+            &filtered_credentials,
+            proxy_username,
+            proxy_password,
+        );
+
+        match config_result {
+            Ok(path) => {
+                let credential_names: Vec<&str> = filtered_credentials
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect();
+                tracing::info!(
+                    path = %path.display(),
+                    credentials = ?credential_names,
+                    "created proxy config"
+                );
+
+                if let Some(ref policy) = job.network_policy {
+                    send_info(
+                        &job_id,
+                        format!(
+                            "Network policy configured with {} rules",
+                            policy.rules.len()
+                        ),
+                        &storage,
+                        &tx,
+                    )
+                    .await;
+                }
+                Some(path)
+            }
+            Err(e) => {
+                let error_msg = format!("Failed to configure proxy: {}", e);
+                tracing::error!(job_id = %job_id, error = %error_msg, "Failed to create proxy config");
+                send_error(&job_id, error_msg, &storage, &tx).await;
+                return;
+            }
+        }
+    } else {
+        // No network policy or empty rules - skip proxy entirely and block all network access
+        tracing::info!("no network rules configured - skipping proxy (network will be blocked)");
+        send_info(
+            &job_id,
+            "Network access blocked (no policy or empty rules)".to_string(),
+            &storage,
+            &tx,
+        )
+        .await;
+        None
+    };
+
+    // Check if workspace has a flake - if so, use it instead of explicit packages
+    let store_paths = if has_flake {
+        // Flake detected - use flake shell and ignore explicit packages
+        if !packages.is_empty() {
+            let pkg_list = packages.join(", ");
+            send_info(
+                &job_id,
+                format!(
+                    "Found flake.nix - using flake shell (ignoring specified packages: {})",
+                    pkg_list
+                ),
+                &storage,
+                &tx,
+            )
+            .await;
+        }
+
+        send_info(
+            &job_id,
+            format!("Computing flake closure from {}", workspace_dir.display()),
+            &storage,
+            &tx,
+        )
+        .await;
+
+        match workspace::compute_flake_closure(&workspace_dir).await {
+            Ok(paths) => {
+                tracing::info!(
+                    job_id = %job_id,
+                    path_count = paths.len(),
+                    "computed flake closure"
+                );
+                send_info(
+                    &job_id,
+                    format!("Flake closure: {} store paths", paths.len()),
+                    &storage,
+                    &tx,
+                )
+                .await;
+                paths
+            }
+            Err(e) => {
+                send_error(
+                    &job_id,
+                    format!("Failed to compute flake closure: {}", e),
+                    &storage,
+                    &tx,
+                )
+                .await;
+                let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+                return;
+            }
+        }
+    } else {
+        // No flake - use explicit packages (original behavior)
+        let nixpkgs_version = job.nixpkgs_version.as_deref();
+        let store_paths = find_packages(
+            is_exec_mode,
+            &packages,
+            nixpkgs_version,
+            &job_id,
+            &storage,
+            &tx,
+        )
+        .instrument(tracing::info_span!("resolve_packages"))
+        .await;
+        match store_paths {
+            Some(paths) => paths,
+            None => return, // Error already logged
+        }
+    };
+
+    // Compute full closure once (used for both cache and executor)
+    let closure = if !store_paths.is_empty() {
+        match workspace::compute_combined_closure(&store_paths)
+            .instrument(tracing::info_span!("compute_closure"))
+            .await
+        {
+            Ok(c) => {
+                tracing::info!(closure_count = c.len(), "computed full closure");
+                c
+            }
+            Err(e) => {
+                send_error(
+                    &job_id,
+                    format!("Failed to compute closure: {}", e),
+                    &storage,
+                    &tx,
+                )
+                .await;
+                let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+                return;
+            }
+        }
+    } else {
+        vec![]
+    };
+
+    // Create root directory using JobRoot trait (btrfs snapshot or copy from cache)
+    let (store_setup, cache_hit) = match job_root
+        .create(&job_dir.root, &closure)
+        .instrument(tracing::info_span!("prepare_root"))
+        .await
+    {
+        Ok((setup, hit)) => {
+            // Send appropriate info message based on strategy and result
+            let msg = match (&setup, hit) {
+                (crate::root::StoreSetup::Populated, true) => {
+                    "Cache hit: root created from snapshot".to_string()
+                }
+                (crate::root::StoreSetup::Populated, false) => {
+                    "Cache miss: created and cached closure".to_string()
+                }
+                (crate::root::StoreSetup::BindMounts { paths }, _) => {
+                    format!("Using bind-mount strategy ({} store paths)", paths.len())
+                }
+            };
+            send_info(&job_id, msg, &storage, &tx).await;
+            (setup, hit)
+        }
+        Err(e) => {
+            send_error(
+                &job_id,
+                format!("Failed to prepare root: {}", e),
+                &storage,
+                &tx,
+            )
+            .await;
+            let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+            return;
+        }
+    };
+    let _ = cache_hit; // Silence unused warning, info logged above
+
+    // Phase 2: Start proxy now that root exists (proxy writes cert to root/etc/ssl/certs/)
+    let mut proxy = if let Some(ref config_path) = proxy_config_path {
+        match start_proxy(
+            &job_id,
+            job_dir.root.clone(),
+            config_path.clone(),
+            executor.proxy_listen_addr(),
+            &storage,
+            &tx,
+        )
+        .instrument(tracing::info_span!("start_proxy"))
+        .await
+        {
+            Some(p) => Some(p),
+            None => return, // Error already logged
+        }
+    } else {
+        None
+    };
+
+    // Configure execution environment
+    let mut env = build_environment(
+        proxy.as_ref(),
+        &workspace_dir,
+        executor.proxy_connect_host(),
+        executor.uses_chroot(),
+        &job_dir.root,
+    );
+
+    // Update PATH with package binaries
+    if !store_paths.is_empty() {
+        let path_env = workspace::build_path_env(&store_paths);
+        let current_path = env.get("PATH").cloned().unwrap_or_default();
+        let _ = env.insert("PATH".to_string(), format!("{}:{}", path_env, current_path));
+    }
+
+    // Configure Claude Code access if a Claude credential is referenced
+    let filtered_credentials = filter_credentials(&config.credentials, job.network_policy.as_ref());
+    if has_credential_with_type(&filtered_credentials, CredentialType::Claude) {
+        match workspace::setup_claude_config(&workspace_dir, &job_id, &filtered_credentials) {
+            Ok(()) => {
+                // Prepend wrapper bin directory to PATH so our security wrapper is used
+                let wrapper_bin = job_dir.base.join("bin");
+                if wrapper_bin.exists() {
+                    let current_path = env.get("PATH").map(|s| s.as_str()).unwrap_or("");
+                    let _ = env.insert(
+                        "PATH".to_string(),
+                        format!("{}:{}", wrapper_bin.display(), current_path),
+                    );
+                    tracing::info!(job_id = %job_id, "added security wrapper to PATH");
+                }
+                tracing::info!(job_id = %job_id, "claude code configured with dummy token (proxy will inject real token)");
+                send_info(
+                    &job_id,
+                    "Claude Code configured (OAuth via proxy injection)".to_string(),
+                    &storage,
+                    &tx,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(job_id = %job_id, error = %e, "failed to copy claude configuration");
+                send_info(
+                    &job_id,
+                    format!("Warning: Could not configure Claude Code: {}", e),
+                    &storage,
+                    &tx,
+                )
+                .await;
+            }
+        }
+    }
+
+    // Configure GitHub token if a GitHub credential is referenced
+    if has_credential_with_type(&filtered_credentials, CredentialType::GitHub) {
+        // Find the GitHub credential and get its dummy token
+        if let Some(github_cred) = filtered_credentials
+            .iter()
+            .find(|c| c.credential_type == CredentialType::GitHub)
+        {
+            if let Some(ref dummy_token) = github_cred.dummy_token {
+                let _ = env.insert("GITHUB_TOKEN".to_string(), dummy_token.clone());
+                tracing::info!(job_id = %job_id, "set GITHUB_TOKEN with dummy token (proxy will inject real token)");
+                send_info(
+                    &job_id,
+                    "GitHub token configured (proxy will inject real token)".to_string(),
+                    &storage,
+                    &tx,
+                )
+                .await;
+            } else {
+                tracing::warn!(job_id = %job_id, "github credential has no dummy_token configured");
+                send_info(
+                    &job_id,
+                    "Warning: GitHub credential has no dummy_token (GITHUB_TOKEN not set)"
+                        .to_string(),
+                    &storage,
+                    &tx,
+                )
+                .await;
+            }
+        }
+    }
+
+    let command = build_command(is_exec_mode, script);
+
+    // Working directory was already resolved by job_workspace.setup() based on path
+    let exec_working_dir = workspace_dir.clone();
+
+    // Parse hardening profile from job metadata
+    let hardening_profile = {
+        use std::str::FromStr;
+        let profile_str = job.hardening_profile.as_deref().unwrap_or("default");
+        match HardeningProfile::from_str(profile_str) {
+            Ok(profile) => profile,
+            Err(e) => {
+                send_error(
+                    &job_id,
+                    format!("Invalid hardening profile '{}': {}", profile_str, e),
+                    &storage,
+                    &tx,
+                )
+                .await;
+                return;
+            }
+        }
+    };
+
+    let exec_config = ExecutionConfig {
+        job_id: job_id.clone(),
+        command,
+        env,
+        working_dir: exec_working_dir,
+        root_dir: job_dir.root.clone(),
+        store_setup,
+        timeout: std::time::Duration::from_secs(3600),
+        store_paths: closure.clone(), // For command path resolution
+        proxy_port: proxy.as_ref().map(|p| p.port),
+        hardening_profile,
+    };
+
+    // Execute job using platform-specific executor (created earlier)
+    let handle = match executor
+        .execute(exec_config)
+        .instrument(tracing::info_span!("executor_start"))
+        .await
+    {
+        Ok(h) => {
+            tracing::debug!(job_id = %job_id, "job execution started");
+            h
+        }
+        Err(e) => {
+            send_error(
+                &job_id,
+                format!("Failed to execute job: {}", e),
+                &storage,
+                &tx,
+            )
+            .await;
+            let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+            return;
+        }
+    };
+
+    let stdout_task = spawn_stream_task(
+        job_id.clone(),
+        LogSource::JobStdout,
+        handle.stdout,
+        storage.clone(),
+        tx.clone(),
+    );
+
+    let stderr_task = spawn_stream_task(
+        job_id.clone(),
+        LogSource::JobStderr,
+        handle.stderr,
+        storage.clone(),
+        tx.clone(),
+    );
+
+    let proxy_tasks = if let Some(ref mut proxy) = proxy {
+        let proxy_stdout = match proxy.take_stdout() {
+            Some(s) => s,
+            None => {
+                tracing::error!(job_id = %job_id, "proxy stdout not available");
+                send_error(
+                    &job_id,
+                    "proxy stdout not available".to_string(),
+                    &storage,
+                    &tx,
+                )
+                .await;
+                let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+                return;
+            }
+        };
+
+        let proxy_stderr = match proxy.take_stderr() {
+            Some(s) => s,
+            None => {
+                tracing::error!(job_id = %job_id, "proxy stderr not available");
+                send_error(
+                    &job_id,
+                    "proxy stderr not available".to_string(),
+                    &storage,
+                    &tx,
+                )
+                .await;
+                let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+                return;
+            }
+        };
+
+        let proxy_stdout_task = spawn_stream_task(
+            job_id.clone(),
+            LogSource::ProxyStdout,
+            proxy_stdout,
+            storage.clone(),
+            tx.clone(),
+        );
+
+        let proxy_stderr_task = spawn_stream_task(
+            job_id.clone(),
+            LogSource::ProxyStderr,
+            proxy_stderr,
+            storage.clone(),
+            tx.clone(),
+        );
+        Some((proxy_stdout_task, proxy_stderr_task))
+    } else {
+        None
+    };
+
+    tracing::debug!("waiting for job to exit");
+    let exit_code = async { handle.exit_code.await.unwrap_or(-1) }
+        .instrument(tracing::info_span!("run_job"))
+        .await;
+    tracing::debug!(exit_code = exit_code, "job exited");
+
+    // Stop proxy and wait for stream tasks to finish
+    async {
+        if let Some(ref mut proxy) = proxy {
+            proxy.stop().await;
+        }
+
+        if let Some((proxy_stdout_task, proxy_stderr_task)) = proxy_tasks {
+            let _ = tokio::join!(
+                stdout_task,
+                stderr_task,
+                proxy_stdout_task,
+                proxy_stderr_task
+            );
+        } else {
+            let _ = tokio::join!(stdout_task, stderr_task);
+        }
+    }
+    .instrument(tracing::info_span!("drain_streams"))
+    .await;
+
+    // Note: Executor cleanup (sandbox profile, network namespace, etc.) is handled
+    // internally by each executor implementation when the job exits.
+
+    let final_status = if exit_code == 0 {
+        JobStatus::Completed
+    } else {
+        JobStatus::Failed
+    };
+
+    let msg = format!("[DONE] Job exited with code: {}\n", exit_code);
+    let _ = storage.append_log(
+        &job_id,
+        &StorageLogEntry {
+            timestamp: SystemTime::now(),
+            message: msg.clone(),
+            source: LogSource::System as i32,
+        },
+    );
+
+    let _ = tx.send(Ok(LogEntry {
+        content: msg,
+        timestamp: Some(prost_types::Timestamp {
+            seconds: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            nanos: 0,
+        }),
+        source: LogSource::System as i32,
+    }));
+
+    // Handle PR creation if push is enabled
+    if job.push && !repo.is_empty() && exit_code == 0 {
+        if let (Some(before_sha), Some(original_branch)) = (head_before, base_branch) {
+            match handle_pr_creation(PrCreationContext {
+                repo_dir: &workspace_dir,
+                job_id: &job_id,
+                repo_url: &repo,
+                head_before: &before_sha,
+                base_branch: &original_branch,
+                config: &config,
+                storage: &storage,
+                tx: &tx,
+            })
+            .await
+            {
+                Ok(pr_url) => {
+                    send_info(
+                        &job_id,
+                        format!("Pull request created: {}", pr_url),
+                        &storage,
+                        &tx,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    send_info(
+                        &job_id,
+                        format!("PR creation skipped: {}", e),
+                        &storage,
+                        &tx,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    let _ = storage.update_job_status(&job_id, final_status.clone());
+    tracing::info!(exit_code = exit_code, status = %final_status.to_string(), "job completed");
+
+    // Remove job from registry - this closes the broadcast channel
+    // so clients stop waiting while we clean up
+    registry.remove(&job_id).await;
+
+    // Cleanup root directory and workspace
+    let _cleanup_span = tracing::info_span!("cleanup").entered();
+    if let Err(e) = job_root.cleanup(&job_dir.root) {
+        tracing::warn!(error = %e, "failed to cleanup root directory");
+    }
+    if let Err(e) = job_workspace.cleanup(&job_dir.workspace) {
+        tracing::warn!(error = %e, "failed to cleanup workspace");
+    }
+    drop(_cleanup_span);
+}
+
+// Helper functions
+
+async fn start_proxy(
+    job_id: &str,
+    root_dir: std::path::PathBuf,
+    proxy_config_path: std::path::PathBuf,
+    proxy_listen_addr: &str,
+    storage: &JobStorage,
+    tx: &broadcast::Sender<Result<LogEntry, Status>>,
+) -> Option<ProxyManager> {
+    // Get platform-specific listen host from the provided address
+    let listen_host = proxy_listen_addr
+        .split(':')
+        .next()
+        .unwrap_or("127.0.0.1")
+        .to_string();
+
+    match ProxyManager::start(job_id.to_string(), root_dir, proxy_config_path, listen_host).await {
+        Ok(p) => {
+            tracing::debug!(job_id = %job_id, port = p.port, listen_host = %p.listen_host, "proxy started");
+            Some(p)
+        }
+        Err(e) => {
+            send_error(job_id, format!("Failed to start proxy: {}", e), storage, tx).await;
+            let _ = storage.update_job_status(job_id, JobStatus::Failed);
+            None
+        }
+    }
+}
+
+fn build_environment(
+    proxy: Option<&ProxyManager>,
+    working_dir: &Path,
+    proxy_connect_host: &str,
+    uses_chroot: bool,
+    root_dir: &Path,
+) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+
+    // Proxy configuration (only if proxy is running)
+    if let Some(proxy) = proxy {
+        // Build proxy URL with platform-specific connect address and credentials
+        // connect_host is where the job connects (10.0.0.1 on Linux, 127.0.0.1 on macOS)
+        let proxy_url = proxy.proxy_url_with_host(proxy_connect_host);
+        let _ = env.insert("HTTP_PROXY".to_string(), proxy_url.clone());
+        let _ = env.insert("HTTPS_PROXY".to_string(), proxy_url);
+
+        // CA cert path depends on executor type:
+        // - Linux (chroot): use chroot-relative path (e.g., /etc/ssl/certs/ca-certificates.crt)
+        // - macOS (no chroot): use full host path (e.g., /tmp/nix-jail-.../root/etc/ssl/certs/...)
+        let ca_cert_path = if uses_chroot {
+            crate::proxy_manager::CA_CERT_CHROOT_PATH.to_string()
+        } else {
+            crate::proxy_manager::ProxyManager::ca_cert_host_path(root_dir)
+                .to_string_lossy()
+                .to_string()
+        };
+        let _ = env.insert("SSL_CERT_FILE".to_string(), ca_cert_path.clone());
+        let _ = env.insert("NODE_EXTRA_CA_CERTS".to_string(), ca_cert_path.clone());
+        let _ = env.insert("REQUESTS_CA_BUNDLE".to_string(), ca_cert_path);
+        let _ = env.insert("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string());
+    }
+
+    // Sandbox isolation
+    let _ = env.insert(
+        "HOME".to_string(),
+        working_dir.to_string_lossy().to_string(),
+    );
+
+    let _ = env.insert("USER".to_string(), "sbc-admin".to_string());
+    let _ = env.insert("LOGNAME".to_string(), "sbc-admin".to_string());
+
+    let _ = env.insert("TMPDIR".to_string(), "/tmp".to_string());
+
+    env
+}
+
+async fn find_packages(
+    is_exec_mode: bool,
+    packages: &[String],
+    nixpkgs_version: Option<&str>,
+    job_id: &str,
+    storage: &JobStorage,
+    tx: &broadcast::Sender<Result<LogEntry, Status>>,
+) -> Option<Vec<std::path::PathBuf>> {
+    if is_exec_mode {
+        let pkg_refs: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
+        match workspace::find_nix_packages_cached(&pkg_refs, nixpkgs_version).await {
+            Ok(paths) => {
+                let version_info = nixpkgs_version.unwrap_or("(none)");
+                tracing::info!(packages = ?packages, nixpkgs_version = %version_info, "found nix packages");
+                Some(paths)
+            }
+            Err(e) => {
+                send_error(
+                    job_id,
+                    format!("Failed to find packages: {}", e),
+                    storage,
+                    tx,
+                )
+                .await;
+                let _ = storage.update_job_status(job_id, JobStatus::Failed);
+                None
+            }
+        }
+    } else {
+        // Submit mode: use curl for now
+        match workspace::find_nix_package("curl").await {
+            Ok(curl_path) => Some(vec![curl_path]),
+            Err(e) => {
+                tracing::warn!(job_id = %job_id, error = %e, "failed to find curl");
+                Some(vec![])
+            }
+        }
+    }
+}
+
+/// Detect hashbang from script content and return (interpreter_name, is_bash)
+fn detect_hashbang(script: &str) -> Option<(String, bool)> {
+    let first_line = script.lines().next()?;
+    if !first_line.starts_with("#!") {
+        return None;
+    }
+
+    let shebang = first_line.trim_start_matches("#!").trim();
+
+    // Handle "#!/usr/bin/env bash" or "#!/usr/bin/env python3"
+    if shebang.contains("/env ") || shebang.contains("/env\t") {
+        let binary = shebang.split_whitespace().last()?;
+        let is_bash = binary == "bash" || binary == "sh";
+        return Some((binary.to_string(), is_bash));
+    }
+
+    // Handle "#!/bin/bash" or "#!/usr/bin/python3"
+    let binary = shebang.split('/').next_back()?.split_whitespace().next()?;
+    let is_bash = binary == "bash" || binary == "sh";
+    Some((binary.to_string(), is_bash))
+}
+
+fn build_command(is_exec_mode: bool, script: String) -> Vec<String> {
+    if is_exec_mode {
+        // Check for hashbang to determine interpreter
+        if let Some((interpreter, is_bash)) = detect_hashbang(&script) {
+            if !is_bash {
+                // Non-bash interpreter: execute with that interpreter
+                tracing::info!(
+                    "detected non-bash interpreter '{}', executing directly",
+                    interpreter
+                );
+                return vec![interpreter, "-c".to_string(), script];
+            }
+        }
+        // Default to bash (either explicit bash hashbang or no hashbang)
+        vec!["bash".to_string(), "-c".to_string(), script]
+    } else {
+        vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            "echo '=== Proxy Configuration ===' && \
+             echo \"HTTP_PROXY=$HTTP_PROXY\" && \
+             echo \"HTTPS_PROXY=$HTTPS_PROXY\" && \
+             echo \"SSL_CERT_FILE=$SSL_CERT_FILE\" && \
+             echo '=== Testing Direct Access (should fail) ===' && \
+             (curl -s --max-time 1 --noproxy '*' https://httpbin.org/anything 2>&1 || echo 'Direct access blocked (expected)') && \
+             echo '=== Testing HTTPS via Proxy (should succeed) ===' && \
+             curl -s --http1.1 https://httpbin.org/anything 2>&1 && \
+             echo '=== Workspace Files ===' && \
+             for f in *; do echo \"$f\"; done && \
+             echo '=== Test Complete ===' && \
+             exit 0"
+                .to_string(),
+        ]
+    }
+}
+
+async fn send_info(
+    job_id: &str,
+    message: String,
+    storage: &JobStorage,
+    tx: &broadcast::Sender<Result<LogEntry, Status>>,
+) {
+    tracing::info!(info = %message, "job info");
+    let msg = format!("[INFO] {}\n", message);
+
+    let _ = storage.append_log(
+        job_id,
+        &StorageLogEntry {
+            timestamp: SystemTime::now(),
+            message: msg.clone(),
+            source: LogSource::System as i32,
+        },
+    );
+
+    let _ = tx.send(Ok(LogEntry {
+        content: msg,
+        timestamp: Some(prost_types::Timestamp {
+            seconds: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            nanos: 0,
+        }),
+        source: LogSource::System as i32,
+    }));
+}
+
+async fn send_error(
+    job_id: &str,
+    message: String,
+    storage: &JobStorage,
+    tx: &broadcast::Sender<Result<LogEntry, Status>>,
+) {
+    tracing::error!(error = %message, "job error");
+    let msg = format!("[ERROR] {}\n", message);
+
+    let _ = storage.append_log(
+        job_id,
+        &StorageLogEntry {
+            timestamp: SystemTime::now(),
+            message: msg.clone(),
+            source: LogSource::System as i32,
+        },
+    );
+
+    let _ = tx.send(Ok(LogEntry {
+        content: msg,
+        timestamp: Some(prost_types::Timestamp {
+            seconds: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            nanos: 0,
+        }),
+        source: LogSource::System as i32,
+    }));
+}
+
+fn spawn_stream_task(
+    job_id: String,
+    source: LogSource,
+    receiver: mpsc::Receiver<String>,
+    storage: JobStorage,
+    tx: broadcast::Sender<Result<LogEntry, Status>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move { streaming::stream_logs(job_id, source, receiver, storage, tx).await })
+}
+
+/// Configuration for PR creation
+struct PrCreationContext<'a> {
+    repo_dir: &'a Path,
+    job_id: &'a str,
+    repo_url: &'a str,
+    head_before: &'a str,
+    base_branch: &'a str,
+    config: &'a crate::config::ServerConfig,
+    storage: &'a JobStorage,
+    tx: &'a broadcast::Sender<Result<LogEntry, Status>>,
+}
+
+async fn handle_pr_creation(
+    ctx: PrCreationContext<'_>,
+) -> Result<String, workspace::WorkspaceError> {
+    let PrCreationContext {
+        repo_dir,
+        job_id,
+        repo_url,
+        head_before,
+        base_branch,
+        config,
+        storage,
+        tx,
+    } = ctx;
+
+    // Check if HEAD moved (commits were made)
+    let head_after = workspace::git_refs::get_head_commit(repo_dir)?;
+    if head_before == head_after {
+        return Err(workspace::WorkspaceError::InvalidPath(
+            "No commits detected".into(),
+        ));
+    }
+
+    tracing::info!(
+        job_id = %job_id,
+        before = %head_before,
+        after = %head_after,
+        "commits detected, creating PR"
+    );
+
+    send_info(
+        job_id,
+        format!(
+            "Detected commits ({} -> {}), preparing pull request...",
+            &head_before[..8],
+            &head_after[..8]
+        ),
+        storage,
+        tx,
+    )
+    .await;
+
+    // Get commit messages for PR body
+    let commits = workspace::git_refs::get_commits_between(repo_dir, head_before, &head_after)?;
+
+    // Create a new branch job-${jobID} for the PR
+    let pr_branch = format!("job-{}", job_id);
+    workspace::git_refs::create_and_checkout_branch(repo_dir, &pr_branch)?;
+
+    send_info(
+        job_id,
+        format!("Created branch '{}' for pull request", pr_branch),
+        storage,
+        tx,
+    )
+    .await;
+
+    // Get GitHub token
+    let github_cred = config
+        .credentials
+        .iter()
+        .find(|c| c.credential_type == crate::config::CredentialType::GitHub)
+        .ok_or_else(|| {
+            workspace::WorkspaceError::InvalidPath("No GitHub credential configured".into())
+        })?;
+
+    let token = crate::config::fetch_credential_token(github_cred)
+        .await
+        .map_err(|e| {
+            workspace::WorkspaceError::InvalidPath(format!("Failed to fetch GitHub token: {}", e))
+        })?;
+
+    // Push the new branch
+    send_info(
+        job_id,
+        format!("Pushing branch '{}' to remote...", pr_branch),
+        storage,
+        tx,
+    )
+    .await;
+
+    workspace::git_refs::push_branch(repo_dir, &pr_branch, &token, repo_url)?;
+
+    // Create PR: job-${jobID} -> base_branch
+    send_info(
+        job_id,
+        format!("Creating pull request: {} -> {}", pr_branch, base_branch),
+        storage,
+        tx,
+    )
+    .await;
+
+    let pr_url =
+        workspace::pr::create_pull_request(repo_url, &pr_branch, base_branch, &commits, &token)
+            .await?;
+
+    Ok(pr_url)
+}

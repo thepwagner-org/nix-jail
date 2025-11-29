@@ -1,0 +1,7 @@
+# ⚠️  DANGER: Allow ALL network access
+# This policy allows access to ANY host - only use for testing!
+
+[[rules]]
+action = "allow"
+[rules.pattern]
+host = ".*"

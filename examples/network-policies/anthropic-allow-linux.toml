@@ -1,0 +1,8 @@
+# Allow access to Anthropic API with credential injection
+# Requires "anthropic" credential configured in server.toml
+
+[[rules]]
+action = "allow"
+credential = "anthropic-linux"
+[rules.pattern]
+host = "api\\.anthropic\\.com"

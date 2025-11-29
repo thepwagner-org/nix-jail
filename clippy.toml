@@ -1,0 +1,7 @@
+# Clippy configuration for nix-jail
+# Security-critical sandboxing project - strict rules for production code
+
+# Allow expect/unwrap in tests - they're acceptable for test assertions
+# Production code should use proper error handling
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true

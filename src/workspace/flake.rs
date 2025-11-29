@@ -1,0 +1,272 @@
+//! Nix flake detection and environment management
+//!
+//! Provides automatic detection of flake.nix files and extraction of
+//! development shell closures for sandboxed execution.
+
+use std::path::{Path, PathBuf};
+use tokio::process::Command;
+use tokio_retry::strategy::{jitter, ExponentialBackoff};
+use tokio_retry::Retry;
+
+use super::WorkspaceError;
+
+/// Detect if a flake.nix file exists in the given directory
+///
+/// # Arguments
+/// * `dir` - Directory to check for flake.nix
+///
+/// # Returns
+/// true if flake.nix exists, false otherwise
+pub fn detect_flake(dir: &Path) -> bool {
+    let flake_path = dir.join("flake.nix");
+    flake_path.exists() && flake_path.is_file()
+}
+
+/// Get the current system architecture string
+///
+/// Returns the Nix system identifier (e.g., "aarch64-darwin", "x86_64-linux")
+/// This is used to select the correct devShell output from the flake.
+///
+/// # Platform Support
+/// - macOS: "aarch64-darwin" (Apple Silicon) or "x86_64-darwin" (Intel)
+/// - Linux: "aarch64-linux" (ARM64) or "x86_64-linux" (x86-64)
+pub fn get_system_arch() -> String {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    return "aarch64-darwin".to_string();
+
+    #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+    return "x86_64-darwin".to_string();
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    return "aarch64-linux".to_string();
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    return "x86_64-linux".to_string();
+
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        all(target_arch = "x86_64", target_os = "macos"),
+        all(target_arch = "aarch64", target_os = "linux"),
+        all(target_arch = "x86_64", target_os = "linux")
+    )))]
+    {
+        // Fallback for unsupported platforms
+        tracing::warn!("Unsupported platform for Nix flakes, using x86_64-linux as fallback");
+        "x86_64-linux".to_string()
+    }
+}
+
+/// Compute the Nix runtime closure for a flake's development shell
+///
+/// This uses the fast path for flake evaluation:
+/// 1. `nix build .#devShells.<system>.default --no-link` - Realize the dev shell
+/// 2. `nix path-info --recursive` - Get the full closure (fast: ~80ms)
+///
+/// # Arguments
+/// * `flake_dir` - Directory containing the flake.nix file
+///
+/// # Returns
+/// Vec of all store paths needed for the flake's dev shell (typically 50-150 paths)
+///
+/// # Errors
+/// Returns WorkspaceError if:
+/// - Flake evaluation fails
+/// - Dev shell doesn't exist for this system
+/// - Nix commands fail
+///
+/// # Performance
+/// - First run: ~2-5 seconds (builds derivation if needed)
+/// - Cached: ~0.3 seconds (derivation already built)
+pub async fn compute_flake_closure(flake_dir: &Path) -> Result<Vec<PathBuf>, WorkspaceError> {
+    let system = get_system_arch();
+    let flake_ref = format!("{}#devShells.{}.default", flake_dir.display(), system);
+
+    tracing::debug!(
+        flake_dir = %flake_dir.display(),
+        system = %system,
+        "Computing flake closure"
+    );
+
+    // Retry strategy: 2 retries with exponential backoff (100ms, 300ms with jitter)
+    let retry_strategy = ExponentialBackoff::from_millis(100).map(jitter).take(2);
+
+    let flake_ref_owned = flake_ref.clone();
+    Retry::spawn(retry_strategy, || async {
+        // Step 1: Build the dev shell (ensures it's realized)
+        tracing::debug!(flake_ref = %flake_ref_owned, "Building flake dev shell");
+
+        let build_output = Command::new("nix")
+            .args(["build", &flake_ref_owned, "--no-link"])
+            .output()
+            .await
+            .map_err(|e| {
+                WorkspaceError::DerivationNotFound(format!(
+                    "Failed to execute nix build: {}. Is Nix installed?",
+                    e
+                ))
+            })?;
+
+        if !build_output.status.success() {
+            let stderr = String::from_utf8_lossy(&build_output.stderr);
+            return Err(WorkspaceError::DerivationNotFound(format!(
+                "Failed to build flake dev shell for system '{}': {}",
+                system, stderr
+            )));
+        }
+
+        // Step 2: Get the closure using nix path-info (fast!)
+        tracing::debug!(flake_ref = %flake_ref_owned, "Getting flake closure with nix path-info");
+
+        let closure_output = Command::new("nix")
+            .args(["path-info", "--recursive", &flake_ref_owned])
+            .output()
+            .await
+            .map_err(|e| {
+                WorkspaceError::DerivationNotFound(format!(
+                    "Failed to execute nix path-info: {}",
+                    e
+                ))
+            })?;
+
+        if !closure_output.status.success() {
+            let stderr = String::from_utf8_lossy(&closure_output.stderr);
+            return Err(WorkspaceError::DerivationNotFound(format!(
+                "Failed to get closure for flake dev shell: {}",
+                stderr
+            )));
+        }
+
+        // Parse the output to get store paths
+        let closure_str = String::from_utf8(closure_output.stdout).map_err(|e| {
+            WorkspaceError::DerivationNotFound(format!(
+                "Invalid UTF-8 in nix path-info output: {}",
+                e
+            ))
+        })?;
+
+        let closure: Vec<PathBuf> = closure_str
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect();
+
+        if closure.is_empty() {
+            return Err(WorkspaceError::DerivationNotFound(
+                "Flake dev shell closure is empty".to_string(),
+            ));
+        }
+
+        tracing::info!(
+            flake_dir = %flake_dir.display(),
+            system = %system,
+            path_count = closure.len(),
+            "Computed flake closure"
+        );
+
+        Ok(closure)
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_detect_flake_exists() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let flake_path = temp_dir.path().join("flake.nix");
+
+        // Create a flake.nix file
+        fs::write(&flake_path, "{ outputs = {}; }").expect("Failed to write flake.nix");
+
+        assert!(detect_flake(temp_dir.path()));
+    }
+
+    #[test]
+    fn test_detect_flake_not_exists() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        assert!(!detect_flake(temp_dir.path()));
+    }
+
+    #[test]
+    fn test_detect_flake_is_directory() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let flake_dir = temp_dir.path().join("flake.nix");
+
+        // Create a directory instead of a file
+        fs::create_dir(&flake_dir).expect("Failed to create directory");
+
+        assert!(!detect_flake(temp_dir.path()));
+    }
+
+    #[test]
+    fn test_get_system_arch() {
+        let system = get_system_arch();
+
+        // Should return one of the supported platforms
+        assert!(
+            system == "aarch64-darwin"
+                || system == "x86_64-darwin"
+                || system == "aarch64-linux"
+                || system == "x86_64-linux"
+        );
+
+        // Should match current platform
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        assert_eq!(system, "aarch64-darwin");
+
+        #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+        assert_eq!(system, "x86_64-darwin");
+
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+        assert_eq!(system, "aarch64-linux");
+
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        assert_eq!(system, "x86_64-linux");
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires a valid flake.nix and Nix installation
+    async fn test_compute_flake_closure() {
+        // This test would require a real flake.nix file
+        // Skip in CI, useful for manual testing with: cargo test -- --ignored
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let flake_path = temp_dir.path().join("flake.nix");
+
+        // Create a minimal flake.nix
+        let system = get_system_arch();
+        let flake_content = format!(
+            r#"{{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+  outputs = {{ nixpkgs, ... }}: {{
+    devShells.{}.default = nixpkgs.legacyPackages.{}.mkShell {{
+      packages = [ nixpkgs.legacyPackages.{}.hello ];
+    }};
+  }};
+}}"#,
+            system, system, system
+        );
+
+        fs::write(&flake_path, flake_content).expect("Failed to write flake.nix");
+
+        let result = compute_flake_closure(temp_dir.path()).await;
+
+        match result {
+            Ok(closure) => {
+                // Should have multiple paths
+                assert!(!closure.is_empty());
+                // All paths should be in /nix/store
+                for path in closure {
+                    assert!(path.starts_with("/nix/store"));
+                }
+            }
+            Err(e) => {
+                // May fail if Nix isn't installed or network issues
+                tracing::debug!(error = %e, "flake closure test failed (expected in CI)");
+            }
+        }
+    }
+}

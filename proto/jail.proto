@@ -1,0 +1,236 @@
+syntax = "proto3";
+
+package jail;
+
+import "google/protobuf/timestamp.proto";
+
+// Request to submit a new job
+message JobRequest {
+  // Git repository URL or path (for submit mode)
+  string repo = 1;
+
+  // Path within the repository (for submit mode)
+  string path = 2;
+
+  // Script content (exec mode) or instructions (submit mode)
+  string script = 3;
+
+  // Nix packages to make available (for exec mode, e.g., ["curl", "jq"])
+  repeated string packages = 4;
+
+  // Network policy for this job (optional, defaults to deny-all)
+  optional NetworkPolicy network_policy = 5;
+
+  // Nixpkgs version to use for package resolution (optional)
+  // If omitted, defaults to nixos-25.05 (pinned stable)
+  //
+  // Supported formats:
+  //   - "nixos-24.05"                    - release branch (hash auto-discovered)
+  //   - "nixos-24.05#sha256:abc..."      - release with explicit hash
+  //   - "nixos-unstable"                 - unstable branch
+  //   - "ae2fc9e0e42c...f068c1bfdc11c71" - 40-char commit SHA
+  optional string nixpkgs_version = 6;
+
+  // Git ref to checkout (branch, tag, or commit SHA)
+  // If omitted, uses the default branch
+  // Examples: "main", "v1.2.3", "feature/foo", "a1b2c3d4..."
+  optional string git_ref = 7;
+
+  // Hardening profile for systemd execution (Linux only)
+  // If omitted, defaults to "default" (maximum security)
+  //
+  // Supported profiles:
+  //   - "default"     - All 33 hardening properties (blocks JIT compilation)
+  //   - "jit-runtime" - 32 hardening properties (allows JIT for Node.js, Python, etc.)
+  //
+  // SECURITY: The default profile includes MemoryDenyWriteExecute=true which prevents
+  // JIT compilation but provides maximum security. Use jit-runtime only when needed.
+  optional string hardening_profile = 8;
+
+  // Enable automatic pull request creation for git repositories
+  // If true, after successful job execution (exit_code == 0):
+  //   1. Detect if commits were made
+  //   2. Create branch job-${jobID}
+  //   3. Push branch to remote
+  //   4. Create PR to original branch
+  //
+  // Requires: repo to be set and GitHub credential in server config
+  optional bool push = 9;
+}
+
+// Network policy controlling allowed/denied hosts and credential usage
+message NetworkPolicy {
+  // Ordered list of rules (first match wins)
+  // If no rule matches, the request is DENIED
+  repeated NetworkRule rules = 1;
+}
+
+// A single network policy rule
+message NetworkRule {
+  // Pattern to match against
+  NetworkPattern pattern = 1;
+
+  // Action to take if pattern matches
+  NetworkAction action = 2;
+
+  // Credential to inject (only for ALLOW rules, references server config)
+  optional string credential = 3;
+}
+
+// Pattern matching for network requests
+message NetworkPattern {
+  oneof pattern {
+    HostPattern host = 1;
+    IpPattern ip = 2;
+  }
+}
+
+// Host pattern with optional path restriction
+message HostPattern {
+  // Host regex pattern (e.g., "api\\.anthropic\\.com", ".*\\.google\\.com")
+  string host = 1;
+
+  // Optional path regex pattern (e.g., "/v1/.*", "/owner/.*")
+  optional string path = 2;
+}
+
+// IP CIDR pattern
+message IpPattern {
+  // CIDR notation (e.g., "10.0.0.0/8", "192.168.0.0/16")
+  string cidr = 1;
+}
+
+// Network action (allow or deny)
+enum NetworkAction {
+  // Allow the network request
+  NETWORK_ACTION_ALLOW = 0;
+
+  // Deny the network request
+  NETWORK_ACTION_DENY = 1;
+}
+
+// Response containing the job ID
+message JobResponse {
+  // Unique identifier for the submitted job
+  string job_id = 1;
+}
+
+// Request to stream logs for a job
+message StreamRequest {
+  // Job ID to stream logs for
+  string job_id = 1;
+
+  // Number of historical log lines to include before live streaming
+  // If omitted or 0, only stream live logs (attach to "now")
+  // If N > 0, first send last N lines from storage, then stream live
+  optional uint32 tail_lines = 2;
+}
+
+// Source of a log entry
+enum LogSource {
+  // Unspecified source (default, for backward compatibility)
+  LOG_SOURCE_UNSPECIFIED = 0;
+
+  // Job's stdout
+  LOG_SOURCE_JOB_STDOUT = 1;
+
+  // Job's stderr
+  LOG_SOURCE_JOB_STDERR = 2;
+
+  // Proxy's stdout
+  LOG_SOURCE_PROXY_STDOUT = 3;
+
+  // Proxy's stderr
+  LOG_SOURCE_PROXY_STDERR = 4;
+
+  // System messages (e.g., [ERROR], [DONE])
+  LOG_SOURCE_SYSTEM = 5;
+}
+
+// A single log entry
+message LogEntry {
+  // Log content
+  string content = 1;
+
+  // When this log entry was created
+  google.protobuf.Timestamp timestamp = 2;
+
+  // Source of this log entry
+  LogSource source = 3;
+}
+
+// Request to list jobs with optional filtering and pagination
+message ListJobsRequest {
+  // Filter by job status (e.g., "Running", "Completed", "Failed", "Pending")
+  // If omitted, returns jobs of all statuses
+  optional string status = 1;
+
+  // Maximum number of jobs to return (default: 50)
+  optional uint32 limit = 2;
+
+  // Number of jobs to skip for pagination (default: 0)
+  optional uint32 offset = 3;
+}
+
+// Information about a single job
+message JobInfo {
+  // Unique job identifier
+  string job_id = 1;
+
+  // Current job status
+  string status = 2;
+
+  // When the job was created/submitted
+  google.protobuf.Timestamp created_at = 3;
+
+  // When the job completed (only for completed/failed jobs)
+  optional google.protobuf.Timestamp completed_at = 4;
+
+  // Git repository URL (if provided)
+  optional string repo = 5;
+
+  // Path within repository (if provided)
+  optional string path = 6;
+
+  // Nix packages used (for exec mode)
+  repeated string packages = 7;
+
+  // Total runtime in seconds (for completed jobs) or elapsed time (for running jobs)
+  uint64 runtime_seconds = 8;
+}
+
+// Response containing a list of jobs
+message ListJobsResponse {
+  // List of jobs matching the criteria
+  repeated JobInfo jobs = 1;
+
+  // Total number of jobs matching the filter (for pagination)
+  uint32 total_count = 2;
+}
+
+// Request to run garbage collection on the cache
+message GcRequest {}
+
+// Response from garbage collection
+message GcResponse {
+  // Number of cache entries deleted
+  uint32 deleted_count = 1;
+
+  // Total bytes freed
+  int64 bytes_freed = 2;
+}
+
+// The jail service for managing sandboxed jobs
+service JailService {
+  // Submit a new job and get back a job ID
+  rpc SubmitJob(JobRequest) returns (JobResponse);
+
+  // Stream logs for a specific job
+  rpc StreamJob(StreamRequest) returns (stream LogEntry);
+
+  // List jobs with optional filtering and pagination
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+
+  // Run garbage collection to clear the cache
+  rpc Gc(GcRequest) returns (GcResponse);
+}
