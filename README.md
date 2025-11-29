@@ -1,3 +1,7 @@
+---
+created: 2025-11-16
+description: Sandboxed execution for Nix packages with network policy enforcement
+---
 # nix-jail
 
 Sandboxed execution for Nix packages with network policy enforcement and credential injection.
@@ -34,6 +38,7 @@ The proxy intercepts HTTPS traffic, enforces host+path policies, and injects cre
 
 - **Network policies** - Regex matching on host and path, default deny, ordered rule matching
 - **Credential injection** - Tokens injected by proxy, sandbox only sees dummy values
+- **Resource limits** - CPU, memory, disk, and process constraints
 - **Git workspaces** - Clone repos as job workspaces with shallow clones and auth support
 - **Nixpkgs versions** - Pin to releases, unstable, or specific commits
 - **Hardening profiles** - Weaken specific protections when needed (e.g., JIT runtimes)
