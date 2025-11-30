@@ -12,7 +12,6 @@ Run scripts in isolated environments where:
 - Only the packages you specify are available (minimal Nix closure)
 - Network access is denied by default, allowed by policy
 - Credentials are injected by the proxy, never visible to the sandbox
-
 ```bash
 # Run curl in a sandbox - network blocked by default
 cargo run --bin client -- exec -p curl -s examples/scripts/curl.sh
@@ -27,11 +26,8 @@ cargo run --bin client -- exec -p curl -s examples/scripts/curl.sh \
 ## How it works
 
 The server spawns jobs through a pipeline: resolve Nix packages, set up workspace, start a per-job MITM proxy, execute in platform sandbox, cleanup.
-
 **macOS:** Apple sandbox-exec with SBPL profiles. Localhost-only network forces proxy usage.
-
 **Linux:** systemd transient units with 33 hardening properties. Network namespaces with veth pairs provide kernel-enforced proxy-only communication.
-
 The proxy intercepts HTTPS traffic, enforces host+path policies, and injects credentials from the host keychain. Code in the sandbox cannot access the real tokens.
 
 ## Features
