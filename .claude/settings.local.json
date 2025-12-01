@@ -1,11 +1,12 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(git -C /Users/pwagner/git/thepwagner/nix-jail log --reverse --format=\"%ci %s\")",
+      "Bash(meow fmt:*)"
+    ]
+  },
   "disabledMcpjsonServers": [
     "mtd-journal",
     "mtd-project"
-  ],
-  "permissions": {
-    "allow": [
-      "Bash(git -C /Users/pwagner/git/thepwagner/nix-jail log --reverse --format=\"%ci %s\")"
-    ]
-  }
+  ]
 }
