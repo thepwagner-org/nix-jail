@@ -34,10 +34,13 @@ cache/
 - Copy with reflinks: `cp --reflink=always`
 - O(1) snapshots for new jobs
 - Metadata tracking in SQLite (last used, reference counts, disk usage)
-**Repo caching:**
-- Hash git state (HEAD + tree hash)
-- Snapshot for each job
-- Reuse common base states
+**Repository isolation:**
+Host maintains full clone (or treeless `--filter=blob:none`); sandbox receives only what's needed:
+- **Sparse-checkout** materializes only job-relevant paths (critical for monorepos - CI for `projects/foo/` never sees `projects/bar/`)
+- **Minimal `.git`** in sandbox: HEAD, index, config, refs - no history blobs
+- **Path allowlist** in job config: `paths: ["projects/foo/", "shared/lib/"]`
+- **Full local git ops** in sandbox: status, diff, add, commit all work
+- **Post-job sync**: extract new commits from sandbox, merge into host clone, push from host
 **Garbage collection:**
 - LRU eviction based on last used time
 - Configurable disk quota
