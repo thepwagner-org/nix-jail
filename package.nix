@@ -1,14 +1,11 @@
-{pkgs, ...}: let
-  cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-  version = cargoToml.package.version;
-in
-  pkgs.rustPlatform.buildRustPackage {
-    pname = "nix-jail";
-    inherit version;
-    src = ./.;
-
-    cargoLock.lockFile = ./Cargo.lock;
-
+{
+  pkgs,
+  buildRustPackage,
+  ...
+}:
+buildRustPackage {
+  src = ./.;
+  extraArgs = {
     nativeBuildInputs = with pkgs; [
       protobuf
       pkg-config
@@ -28,4 +25,5 @@ in
       license = licenses.mit;
       platforms = platforms.linux;
     };
-  }
+  };
+}
