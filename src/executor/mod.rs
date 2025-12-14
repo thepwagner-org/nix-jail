@@ -40,7 +40,7 @@ pub use systemd::SystemdExecutor;
 
 /// Creates the appropriate executor for the current platform
 ///
-/// Returns a boxed `Executor` trait object that provides sandboxed execution.
+/// Returns an `Arc<dyn Executor>` trait object that provides sandboxed execution.
 /// This is the recommended way to get an executor - it consolidates all
 /// platform-specific selection logic to this single location.
 ///
@@ -53,17 +53,17 @@ pub use systemd::SystemdExecutor;
 /// println!("Using executor: {}", executor.name());
 /// ```
 #[cfg(target_os = "macos")]
-pub fn create_executor() -> Box<dyn Executor> {
-    Box::new(SandboxExecutor::new())
+pub fn create_executor() -> std::sync::Arc<dyn Executor> {
+    std::sync::Arc::new(SandboxExecutor::new())
 }
 
 #[cfg(target_os = "linux")]
-pub fn create_executor() -> Box<dyn Executor> {
-    Box::new(SystemdExecutor::new())
+pub fn create_executor() -> std::sync::Arc<dyn Executor> {
+    std::sync::Arc::new(SystemdExecutor::new())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn create_executor() -> Box<dyn Executor> {
+pub fn create_executor() -> std::sync::Arc<dyn Executor> {
     compile_error!("nix-jail only supports macOS and Linux")
 }
 

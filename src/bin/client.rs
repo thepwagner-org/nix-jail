@@ -12,6 +12,7 @@ use nix_jail::log_sink::StdioLogSink;
 use nix_jail::networkpolicy::ClientNetworkPolicy;
 use nix_jail::orchestration::{execute_local, LocalExecutionConfig};
 use tonic::Request;
+use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Inject OpenTelemetry trace context into a tonic request
@@ -220,6 +221,10 @@ enum Commands {
         #[arg(long)]
         show_prefix: bool,
 
+        /// Run in interactive mode (allocate PTY for terminal programs)
+        #[arg(short, long)]
+        interactive: bool,
+
         /// Command to execute (everything after --)
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -249,6 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hardening_profile,
         config,
         show_prefix,
+        interactive,
         command,
     } = cli.command
     {
@@ -262,9 +268,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             hardening_profile,
             config,
             show_prefix,
+            interactive,
             command,
         )
+        .instrument(tracing::info_span!("run"))
         .await?;
+        drop(_tracing_guard); // Flush traces before exit
         std::process::exit(exit_code);
     }
 
@@ -663,6 +672,7 @@ async fn run_local(
     hardening_profile: Option<String>,
     config_path: Option<std::path::PathBuf>,
     show_prefix: bool,
+    interactive: bool,
     command: Vec<String>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     tracing::info!(packages = ?packages, "running locally");
@@ -746,6 +756,13 @@ async fn run_local(
     // Create log sink
     let log_sink = Arc::new(StdioLogSink::new(show_prefix));
 
+    // Get terminal size for interactive mode
+    let pty_size = if interactive {
+        get_terminal_size()
+    } else {
+        None
+    };
+
     // Build execution config
     let exec_config = LocalExecutionConfig {
         packages,
@@ -756,10 +773,24 @@ async fn run_local(
         hardening_profile: profile,
         state_dir,
         nixpkgs_version: Some(nixpkgs_version),
+        interactive,
+        pty_size,
     };
 
+    // Enable raw mode for interactive sessions
+    let _raw_guard = if interactive {
+        Some(enable_raw_mode()?)
+    } else {
+        None
+    };
+
+    // Create executor and job root
+    let executor = nix_jail::executor::create_executor();
+    let job_root: std::sync::Arc<dyn nix_jail::root::JobRoot> =
+        std::sync::Arc::new(nix_jail::root::BindMountJobRoot::new());
+
     // Execute
-    let exit_code = execute_local(exec_config, log_sink).await?;
+    let exit_code = execute_local(exec_config, executor, job_root, log_sink).await?;
 
     Ok(exit_code)
 }
@@ -970,6 +1001,24 @@ impl Drop for RawModeGuard {
             nix::sys::termios::SetArg::TCSANOW,
             &self.original_termios,
         );
+    }
+}
+
+/// Get current terminal size (rows, cols)
+fn get_terminal_size() -> Option<(u16, u16)> {
+    let output = std::process::Command::new("stty")
+        .arg("size")
+        .stdin(std::process::Stdio::inherit())
+        .output()
+        .ok()?;
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    let parts: Vec<&str> = output_str.split_whitespace().collect();
+    if parts.len() == 2 {
+        let rows = parts[0].parse().ok()?;
+        let cols = parts[1].parse().ok()?;
+        Some((rows, cols))
+    } else {
+        None
     }
 }
 

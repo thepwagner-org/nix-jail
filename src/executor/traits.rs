@@ -117,6 +117,8 @@ pub struct ExecutionConfig {
     pub hardening_profile: HardeningProfile,
     /// Use PTY mode for interactive terminal sessions
     pub interactive: bool,
+    /// Terminal size for PTY mode (rows, cols)
+    pub pty_size: Option<(u16, u16)>,
 }
 
 /// I/O handle for job execution

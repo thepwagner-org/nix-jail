@@ -44,6 +44,26 @@ impl opentelemetry::propagation::Extractor for MetadataExtractor<'_> {
     }
 }
 
+/// Configuration for creating a JailServiceImpl
+pub struct JailServiceConfig {
+    pub storage: JobStorage,
+    pub config: config::ServerConfig,
+    pub registry: crate::job_registry::JobRegistry,
+    pub cache_manager: CacheManager,
+    pub executor: Arc<dyn crate::executor::Executor>,
+    pub job_root: Arc<dyn crate::job_dir::JobRoot>,
+    pub job_workspace: Arc<dyn JobWorkspace>,
+    pub session_registry: Arc<crate::session::SessionRegistry>,
+}
+
+impl std::fmt::Debug for JailServiceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JailServiceConfig")
+            .field("executor", &self.executor.name())
+            .finish_non_exhaustive()
+    }
+}
+
 /// gRPC service implementation
 #[derive(Clone)]
 pub struct JailServiceImpl {
@@ -51,6 +71,7 @@ pub struct JailServiceImpl {
     config: config::ServerConfig,
     registry: crate::job_registry::JobRegistry,
     cache_manager: CacheManager,
+    executor: Arc<dyn crate::executor::Executor>,
     job_root: Arc<dyn crate::job_dir::JobRoot>,
     job_workspace: Arc<dyn JobWorkspace>,
     session_registry: Arc<crate::session::SessionRegistry>,
@@ -63,6 +84,7 @@ impl std::fmt::Debug for JailServiceImpl {
             .field("config", &self.config)
             .field("registry", &self.registry)
             .field("cache_manager", &self.cache_manager)
+            .field("executor", &self.executor.name())
             .field("job_root", &self.job_root)
             .field("job_workspace", &self.job_workspace)
             .field("session_registry", &self.session_registry)
@@ -71,23 +93,16 @@ impl std::fmt::Debug for JailServiceImpl {
 }
 
 impl JailServiceImpl {
-    pub fn new(
-        storage: JobStorage,
-        config: config::ServerConfig,
-        registry: crate::job_registry::JobRegistry,
-        cache_manager: CacheManager,
-        job_root: Arc<dyn crate::job_dir::JobRoot>,
-        job_workspace: Arc<dyn JobWorkspace>,
-        session_registry: Arc<crate::session::SessionRegistry>,
-    ) -> Self {
+    pub fn new(cfg: JailServiceConfig) -> Self {
         Self {
-            storage,
-            config,
-            registry,
-            cache_manager,
-            job_root,
-            job_workspace,
-            session_registry,
+            storage: cfg.storage,
+            config: cfg.config,
+            registry: cfg.registry,
+            cache_manager: cfg.cache_manager,
+            executor: cfg.executor,
+            job_root: cfg.job_root,
+            job_workspace: cfg.job_workspace,
+            session_registry: cfg.session_registry,
         }
     }
 }
@@ -161,6 +176,7 @@ impl JailService for JailServiceImpl {
         let storage_for_exec = self.storage.clone();
         let config_for_exec = self.config.clone();
         let registry_for_exec = self.registry.clone();
+        let executor_for_exec = self.executor.clone();
         let job_root_for_exec = self.job_root.clone();
         let job_workspace_for_exec = self.job_workspace.clone();
 
@@ -206,6 +222,7 @@ impl JailService for JailServiceImpl {
                         config: config_for_exec,
                         tx: log_tx_for_exec,
                         registry: registry_for_exec,
+                        executor: executor_for_exec,
                         job_root: job_root_for_exec,
                         job_workspace: job_workspace_for_exec,
                         session_registry: session_registry_for_exec,

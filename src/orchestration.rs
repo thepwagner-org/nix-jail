@@ -15,7 +15,7 @@ use tonic::Status;
 use tracing::Instrument;
 
 use crate::config::{Credential, CredentialType};
-use crate::executor::{create_executor, ExecutionConfig, HardeningProfile};
+use crate::executor::{ExecutionConfig, Executor, HardeningProfile};
 use crate::jail::{LogEntry, LogSource, NetworkPolicy};
 use crate::job_dir::JobDirectory;
 use crate::job_workspace::JobWorkspace;
@@ -70,15 +70,28 @@ pub enum OrchestrationError {
 }
 
 /// Context for job execution containing all required services and configuration
-#[derive(Debug)]
 pub struct ExecuteJobContext {
     pub storage: JobStorage,
     pub config: crate::config::ServerConfig,
     pub tx: broadcast::Sender<Result<LogEntry, Status>>,
     pub registry: crate::job_registry::JobRegistry,
+    pub executor: Arc<dyn Executor>,
     pub job_root: Arc<dyn JobRoot>,
     pub job_workspace: Arc<dyn JobWorkspace>,
     pub session_registry: Option<Arc<crate::session::SessionRegistry>>,
+}
+
+impl std::fmt::Debug for ExecuteJobContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecuteJobContext")
+            .field("storage", &self.storage)
+            .field("config", &self.config)
+            .field("registry", &self.registry)
+            .field("executor", &self.executor.name())
+            .field("job_root", &self.job_root)
+            .field("job_workspace", &self.job_workspace)
+            .finish()
+    }
 }
 
 /// Extract credential names referenced in a network policy
@@ -171,6 +184,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         config,
         tx,
         registry,
+        executor,
         job_root,
         job_workspace,
         session_registry,
@@ -178,9 +192,6 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
 
     // Create log sink for this job (replaces send_info/send_error pattern)
     let log_sink: Arc<dyn LogSink> = Arc::new(StorageLogSink::new(storage.clone(), tx.clone()));
-
-    // Create platform-specific executor early so we can use its methods
-    let executor = create_executor();
 
     let job_id = job.id.clone();
     let packages = job.packages.clone();
@@ -281,74 +292,23 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         (None, None)
     };
 
-    // Only start proxy if network policy has rules
-    let has_network_rules = job
-        .network_policy
-        .as_ref()
-        .map(|policy| !policy.rules.is_empty())
-        .unwrap_or(false);
-
-    // Phase 1: Create proxy config (early) - doesn't create root directory
-    // The actual proxy start is delayed until after prepare_root creates the root
-    let proxy_config_path = if has_network_rules {
-        // Filter credentials to only those referenced in the network policy
-        let filtered_credentials =
-            filter_credentials(&config.credentials, job.network_policy.as_ref());
-
-        // Generate proxy authentication credentials
-        let proxy_username = Some(format!("job-{}", job_id));
-        let proxy_password = Some(workspace::generate_proxy_password());
-
-        // Create proxy config in job_dir.base (outside sandbox)
-        // CA cert will be written to job_dir.root/etc/ssl/certs/ (host path)
-        // Inside sandbox, it appears at CA_CERT_CHROOT_PATH
-        let ca_cert_host_path =
-            crate::proxy_manager::ProxyManager::ca_cert_host_path(&job_dir.root);
-        let config_result = workspace::write_proxy_config(
-            &job_dir.base,
-            &ca_cert_host_path,
-            executor.proxy_listen_addr(),
-            job.network_policy.clone(),
-            &filtered_credentials,
-            proxy_username,
-            proxy_password,
-        );
-
-        match config_result {
-            Ok(path) => {
-                let credential_names: Vec<&str> = filtered_credentials
-                    .iter()
-                    .map(|c| c.name.as_str())
-                    .collect();
-                tracing::info!(
-                    path = %path.display(),
-                    credentials = ?credential_names,
-                    "created proxy config"
-                );
-
-                if let Some(ref policy) = job.network_policy {
-                    log_sink.info(
-                        &job_id,
-                        &format!(
-                            "Network policy configured with {} rules",
-                            policy.rules.len()
-                        ),
-                    );
-                }
-                Some(path)
-            }
-            Err(e) => {
-                let error_msg = format!("Failed to configure proxy: {}", e);
-                tracing::error!(job_id = %job_id, error = %error_msg, "Failed to create proxy config");
-                log_sink.error(&job_id, &error_msg);
-                return;
-            }
+    // Phase 1: Create proxy config if network policy has rules
+    let proxy_config_path = match configure_proxy(
+        &job_id,
+        &job_dir,
+        job.network_policy.as_ref(),
+        &config.credentials,
+        executor.proxy_listen_addr(),
+        &log_sink,
+    )
+    .await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            log_sink.error(&job_id, &format!("Failed to configure proxy: {}", e));
+            let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+            return;
         }
-    } else {
-        // No network policy or empty rules - skip proxy entirely and block all network access
-        tracing::info!("no network rules configured - skipping proxy (network will be blocked)");
-        log_sink.info(&job_id, "Network access blocked (no policy or empty rules)");
-        None
     };
 
     // Check if workspace has a flake - if so, use it instead of explicit packages
@@ -459,23 +419,21 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
     let _ = cache_hit; // Silence unused warning, info logged above
 
     // Phase 2: Start proxy now that root exists (proxy writes cert to root/etc/ssl/certs/)
-    let mut proxy = if let Some(ref config_path) = proxy_config_path {
-        match start_proxy(
-            &job_id,
-            job_dir.root.clone(),
-            config_path.clone(),
-            executor.proxy_listen_addr(),
-            &storage,
-            &log_sink,
-        )
-        .instrument(tracing::info_span!("start_proxy"))
-        .await
-        {
-            Some(p) => Some(p),
-            None => return, // Error already logged
+    let mut proxy = match start_proxy_if_configured(
+        &job_id,
+        &job_dir,
+        proxy_config_path.as_ref(),
+        executor.proxy_listen_addr(),
+    )
+    .instrument(tracing::info_span!("start_proxy"))
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            log_sink.error(&job_id, &format!("Failed to start proxy: {}", e));
+            let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+            return;
         }
-    } else {
-        None
     };
 
     // Configure execution environment
@@ -494,60 +452,16 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         let _ = env.insert("PATH".to_string(), format!("{}:{}", path_env, current_path));
     }
 
-    // Configure Claude Code access if a Claude credential is referenced
-    let filtered_credentials = filter_credentials(&config.credentials, job.network_policy.as_ref());
-    if has_credential_with_type(&filtered_credentials, CredentialType::Claude) {
-        match workspace::setup_claude_config(&workspace_dir, &job_id, &filtered_credentials) {
-            Ok(()) => {
-                // Prepend wrapper bin directory to PATH so our security wrapper is used
-                let wrapper_bin = job_dir.base.join("bin");
-                if wrapper_bin.exists() {
-                    let current_path = env.get("PATH").map(|s| s.as_str()).unwrap_or("");
-                    let _ = env.insert(
-                        "PATH".to_string(),
-                        format!("{}:{}", wrapper_bin.display(), current_path),
-                    );
-                    tracing::info!(job_id = %job_id, "added security wrapper to PATH");
-                }
-                tracing::info!(job_id = %job_id, "claude code configured with dummy token (proxy will inject real token)");
-                log_sink.info(
-                    &job_id,
-                    "Claude Code configured (OAuth via proxy injection)",
-                );
-            }
-            Err(e) => {
-                tracing::warn!(job_id = %job_id, error = %e, "failed to copy claude configuration");
-                log_sink.info(
-                    &job_id,
-                    &format!("Warning: Could not configure Claude Code: {}", e),
-                );
-            }
-        }
-    }
-
-    // Configure GitHub token if a GitHub credential is referenced
-    if has_credential_with_type(&filtered_credentials, CredentialType::GitHub) {
-        // Find the GitHub credential and get its dummy token
-        if let Some(github_cred) = filtered_credentials
-            .iter()
-            .find(|c| c.credential_type == CredentialType::GitHub)
-        {
-            if let Some(ref dummy_token) = github_cred.dummy_token {
-                let _ = env.insert("GITHUB_TOKEN".to_string(), dummy_token.clone());
-                tracing::info!(job_id = %job_id, "set GITHUB_TOKEN with dummy token (proxy will inject real token)");
-                log_sink.info(
-                    &job_id,
-                    "GitHub token configured (proxy will inject real token)",
-                );
-            } else {
-                tracing::warn!(job_id = %job_id, "github credential has no dummy_token configured");
-                log_sink.info(
-                    &job_id,
-                    "Warning: GitHub credential has no dummy_token (GITHUB_TOKEN not set)",
-                );
-            }
-        }
-    }
+    // Configure credentials (Claude Code, GitHub token)
+    setup_credentials_env(
+        &job_id,
+        &workspace_dir,
+        &job_dir,
+        &mut env,
+        &config.credentials,
+        job.network_policy.as_ref(),
+        &log_sink,
+    );
 
     let command = build_command(is_exec_mode, script);
 
@@ -582,6 +496,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         proxy_port: proxy.as_ref().map(|p| p.port),
         hardening_profile,
         interactive,
+        pty_size: None, // Server mode uses WebSocket for terminal size
     };
 
     // Execute job using platform-specific executor (created earlier)
@@ -783,34 +698,6 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
 
 // Helper functions
 
-async fn start_proxy(
-    job_id: &str,
-    root_dir: std::path::PathBuf,
-    proxy_config_path: std::path::PathBuf,
-    proxy_listen_addr: &str,
-    storage: &JobStorage,
-    log_sink: &Arc<dyn LogSink>,
-) -> Option<ProxyManager> {
-    // Get platform-specific listen host from the provided address
-    let listen_host = proxy_listen_addr
-        .split(':')
-        .next()
-        .unwrap_or("127.0.0.1")
-        .to_string();
-
-    match ProxyManager::start(job_id.to_string(), root_dir, proxy_config_path, listen_host).await {
-        Ok(p) => {
-            tracing::debug!(job_id = %job_id, port = p.port, listen_host = %p.listen_host, "proxy started");
-            Some(p)
-        }
-        Err(e) => {
-            log_sink.error(job_id, &format!("Failed to start proxy: {}", e));
-            let _ = storage.update_job_status(job_id, JobStatus::Failed);
-            None
-        }
-    }
-}
-
 fn build_environment(
     proxy: Option<&ProxyManager>,
     working_dir: &Path,
@@ -932,6 +819,190 @@ fn build_command(is_exec_mode: bool, script: String) -> Vec<String> {
              exit 0"
                 .to_string(),
         ]
+    }
+}
+
+/// Configure proxy for network policy enforcement
+///
+/// Returns the path to the proxy config file if network policy has rules,
+/// or None if network should be blocked (no policy).
+async fn configure_proxy(
+    job_id: &str,
+    job_dir: &JobDirectory,
+    network_policy: Option<&NetworkPolicy>,
+    credentials: &[Credential],
+    proxy_listen_addr: &str,
+    log_sink: &Arc<dyn LogSink>,
+) -> Result<Option<PathBuf>, OrchestrationError> {
+    let has_network_rules = network_policy
+        .map(|policy| !policy.rules.is_empty())
+        .unwrap_or(false);
+
+    if !has_network_rules {
+        log_sink.info(job_id, "Network access blocked (no policy)");
+        return Ok(None);
+    }
+
+    let filtered_credentials = filter_credentials(credentials, network_policy);
+    let proxy_username = Some(format!("job-{}", job_id));
+    let proxy_password = Some(workspace::generate_proxy_password());
+
+    let ca_cert_host_path = crate::proxy_manager::ProxyManager::ca_cert_host_path(&job_dir.root);
+    let path = workspace::write_proxy_config(
+        &job_dir.base,
+        &ca_cert_host_path,
+        proxy_listen_addr,
+        network_policy.cloned(),
+        &filtered_credentials,
+        proxy_username,
+        proxy_password,
+    )
+    .map_err(|e| OrchestrationError::ProxyConfigError(e.to_string()))?;
+
+    let credential_names: Vec<&str> = filtered_credentials
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    tracing::info!(
+        path = %path.display(),
+        credentials = ?credential_names,
+        "created proxy config"
+    );
+
+    if let Some(policy) = network_policy {
+        log_sink.info(
+            job_id,
+            &format!(
+                "Network policy configured with {} rules",
+                policy.rules.len()
+            ),
+        );
+    }
+
+    Ok(Some(path))
+}
+
+/// Resolve packages and compute closure
+///
+/// Handles both flake-based and explicit package resolution.
+/// Returns (store_paths, closure).
+async fn resolve_packages_and_closure(
+    job_id: &str,
+    working_dir: &Path,
+    packages: &[String],
+    nixpkgs_version: Option<&str>,
+    has_flake: bool,
+    log_sink: &Arc<dyn LogSink>,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), OrchestrationError> {
+    let store_paths = if has_flake {
+        if !packages.is_empty() {
+            log_sink.info(
+                job_id,
+                &format!(
+                    "Ignoring explicit packages ({}), using flake.nix",
+                    packages.join(", ")
+                ),
+            );
+        }
+        log_sink.info(
+            job_id,
+            &format!("Computing flake closure from {}", working_dir.display()),
+        );
+        workspace::compute_flake_closure(working_dir)
+            .await
+            .map_err(|e| OrchestrationError::FlakeClosureError(e.to_string()))?
+    } else if !packages.is_empty() {
+        let pkg_refs: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
+        workspace::find_nix_packages_cached(&pkg_refs, nixpkgs_version)
+            .await
+            .map_err(|e| OrchestrationError::PackageError(e.to_string()))?
+    } else {
+        vec![]
+    };
+
+    let closure = if !store_paths.is_empty() {
+        workspace::compute_combined_closure(&store_paths)
+            .await
+            .map_err(|e| OrchestrationError::ClosureError(e.to_string()))?
+    } else {
+        vec![]
+    };
+
+    log_sink.info(job_id, &format!("Closure: {} store paths", closure.len()));
+
+    Ok((store_paths, closure))
+}
+
+/// Start proxy if config path is provided
+async fn start_proxy_if_configured(
+    job_id: &str,
+    job_dir: &JobDirectory,
+    proxy_config_path: Option<&PathBuf>,
+    proxy_listen_addr: &str,
+) -> Result<Option<ProxyManager>, OrchestrationError> {
+    let Some(config_path) = proxy_config_path else {
+        return Ok(None);
+    };
+
+    let listen_host = proxy_listen_addr
+        .split(':')
+        .next()
+        .unwrap_or("127.0.0.1")
+        .to_string();
+
+    let proxy = ProxyManager::start(
+        job_id.to_string(),
+        job_dir.root.clone(),
+        config_path.clone(),
+        listen_host,
+    )
+    .await
+    .map_err(|e| OrchestrationError::ProxyStartError(e.to_string()))?;
+
+    tracing::debug!(port = proxy.port, "proxy started");
+    Ok(Some(proxy))
+}
+
+/// Setup credential-related environment variables
+fn setup_credentials_env(
+    job_id: &str,
+    working_dir: &Path,
+    job_dir: &JobDirectory,
+    env: &mut HashMap<String, String>,
+    credentials: &[Credential],
+    network_policy: Option<&NetworkPolicy>,
+    log_sink: &Arc<dyn LogSink>,
+) {
+    let filtered_credentials = filter_credentials(credentials, network_policy);
+
+    // Claude Code credential
+    if has_credential_with_type(&filtered_credentials, CredentialType::Claude) {
+        if let Ok(()) = workspace::setup_claude_config(working_dir, job_id, &filtered_credentials) {
+            let wrapper_bin = job_dir.base.join("bin");
+            if let Some(path) = env.get("PATH").cloned() {
+                let _ = env.insert(
+                    "PATH".to_string(),
+                    format!("{}:{}", wrapper_bin.display(), path),
+                );
+            }
+            log_sink.info(job_id, "Claude Code credentials configured");
+        }
+    }
+
+    // GitHub token credential
+    if has_credential_with_type(&filtered_credentials, CredentialType::GitHub) {
+        if let Some(github_cred) = filtered_credentials
+            .iter()
+            .find(|c| c.credential_type == CredentialType::GitHub)
+        {
+            if let Some(ref dummy_token) = github_cred.dummy_token {
+                let _ = env.insert("GITHUB_TOKEN".to_string(), dummy_token.clone());
+                log_sink.info(
+                    job_id,
+                    "GitHub token configured (proxy will inject real token)",
+                );
+            }
+        }
     }
 }
 
@@ -1067,6 +1138,12 @@ pub struct LocalExecutionConfig {
 
     /// Nixpkgs version (optional)
     pub nixpkgs_version: Option<String>,
+
+    /// Interactive mode (use PTY)
+    pub interactive: bool,
+
+    /// Terminal size for PTY mode (rows, cols)
+    pub pty_size: Option<(u16, u16)>,
 }
 
 /// Execute a job locally without a server
@@ -1079,12 +1156,12 @@ pub struct LocalExecutionConfig {
 /// - Returns exit code directly
 pub async fn execute_local(
     config: LocalExecutionConfig,
+    executor: Arc<dyn Executor>,
+    job_root: Arc<dyn JobRoot>,
     log_sink: Arc<dyn LogSink>,
 ) -> Result<i32, OrchestrationError> {
     let job_id = ulid::Ulid::new().to_string();
     tracing::info!(job_id = %job_id, "starting local execution");
-
-    let executor = create_executor();
 
     // Create job directory
     let state_dir = config
@@ -1098,129 +1175,60 @@ pub async fn execute_local(
     // Detect flake.nix in working directory
     let has_flake = workspace::flake::detect_flake(&config.working_dir);
 
-    // Only start proxy if network policy has rules
-    let has_network_rules = config
-        .network_policy
-        .as_ref()
-        .map(|policy| !policy.rules.is_empty())
-        .unwrap_or(false);
-
     // Phase 1: Create proxy config if needed
-    let proxy_config_path = if has_network_rules {
-        let filtered_credentials =
-            filter_credentials(&config.credentials, config.network_policy.as_ref());
-
-        let proxy_username = Some(format!("job-{}", job_id));
-        let proxy_password = Some(workspace::generate_proxy_password());
-
-        let ca_cert_host_path =
-            crate::proxy_manager::ProxyManager::ca_cert_host_path(&job_dir.root);
-        let config_result = workspace::write_proxy_config(
-            &job_dir.base,
-            &ca_cert_host_path,
-            executor.proxy_listen_addr(),
-            config.network_policy.clone(),
-            &filtered_credentials,
-            proxy_username,
-            proxy_password,
-        );
-
-        match config_result {
-            Ok(path) => {
-                log_sink.info(
-                    &job_id,
-                    &format!(
-                        "Network policy configured with {} rules",
-                        config
-                            .network_policy
-                            .as_ref()
-                            .map(|p| p.rules.len())
-                            .unwrap_or(0)
-                    ),
-                );
-                Some(path)
-            }
-            Err(e) => {
-                return Err(OrchestrationError::ProxyConfigError(e.to_string()));
-            }
-        }
-    } else {
-        log_sink.info(&job_id, "Network access blocked (no policy)");
-        None
-    };
-
-    // Phase 2: Resolve packages
-    let store_paths = if has_flake {
-        log_sink.info(
-            &job_id,
-            &format!(
-                "Computing flake closure from {}",
-                config.working_dir.display()
-            ),
-        );
-        workspace::compute_flake_closure(&config.working_dir)
-            .await
-            .map_err(|e| OrchestrationError::FlakeClosureError(e.to_string()))?
-    } else if !config.packages.is_empty() {
-        let pkg_refs: Vec<&str> = config.packages.iter().map(|s| s.as_str()).collect();
-        workspace::find_nix_packages_cached(&pkg_refs, config.nixpkgs_version.as_deref())
-            .await
-            .map_err(|e| OrchestrationError::PackageError(e.to_string()))?
-    } else {
-        vec![]
-    };
-
-    // Compute closure
-    let closure = if !store_paths.is_empty() {
-        workspace::compute_combined_closure(&store_paths)
-            .await
-            .map_err(|e| OrchestrationError::ClosureError(e.to_string()))?
-    } else {
-        vec![]
-    };
-
-    log_sink.info(&job_id, &format!("Closure: {} store paths", closure.len()));
-
-    // Phase 3: Prepare root with bind-mount strategy (no caching for local execution)
-    let job_root = crate::root::BindMountJobRoot::new();
-    let (store_setup, _) = job_root
-        .create(&job_dir.root, &closure)
-        .await
-        .map_err(|e| OrchestrationError::RootError(e.to_string()))?;
-
-    log_sink.info(
+    let proxy_config_path = configure_proxy(
         &job_id,
-        &format!("Using bind-mount strategy ({} store paths)", closure.len()),
-    );
+        &job_dir,
+        config.network_policy.as_ref(),
+        &config.credentials,
+        executor.proxy_listen_addr(),
+        &log_sink,
+    )
+    .await?;
+
+    // Phase 2: Resolve packages and compute closure
+    let (store_paths, closure) = resolve_packages_and_closure(
+        &job_id,
+        &config.working_dir,
+        &config.packages,
+        config.nixpkgs_version.as_deref(),
+        has_flake,
+        &log_sink,
+    )
+    .instrument(tracing::info_span!("resolve_packages"))
+    .await?;
+
+    // Phase 3: Prepare root using injected JobRoot implementation
+    let (store_setup, cache_hit) = async {
+        job_root
+            .create(&job_dir.root, &closure)
+            .await
+            .map_err(|e| OrchestrationError::RootError(e.to_string()))
+    }
+    .instrument(tracing::info_span!("prepare_root"))
+    .await?;
+
+    let msg = match (&store_setup, cache_hit) {
+        (crate::root::StoreSetup::Populated, true) => {
+            "Cache hit: root created from snapshot".to_string()
+        }
+        (crate::root::StoreSetup::Populated, false) => {
+            "Cache miss: created and cached closure".to_string()
+        }
+        (crate::root::StoreSetup::BindMounts { paths }, _) => {
+            format!("Using bind-mount strategy ({} store paths)", paths.len())
+        }
+    };
+    log_sink.info(&job_id, &msg);
 
     // Phase 4: Start proxy if configured
-    let mut proxy = if let Some(ref config_path) = proxy_config_path {
-        let listen_host = executor
-            .proxy_listen_addr()
-            .split(':')
-            .next()
-            .unwrap_or("127.0.0.1")
-            .to_string();
-
-        match ProxyManager::start(
-            job_id.clone(),
-            job_dir.root.clone(),
-            config_path.clone(),
-            listen_host,
-        )
-        .await
-        {
-            Ok(p) => {
-                tracing::debug!(port = p.port, "proxy started");
-                Some(p)
-            }
-            Err(e) => {
-                return Err(OrchestrationError::ProxyStartError(e.to_string()));
-            }
-        }
-    } else {
-        None
-    };
+    let mut proxy = start_proxy_if_configured(
+        &job_id,
+        &job_dir,
+        proxy_config_path.as_ref(),
+        executor.proxy_listen_addr(),
+    )
+    .await?;
 
     // Phase 5: Build environment
     let mut env = build_environment(
@@ -1238,43 +1246,16 @@ pub async fn execute_local(
         let _ = env.insert("PATH".to_string(), format!("{}:{}", path_env, current_path));
     }
 
-    // Configure credentials if needed
-    let filtered_credentials =
-        filter_credentials(&config.credentials, config.network_policy.as_ref());
-
-    if has_credential_with_type(&filtered_credentials, CredentialType::Claude) {
-        if let Ok(()) =
-            workspace::setup_claude_config(&config.working_dir, &job_id, &filtered_credentials)
-        {
-            let wrapper_bin = job_dir.base.join("bin");
-            if wrapper_bin.exists() {
-                let current_path = env.get("PATH").map(|s| s.as_str()).unwrap_or("");
-                let _ = env.insert(
-                    "PATH".to_string(),
-                    format!("{}:{}", wrapper_bin.display(), current_path),
-                );
-            }
-            log_sink.info(
-                &job_id,
-                "Claude Code configured (OAuth via proxy injection)",
-            );
-        }
-    }
-
-    if has_credential_with_type(&filtered_credentials, CredentialType::GitHub) {
-        if let Some(github_cred) = filtered_credentials
-            .iter()
-            .find(|c| c.credential_type == CredentialType::GitHub)
-        {
-            if let Some(ref dummy_token) = github_cred.dummy_token {
-                let _ = env.insert("GITHUB_TOKEN".to_string(), dummy_token.clone());
-                log_sink.info(
-                    &job_id,
-                    "GitHub token configured (proxy will inject real token)",
-                );
-            }
-        }
-    }
+    // Configure credentials
+    setup_credentials_env(
+        &job_id,
+        &config.working_dir,
+        &job_dir,
+        &mut env,
+        &config.credentials,
+        config.network_policy.as_ref(),
+        &log_sink,
+    );
 
     // Phase 6: Execute
     let exec_config = ExecutionConfig {
@@ -1288,13 +1269,18 @@ pub async fn execute_local(
         store_paths: closure.clone(),
         proxy_port: proxy.as_ref().map(|p| p.port),
         hardening_profile: config.hardening_profile,
-        interactive: false,
+        interactive: config.interactive,
+        pty_size: config.pty_size,
     };
 
-    let handle = executor
-        .execute(exec_config)
-        .await
-        .map_err(|e| OrchestrationError::ExecutionError(e.to_string()))?;
+    let handle = async {
+        executor
+            .execute(exec_config)
+            .await
+            .map_err(|e| OrchestrationError::ExecutionError(e.to_string()))
+    }
+    .instrument(tracing::info_span!("execute"))
+    .await?;
 
     // Extract stdout/stderr from handle based on mode
     let (stdout_task, stderr_task) = match handle.io {
@@ -1326,11 +1312,40 @@ pub async fn execute_local(
 
             (stdout_task, stderr_task)
         }
-        crate::executor::IoHandle::Pty { .. } => {
-            // PTY mode not currently supported in local execution
-            return Err(OrchestrationError::ExecutionError(
-                "PTY mode not supported in local execution".to_string(),
-            ));
+        crate::executor::IoHandle::Pty { stdin, stdout } => {
+            // PTY mode: connect directly to user's terminal
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            // Forward user stdin to PTY stdin
+            let stdin_task = tokio::spawn(async move {
+                let mut user_stdin = tokio::io::stdin();
+                let mut buf = [0u8; 1024];
+                loop {
+                    match user_stdin.read(&mut buf).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            if stdin.send(buf[..n].to_vec()).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            // Forward PTY stdout to user stdout
+            let stdout_task = tokio::spawn(async move {
+                let mut user_stdout = tokio::io::stdout();
+                let mut stdout = stdout;
+                while let Some(data) = stdout.recv().await {
+                    if user_stdout.write_all(&data).await.is_err() {
+                        break;
+                    }
+                    let _ = user_stdout.flush().await;
+                }
+            });
+
+            (stdin_task, stdout_task)
         }
     };
 

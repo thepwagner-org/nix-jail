@@ -127,11 +127,12 @@ impl Executor for SandboxExecutor {
             // PTY mode: use portable-pty for interactive terminal
             use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
+            let (rows, cols) = config.pty_size.unwrap_or((24, 80));
             let pty_system = native_pty_system();
             let pty_pair = pty_system
                 .openpty(PtySize {
-                    rows: 24,
-                    cols: 80,
+                    rows,
+                    cols,
                     pixel_width: 0,
                     pixel_height: 0,
                 })
@@ -366,6 +367,7 @@ mod tests {
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let handle = executor.execute(config).await.expect("Execution failed");
@@ -402,6 +404,7 @@ mod tests {
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let handle = executor.execute(config).await.expect("Execution failed");
@@ -434,6 +437,7 @@ mod tests {
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let handle = executor.execute(config).await.expect("Execution failed");
@@ -458,6 +462,7 @@ mod tests {
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let handle = executor.execute(config).await.expect("Execution failed");
@@ -486,6 +491,7 @@ mod tests {
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let mut handle = executor.execute(config).await.expect("Execution failed");
@@ -529,6 +535,7 @@ mod tests {
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let mut handle = executor.execute(config).await.expect("Execution failed");
@@ -580,6 +587,7 @@ mod tests {
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let mut handle = executor.execute(config).await.expect("Execution failed");
@@ -613,6 +621,7 @@ mod tests {
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let result = executor.execute(config).await;
@@ -643,6 +652,7 @@ mod tests {
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let result = executor.execute(config).await;
@@ -684,6 +694,7 @@ mod tests {
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let handle = executor.execute(config).await.expect("Execution failed");
@@ -764,6 +775,7 @@ mod tests {
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let mut handle = executor.execute(config).await.expect("Execution failed");

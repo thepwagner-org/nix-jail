@@ -180,6 +180,10 @@ pub fn service(
         storage::StorageError::InvalidPath(format!("failed to initialize cache manager: {}", e))
     })?;
 
+    // Create platform-specific executor
+    let executor = executor::create_executor();
+    tracing::info!(executor = %executor.name(), "initialized executor");
+
     // Create job root based on configured strategy
     let job_root = root::get_job_root(config.store_strategy, cache_manager.clone());
     tracing::info!(strategy = ?job_root, "initialized job root");
@@ -190,13 +194,16 @@ pub fn service(
 
     let registry = job_registry::JobRegistry::new();
     Ok(JailServiceServer::new(JailServiceImpl::new(
-        storage,
-        config,
-        registry,
-        cache_manager,
-        job_root,
-        job_workspace,
-        session_registry,
+        service::JailServiceConfig {
+            storage,
+            config,
+            registry,
+            cache_manager,
+            executor,
+            job_root,
+            job_workspace,
+            session_registry,
+        },
     )))
 }
 
