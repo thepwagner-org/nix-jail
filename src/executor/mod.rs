@@ -20,7 +20,9 @@ mod sandbox_policy;
 pub mod systemd;
 
 // Re-export main types
-pub use traits::{ExecutionConfig, ExecutionHandle, Executor, ExecutorError, HardeningProfile};
+pub use traits::{
+    ExecutionConfig, ExecutionHandle, Executor, ExecutorError, HardeningProfile, IoHandle,
+};
 
 // Re-export types module for backward compatibility
 pub use types::JobExecutor;

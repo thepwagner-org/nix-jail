@@ -7,15 +7,18 @@ use tracing_subscriber::{
 pub mod cache;
 pub mod config;
 pub mod executor;
+pub mod hashbang;
 pub mod job_dir;
 pub mod job_registry;
 pub mod job_workspace;
+pub mod log_sink;
 pub mod networkpolicy;
 pub mod orchestration;
 pub mod proxy;
 pub mod proxy_manager;
 pub mod root;
 pub mod service;
+pub mod session;
 pub mod storage;
 pub mod streaming;
 pub mod validation;
@@ -154,6 +157,7 @@ fn init_otlp_tracer(
 pub fn service(
     db_path: impl AsRef<std::path::Path>,
     config: config::ServerConfig,
+    session_registry: std::sync::Arc<session::SessionRegistry>,
 ) -> Result<JailServiceServer<JailServiceImpl>, storage::StorageError> {
     let path_str = db_path.as_ref().to_str().ok_or_else(|| {
         storage::StorageError::InvalidPath("Database path contains invalid UTF-8".to_string())
@@ -192,6 +196,7 @@ pub fn service(
         cache_manager,
         job_root,
         job_workspace,
+        session_registry,
     )))
 }
 

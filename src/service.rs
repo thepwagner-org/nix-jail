@@ -53,6 +53,7 @@ pub struct JailServiceImpl {
     cache_manager: CacheManager,
     job_root: Arc<dyn crate::job_dir::JobRoot>,
     job_workspace: Arc<dyn JobWorkspace>,
+    session_registry: Arc<crate::session::SessionRegistry>,
 }
 
 impl std::fmt::Debug for JailServiceImpl {
@@ -64,6 +65,7 @@ impl std::fmt::Debug for JailServiceImpl {
             .field("cache_manager", &self.cache_manager)
             .field("job_root", &self.job_root)
             .field("job_workspace", &self.job_workspace)
+            .field("session_registry", &self.session_registry)
             .finish()
     }
 }
@@ -76,6 +78,7 @@ impl JailServiceImpl {
         cache_manager: CacheManager,
         job_root: Arc<dyn crate::job_dir::JobRoot>,
         job_workspace: Arc<dyn JobWorkspace>,
+        session_registry: Arc<crate::session::SessionRegistry>,
     ) -> Self {
         Self {
             storage,
@@ -84,6 +87,7 @@ impl JailServiceImpl {
             cache_manager,
             job_root,
             job_workspace,
+            session_registry,
         }
     }
 }
@@ -118,6 +122,8 @@ impl JailService for JailServiceImpl {
         }
 
         let job_id = Ulid::new().to_string();
+        let interactive = req.interactive.unwrap_or(false);
+
         tracing::info!(
             job_id = %job_id,
             packages = ?req.packages,
@@ -126,6 +132,7 @@ impl JailService for JailServiceImpl {
             path = %req.path,
             nixpkgs_version = %req.nixpkgs_version.as_deref().unwrap_or("(none)"),
             hardening_profile = %req.hardening_profile.as_deref().unwrap_or("default"),
+            interactive = interactive,
             "job received"
         );
 
@@ -161,6 +168,33 @@ impl JailService for JailServiceImpl {
         let (log_tx, _) = tokio::sync::broadcast::channel(1000);
         let log_tx_for_exec = log_tx.clone();
 
+        // Generate WebSocket URL and register session if interactive
+        let (websocket_url, session_registry_for_exec) = if interactive {
+            // Register session for token validation (channels added by executor)
+            let token = self.session_registry.register(job_id.clone()).await;
+
+            // Calculate WebSocket URL (gRPC port + 1)
+            let ws_port = self.config.addr.port() + 1;
+            let ws_host = self.config.addr.ip();
+            let url = format!(
+                "ws://{}:{}/session/{}?token={}",
+                ws_host,
+                ws_port,
+                job_id,
+                token.as_str()
+            );
+
+            tracing::info!(
+                job_id = %job_id,
+                websocket_url = %url,
+                "created interactive session"
+            );
+
+            (Some(url), Some(self.session_registry.clone()))
+        } else {
+            (None, None)
+        };
+
         // Spawn execution task with trace context propagated
         let exec_span = tracing::info_span!(parent: &span, "execute_job", job_id = %job_id);
         let task_handle = tokio::spawn(
@@ -173,6 +207,8 @@ impl JailService for JailServiceImpl {
                     registry_for_exec,
                     job_root_for_exec,
                     job_workspace_for_exec,
+                    interactive,
+                    session_registry_for_exec,
                 )
                 .await;
             }
@@ -191,7 +227,10 @@ impl JailService for JailServiceImpl {
         let mut jobs = self.registry.jobs.write().await;
         let _ = jobs.insert(job_id.clone(), running_job);
 
-        Ok(Response::new(JobResponse { job_id }))
+        Ok(Response::new(JobResponse {
+            job_id,
+            websocket_url,
+        }))
     }
 
     type StreamJobStream = ReceiverStream<Result<LogEntry, Status>>;

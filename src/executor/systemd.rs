@@ -813,8 +813,10 @@ impl Executor for SystemdExecutor {
         }));
 
         Ok(ExecutionHandle {
-            stdout: stdout_rx,
-            stderr: stderr_rx,
+            io: super::traits::IoHandle::Piped {
+                stdout: stdout_rx,
+                stderr: stderr_rx,
+            },
             exit_code: exit_rx,
         })
     }
@@ -878,6 +880,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             env: HashMap::new(),
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
         let props = generate_hardening_properties(
@@ -987,6 +990,7 @@ mod tests {
             timeout: Duration::from_secs(120),
             env: HashMap::new(),
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
         let props = generate_hardening_properties(
@@ -1194,6 +1198,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             env: HashMap::new(),
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
         let props_default = generate_hardening_properties(
@@ -1221,6 +1226,7 @@ mod tests {
             timeout: Duration::from_secs(60),
             env: HashMap::new(),
             hardening_profile: HardeningProfile::JitRuntime,
+            interactive: false,
         };
 
         let props_jit = generate_hardening_properties(
@@ -1280,6 +1286,7 @@ mod tests {
             store_paths: vec![],
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
         let executor = SystemdExecutor::new();

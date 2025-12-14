@@ -115,6 +115,29 @@ pub struct ExecutionConfig {
     pub proxy_port: Option<u16>,
     /// Hardening profile (used on Linux, ignored on macOS)
     pub hardening_profile: HardeningProfile,
+    /// Use PTY mode for interactive terminal sessions
+    pub interactive: bool,
+}
+
+/// I/O handle for job execution
+///
+/// Differentiates between piped (line-based) and PTY (raw byte) modes.
+#[derive(Debug)]
+pub enum IoHandle {
+    /// Piped mode: separate stdout/stderr channels with line-based streaming
+    Piped {
+        /// Channel receiving stdout lines
+        stdout: mpsc::Receiver<String>,
+        /// Channel receiving stderr lines
+        stderr: mpsc::Receiver<String>,
+    },
+    /// PTY mode: single bidirectional channel for interactive terminal
+    Pty {
+        /// Channel for sending input bytes to the PTY
+        stdin: mpsc::Sender<Vec<u8>>,
+        /// Channel receiving output bytes from the PTY
+        stdout: mpsc::Receiver<Vec<u8>>,
+    },
 }
 
 /// Handle to a running job execution
@@ -123,10 +146,8 @@ pub struct ExecutionConfig {
 /// Platform-specific cleanup is handled internally by each executor.
 #[derive(Debug)]
 pub struct ExecutionHandle {
-    /// Channel receiving stdout lines
-    pub stdout: mpsc::Receiver<String>,
-    /// Channel receiving stderr lines
-    pub stderr: mpsc::Receiver<String>,
+    /// I/O handle (piped or PTY mode)
+    pub io: IoHandle,
     /// Receiver for the final exit code
     pub exit_code: oneshot::Receiver<i32>,
 }
@@ -255,8 +276,10 @@ pub mod mock {
             }));
 
             Ok(ExecutionHandle {
-                stdout: stdout_rx,
-                stderr: stderr_rx,
+                io: IoHandle::Piped {
+                    stdout: stdout_rx,
+                    stderr: stderr_rx,
+                },
                 exit_code: exit_rx,
             })
         }

@@ -1,11 +1,16 @@
+use std::sync::Arc;
+
 use clap::{Parser, Subcommand};
 use nix_jail::config::ClientConfig;
+use nix_jail::executor::HardeningProfile;
 use nix_jail::jail::jail_service_client::JailServiceClient;
 use nix_jail::jail::{
     GcRequest, HostPattern, IpPattern, JobRequest, LogSource, NetworkAction, NetworkPattern,
     NetworkPolicy, NetworkRule, StreamRequest,
 };
+use nix_jail::log_sink::StdioLogSink;
 use nix_jail::networkpolicy::ClientNetworkPolicy;
+use nix_jail::orchestration::{execute_local, LocalExecutionConfig};
 use tonic::Request;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -150,6 +155,12 @@ enum Commands {
         #[command(flatten)]
         output: OutputOptions,
     },
+    /// Attach to an interactive job via WebSocket TTY
+    AttachInteractive {
+        /// WebSocket URL for the interactive session
+        /// Format: ws://host:port/session/{job_id}?token={token}
+        websocket_url: String,
+    },
     /// List jobs with optional filtering
     List {
         /// Filter by job status (Running, Completed, Failed, Pending)
@@ -170,6 +181,49 @@ enum Commands {
     },
     /// Run garbage collection to clear the cache
     Gc,
+
+    /// Execute a command locally without a server (serverless mode)
+    Run {
+        /// Nix packages to make available (can be specified multiple times)
+        #[arg(short, long)]
+        package: Vec<String>,
+
+        /// Path to network policy TOML file
+        #[arg(long)]
+        policy: Option<std::path::PathBuf>,
+
+        /// Allow access to specific hosts (can be specified multiple times)
+        #[arg(long)]
+        allow_host: Vec<String>,
+
+        /// Allow access to specific CIDR ranges (can be specified multiple times)
+        #[arg(long)]
+        allow_cidr: Vec<String>,
+
+        /// Working directory (defaults to current directory)
+        #[arg(long)]
+        workdir: Option<std::path::PathBuf>,
+
+        /// Nixpkgs version to use for package resolution
+        #[arg(long, alias = "nixpkgs", default_value = "nixos-25.05")]
+        nixpkgs_version: String,
+
+        /// Hardening profile for systemd execution (Linux only)
+        #[arg(long)]
+        hardening_profile: Option<String>,
+
+        /// Path to config file (same format as server config)
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+
+        /// Show output prefixes for log sources
+        #[arg(long)]
+        show_prefix: bool,
+
+        /// Command to execute (everything after --)
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -183,6 +237,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.otlp_endpoint.as_deref(),
     );
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Handle Run command separately (doesn't need server connection)
+    if let Commands::Run {
+        package,
+        policy,
+        allow_host,
+        allow_cidr,
+        workdir,
+        nixpkgs_version,
+        hardening_profile,
+        config,
+        show_prefix,
+        command,
+    } = cli.command
+    {
+        let exit_code = run_local(
+            package,
+            policy,
+            allow_host,
+            allow_cidr,
+            workdir,
+            nixpkgs_version,
+            hardening_profile,
+            config,
+            show_prefix,
+            command,
+        )
+        .await?;
+        std::process::exit(exit_code);
+    }
 
     let server = cli
         .server
@@ -236,6 +320,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             attach_job(&mut client, job_id, tail, output).await?;
         }
+        Commands::AttachInteractive { websocket_url } => {
+            attach_interactive(websocket_url).await?;
+        }
         Commands::List {
             status,
             limit,
@@ -247,6 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Gc => {
             gc_cache(&mut client).await?;
         }
+        Commands::Run { .. } => unreachable!(), // Handled above
     }
 
     Ok(())
@@ -362,6 +450,7 @@ async fn exec_job(
         nixpkgs_version: Some(nixpkgs_version),
         hardening_profile,
         push: Some(push),
+        interactive: None, // Not interactive for exec mode
     });
 
     let job_id = {
@@ -379,22 +468,10 @@ async fn exec_job(
 /// Detect hashbang from script content and return interpreter_name
 /// Only supports: sh, bash, python3
 fn detect_hashbang(script: &str) -> Option<String> {
-    let first_line = script.lines().next()?;
-    if !first_line.starts_with("#!") {
-        return None;
-    }
-
-    let shebang = first_line.trim_start_matches("#!").trim();
-    let binary = if shebang.contains("/env ") || shebang.contains("/env\t") {
-        // Handle "#!/usr/bin/env bash" or "#!/usr/bin/env python3"
-        shebang.split_whitespace().last()?
-    } else {
-        // Handle "#!/bin/bash" or "#!/usr/bin/python3"
-        shebang.split('/').next_back()?.split_whitespace().next()?
-    };
+    let interpreter = nix_jail::hashbang::detect_interpreter(script)?;
 
     // Only allow specific interpreters
-    match binary {
+    match interpreter.as_str() {
         "sh" | "bash" => Some("bash".to_string()),
         "python3" => Some("python3".to_string()),
         _ => None,
@@ -574,6 +651,119 @@ async fn gc_cache(
     Ok(())
 }
 
+/// Execute a command locally without a server
+#[allow(clippy::too_many_arguments)]
+async fn run_local(
+    packages: Vec<String>,
+    policy_path: Option<std::path::PathBuf>,
+    allow_hosts: Vec<String>,
+    allow_cidrs: Vec<String>,
+    workdir: Option<std::path::PathBuf>,
+    nixpkgs_version: String,
+    hardening_profile: Option<String>,
+    config_path: Option<std::path::PathBuf>,
+    show_prefix: bool,
+    command: Vec<String>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    tracing::info!(packages = ?packages, "running locally");
+
+    // Determine working directory
+    let working_dir = match workdir {
+        Some(dir) => dir.canonicalize()?,
+        None => std::env::current_dir()?,
+    };
+
+    // Load network policy if provided
+    let mut network_policy = if let Some(ref path) = policy_path {
+        let policy_toml = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read policy file {}: {}", path.display(), e))?;
+        let policy_file: ClientNetworkPolicy = toml::from_str(&policy_toml)
+            .map_err(|e| format!("Failed to parse policy TOML: {}", e))?;
+        tracing::info!(
+            "loaded network policy from {} with {} rules",
+            path.display(),
+            policy_file.rules.len()
+        );
+        Some(policy_file.to_proto())
+    } else {
+        None
+    };
+
+    // Apply CLI overrides for allowed hosts/CIDRs
+    if !allow_hosts.is_empty() || !allow_cidrs.is_empty() {
+        let mut rules = vec![];
+
+        for host in allow_hosts {
+            rules.push(NetworkRule {
+                pattern: Some(NetworkPattern {
+                    pattern: Some(nix_jail::jail::network_pattern::Pattern::Host(
+                        HostPattern { host, path: None },
+                    )),
+                }),
+                action: NetworkAction::Allow as i32,
+                credential: None,
+            });
+        }
+
+        for cidr in allow_cidrs {
+            rules.push(NetworkRule {
+                pattern: Some(NetworkPattern {
+                    pattern: Some(nix_jail::jail::network_pattern::Pattern::Ip(IpPattern {
+                        cidr,
+                    })),
+                }),
+                action: NetworkAction::Allow as i32,
+                credential: None,
+            });
+        }
+
+        // Merge with existing policy or create new
+        if let Some(ref mut policy) = network_policy {
+            policy.rules.extend(rules);
+        } else {
+            network_policy = Some(NetworkPolicy { rules });
+        }
+    }
+
+    // Parse hardening profile
+    let profile = match hardening_profile.as_deref() {
+        Some(s) => s.parse::<HardeningProfile>()?,
+        None => HardeningProfile::Default,
+    };
+
+    // Load credentials from config file if provided
+    let credentials = if let Some(ref path) = config_path {
+        let config = nix_jail::config::ServerConfig::from_toml_file(path)?;
+        config.credentials
+    } else {
+        vec![]
+    };
+
+    // Determine state directory
+    let state_dir = std::env::temp_dir().join("nix-jail-local");
+    std::fs::create_dir_all(&state_dir)?;
+
+    // Create log sink
+    let log_sink = Arc::new(StdioLogSink::new(show_prefix));
+
+    // Build execution config
+    let exec_config = LocalExecutionConfig {
+        packages,
+        command,
+        working_dir,
+        network_policy,
+        credentials,
+        hardening_profile: profile,
+        state_dir,
+        nixpkgs_version: Some(nixpkgs_version),
+    };
+
+    // Execute
+    let exit_code = execute_local(exec_config, log_sink).await?;
+
+    Ok(exit_code)
+}
+
 /// Format duration in seconds to human-readable format
 fn format_duration(seconds: u64) -> String {
     if seconds < 60 {
@@ -646,6 +836,141 @@ async fn stream_job_output(
     tracing::info!(job_id = %job_id, "job finished streaming");
 
     Ok(())
+}
+
+/// Attach to an interactive job via WebSocket
+#[tracing::instrument(skip(websocket_url), fields(url = %websocket_url))]
+async fn attach_interactive(websocket_url: String) -> Result<(), Box<dyn std::error::Error>> {
+    use futures::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message;
+
+    tracing::info!("connecting to interactive session");
+
+    // Connect to WebSocket
+    let (ws_stream, _) = connect_async(&websocket_url).await?;
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+    // Extract job_id and token from URL
+    let url_parts: Vec<&str> = websocket_url.split('/').collect();
+    let session_part = url_parts
+        .last()
+        .ok_or("invalid websocket url")?
+        .split('?')
+        .collect::<Vec<&str>>();
+    let job_id = session_part.first().ok_or("missing job_id")?;
+    let token = session_part
+        .get(1)
+        .and_then(|s| s.strip_prefix("token="))
+        .ok_or("missing token")?;
+
+    // Send authentication
+    let auth_msg = serde_json::json!({
+        "job_id": job_id,
+        "token": token,
+    });
+    ws_sender.send(Message::Text(auth_msg.to_string())).await?;
+
+    // Wait for auth response
+    let auth_response = ws_receiver.next().await.ok_or("connection closed")??;
+    match auth_response {
+        Message::Text(text) => {
+            let response: serde_json::Value = serde_json::from_str(&text)?;
+            if response.get("error").is_some() {
+                return Err(format!("authentication failed: {}", text).into());
+            }
+            tracing::info!("authenticated successfully");
+        }
+        _ => return Err("unexpected auth response".into()),
+    }
+
+    // Put terminal in raw mode
+    let _raw_guard = enable_raw_mode()?;
+
+    // Spawn task to read from stdin and send to WebSocket
+    let stdin_handle = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let mut buf = vec![0u8; 1024];
+
+        loop {
+            match stdin.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if ws_sender
+                        .send(Message::Binary(buf[..n].to_vec()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "stdin read error");
+                    break;
+                }
+            }
+        }
+    });
+
+    // Read from WebSocket and write to stdout
+    let mut stdout = tokio::io::stdout();
+    while let Some(msg_result) = ws_receiver.next().await {
+        match msg_result {
+            Ok(Message::Binary(data)) => {
+                stdout.write_all(&data).await?;
+                stdout.flush().await?;
+            }
+            Ok(Message::Close(_)) => {
+                tracing::info!("server closed connection");
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "websocket error");
+                break;
+            }
+        }
+    }
+
+    // Clean up
+    stdin_handle.abort();
+
+    Ok(())
+}
+
+/// Enable raw mode for terminal (disable line buffering and echo)
+fn enable_raw_mode() -> Result<RawModeGuard, Box<dyn std::error::Error>> {
+    use std::io::stdin;
+
+    // Get current terminal attributes
+    let original_termios = nix::sys::termios::tcgetattr(stdin())?;
+
+    // Create new termios with raw mode settings
+    let mut raw_termios = original_termios.clone();
+    nix::sys::termios::cfmakeraw(&mut raw_termios);
+
+    // Apply raw mode
+    nix::sys::termios::tcsetattr(stdin(), nix::sys::termios::SetArg::TCSANOW, &raw_termios)?;
+
+    Ok(RawModeGuard { original_termios })
+}
+
+/// Guard that restores terminal mode on drop
+struct RawModeGuard {
+    original_termios: nix::sys::termios::Termios,
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        use std::io::stdin;
+        // Restore original terminal settings
+        let _ = nix::sys::termios::tcsetattr(
+            stdin(),
+            nix::sys::termios::SetArg::TCSANOW,
+            &self.original_termios,
+        );
+    }
 }
 
 #[cfg(test)]

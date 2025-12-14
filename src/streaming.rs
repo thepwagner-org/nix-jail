@@ -3,16 +3,42 @@
 //! Provides helpers to stream logs from various sources (stdout, stderr, proxy)
 //! to both storage and gRPC clients.
 
+use std::sync::Arc;
+
 use crate::jail::LogEntry as GrpcLogEntry;
 use crate::jail::LogSource;
+use crate::log_sink::LogSink;
 use crate::storage::{JobStorage, LogEntry as StorageLogEntry};
 use std::time::SystemTime;
 use tokio::sync::{broadcast, mpsc};
 use tonic::Status;
 
-/// Stream logs from a channel to both storage and broadcast channel
+/// Stream logs from a channel to a LogSink
 ///
 /// This is the core streaming primitive that handles:
+/// - Receiving log lines from a source channel (mpsc from executor)
+/// - Forwarding them to a LogSink implementation
+///
+/// # Arguments
+/// * `job_id` - Job ID for logging
+/// * `source` - Type of log source
+/// * `receiver` - Channel receiving log lines from executor
+/// * `log_sink` - Destination for logs
+pub async fn stream_to_sink(
+    job_id: String,
+    source: LogSource,
+    mut receiver: mpsc::Receiver<String>,
+    log_sink: Arc<dyn LogSink>,
+) {
+    while let Some(line) = receiver.recv().await {
+        let message = format!("{}\n", line);
+        log_sink.log(&job_id, source, &message);
+    }
+}
+
+/// Stream logs from a channel to both storage and broadcast channel
+///
+/// This is the legacy streaming primitive that handles:
 /// - Receiving log lines from a source channel (mpsc from executor)
 /// - Persisting them to storage
 /// - Forwarding them to the broadcast channel (for multiple clients)

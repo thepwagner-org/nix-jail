@@ -56,6 +56,12 @@ message JobRequest {
   //
   // Requires: repo to be set and GitHub credential in server config
   optional bool push = 9;
+
+  // Enable interactive TTY mode for this job
+  // If true, the server will allocate a PTY and provide a WebSocket URL
+  // for bidirectional terminal communication. The job will wait for a
+  // client to connect before starting execution.
+  optional bool interactive = 10;
 }
 
 // Network policy controlling allowed/denied hosts and credential usage
@@ -113,6 +119,10 @@ enum NetworkAction {
 message JobResponse {
   // Unique identifier for the submitted job
   string job_id = 1;
+
+  // WebSocket URL for interactive terminal sessions (only for interactive jobs)
+  // Format: ws://host:port/session/{job_id}?token={auth_token}
+  optional string websocket_url = 2;
 }
 
 // Request to stream logs for a job

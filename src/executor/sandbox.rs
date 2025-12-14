@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
-use super::traits::{ExecutionConfig, ExecutionHandle, Executor, ExecutorError};
+use super::traits::{ExecutionConfig, ExecutionHandle, Executor, ExecutorError, IoHandle};
 
 /// macOS sandbox-exec based executor
 ///
@@ -118,88 +118,204 @@ impl Executor for SandboxExecutor {
                 .map_err(|e| ExecutorError::SpawnFailed(format!("{}: {}", program, e)))?
         };
 
-        // Take stdout and stderr handles
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ExecutorError::SpawnFailed("Failed to capture stdout".to_string()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| ExecutorError::SpawnFailed("Failed to capture stderr".to_string()))?;
-
         let timeout = config.timeout;
         let job_id = config.job_id.clone();
+        let interactive = config.interactive;
 
-        // Spawn task to handle process execution, output streaming, and cleanup
-        // Intentionally detached: communicates via channels
-        drop(tokio::spawn(async move {
-            // Stream stdout
-            let stdout_task = {
-                let stdout_tx = stdout_tx.clone();
-                tokio::spawn(async move {
-                    let reader = BufReader::new(stdout);
-                    let mut lines = reader.lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        if stdout_tx.send(line).await.is_err() {
-                            break; // Receiver dropped
-                        }
-                    }
+        // Handle I/O based on interactive mode
+        let io_handle = if interactive {
+            // PTY mode: use portable-pty for interactive terminal
+            use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+            let pty_system = native_pty_system();
+            let pty_pair = pty_system
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
                 })
-            };
+                .map_err(|e| ExecutorError::SpawnFailed(format!("Failed to create PTY: {}", e)))?;
 
-            // Stream stderr
-            let stderr_task = {
-                let stderr_tx = stderr_tx.clone();
-                tokio::spawn(async move {
-                    let reader = BufReader::new(stderr);
-                    let mut lines = reader.lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        if stderr_tx.send(line).await.is_err() {
-                            break; // Receiver dropped
-                        }
-                    }
-                })
-            };
-
-            // Wait for process with timeout
-            let result = tokio::time::timeout(timeout, child.wait()).await;
-
-            match result {
-                Ok(Ok(status)) => {
-                    let exit_code = status.code().unwrap_or(-1);
-                    let _ = exit_tx.send(exit_code);
-                }
-                Ok(Err(e)) => {
-                    tracing::error!(job_id = %job_id, error = %e, "error waiting for process");
-                    let _ = exit_tx.send(-1);
-                }
-                Err(_) => {
-                    tracing::warn!(job_id = %job_id, "execution timed out, killing process");
-                    let _ = child.kill().await;
-                    let _ = exit_tx.send(-1);
-                }
+            // Build command for PTY
+            let mut cmd_builder = CommandBuilder::new(&config.command[0]);
+            cmd_builder.args(&config.command[1..]);
+            cmd_builder.cwd(&config.working_dir);
+            cmd_builder.env_clear();
+            for (k, v) in &config.env {
+                cmd_builder.env(k, v);
             }
 
-            // Wait for output tasks to complete
-            let _ = tokio::join!(stdout_task, stderr_task);
+            // Spawn process in PTY
+            let mut pty_child = pty_pair.slave.spawn_command(cmd_builder).map_err(|e| {
+                ExecutorError::SpawnFailed(format!("Failed to spawn in PTY: {}", e))
+            })?;
 
-            // Cleanup sandbox profile (internal cleanup - no external cleanup needed)
-            if let Some(profile_path) = cleanup_profile_path {
-                if let Err(e) = std::fs::remove_file(&profile_path) {
-                    tracing::warn!(
-                        job_id = %job_id,
-                        path = %profile_path.display(),
-                        error = %e,
-                        "failed to cleanup sandbox profile"
-                    );
+            // Get reader and writer for PTY master
+            let mut pty_reader = pty_pair.master.try_clone_reader().map_err(|e| {
+                ExecutorError::SpawnFailed(format!("Failed to clone PTY reader: {}", e))
+            })?;
+            let mut pty_writer = pty_pair.master.take_writer().map_err(|e| {
+                ExecutorError::SpawnFailed(format!("Failed to take PTY writer: {}", e))
+            })?;
+
+            let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(128);
+            let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
+
+            // Spawn task to handle PTY I/O and cleanup
+            drop(tokio::spawn(async move {
+                // Task to read from PTY and send to stdout channel (blocking I/O in spawn_blocking)
+                let read_task = {
+                    let stdout_tx = stdout_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        use std::io::Read;
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match pty_reader.read(&mut buf) {
+                                Ok(0) => break, // EOF
+                                Ok(n) => {
+                                    if stdout_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                                        break; // Receiver dropped
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    })
+                };
+
+                // Task to read from stdin channel and write to PTY
+                let write_task = tokio::task::spawn_blocking(move || {
+                    use std::io::Write;
+                    while let Some(data) = stdin_rx.blocking_recv() {
+                        if pty_writer.write_all(&data).is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                // Wait for process with timeout
+                let result = tokio::time::timeout(timeout, async {
+                    pty_child.wait().map_err(std::io::Error::other)
+                })
+                .await;
+
+                let exit_code = match result {
+                    Ok(Ok(status)) => status.exit_code() as i32,
+                    Ok(Err(e)) => {
+                        tracing::error!(job_id = %job_id, error = %e, "error waiting for process");
+                        -1
+                    }
+                    Err(_) => {
+                        tracing::warn!(job_id = %job_id, "execution timed out, killing process");
+                        let _ = pty_child.kill();
+                        -1
+                    }
+                };
+
+                let _ = exit_tx.send(exit_code);
+
+                // Wait for I/O tasks
+                let _ = tokio::join!(read_task, write_task);
+
+                // Cleanup sandbox profile
+                if let Some(profile_path) = cleanup_profile_path {
+                    if let Err(e) = std::fs::remove_file(&profile_path) {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            path = %profile_path.display(),
+                            error = %e,
+                            "failed to cleanup sandbox profile"
+                        );
+                    }
                 }
+            }));
+
+            IoHandle::Pty {
+                stdin: stdin_tx,
+                stdout: stdout_rx,
             }
-        }));
+        } else {
+            // Piped mode: separate stdout/stderr with line-based streaming
+            let stdout = child.stdout.take().ok_or_else(|| {
+                ExecutorError::SpawnFailed("Failed to capture stdout".to_string())
+            })?;
+            let stderr = child.stderr.take().ok_or_else(|| {
+                ExecutorError::SpawnFailed("Failed to capture stderr".to_string())
+            })?;
+
+            drop(tokio::spawn(async move {
+                // Stream stdout
+                let stdout_task = {
+                    let stdout_tx = stdout_tx.clone();
+                    tokio::spawn(async move {
+                        let reader = BufReader::new(stdout);
+                        let mut lines = reader.lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            if stdout_tx.send(line).await.is_err() {
+                                break; // Receiver dropped
+                            }
+                        }
+                    })
+                };
+
+                // Stream stderr
+                let stderr_task = {
+                    let stderr_tx = stderr_tx.clone();
+                    tokio::spawn(async move {
+                        let reader = BufReader::new(stderr);
+                        let mut lines = reader.lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            if stderr_tx.send(line).await.is_err() {
+                                break; // Receiver dropped
+                            }
+                        }
+                    })
+                };
+
+                // Wait for process with timeout
+                let result = tokio::time::timeout(timeout, child.wait()).await;
+
+                match result {
+                    Ok(Ok(status)) => {
+                        let exit_code = status.code().unwrap_or(-1);
+                        let _ = exit_tx.send(exit_code);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(job_id = %job_id, error = %e, "error waiting for process");
+                        let _ = exit_tx.send(-1);
+                    }
+                    Err(_) => {
+                        tracing::warn!(job_id = %job_id, "execution timed out, killing process");
+                        let _ = child.kill().await;
+                        let _ = exit_tx.send(-1);
+                    }
+                }
+
+                // Wait for output tasks to complete
+                let _ = tokio::join!(stdout_task, stderr_task);
+
+                // Cleanup sandbox profile (internal cleanup - no external cleanup needed)
+                if let Some(profile_path) = cleanup_profile_path {
+                    if let Err(e) = std::fs::remove_file(&profile_path) {
+                        tracing::warn!(
+                            job_id = %job_id,
+                            path = %profile_path.display(),
+                            error = %e,
+                            "failed to cleanup sandbox profile"
+                        );
+                    }
+                }
+            }));
+
+            IoHandle::Piped {
+                stdout: stdout_rx,
+                stderr: stderr_rx,
+            }
+        };
 
         Ok(ExecutionHandle {
-            stdout: stdout_rx,
-            stderr: stderr_rx,
+            io: io_handle,
             exit_code: exit_rx,
         })
     }
@@ -249,12 +365,17 @@ mod tests {
             store_paths: vec![],
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
-        let mut handle = executor.execute(config).await.expect("Execution failed");
+        let handle = executor.execute(config).await.expect("Execution failed");
 
         // Read stdout
-        let line = handle.stdout.recv().await.expect("No stdout received");
+        let line = if let IoHandle::Piped { mut stdout, .. } = handle.io {
+            stdout.recv().await.expect("No stdout received")
+        } else {
+            panic!("Expected piped mode");
+        };
         assert_eq!(line, "hello world");
 
         // Get exit code
@@ -280,12 +401,17 @@ mod tests {
             store_paths: vec![],
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
-        let mut handle = executor.execute(config).await.expect("Execution failed");
+        let handle = executor.execute(config).await.expect("Execution failed");
 
         // Read stderr
-        let line = handle.stderr.recv().await.expect("No stderr received");
+        let line = if let IoHandle::Piped { mut stderr, .. } = handle.io {
+            stderr.recv().await.expect("No stderr received")
+        } else {
+            panic!("Expected piped mode");
+        };
         assert_eq!(line, "error");
 
         // Get exit code
@@ -307,6 +433,7 @@ mod tests {
             store_paths: vec![],
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
         let handle = executor.execute(config).await.expect("Execution failed");
@@ -330,6 +457,7 @@ mod tests {
             store_paths: vec![],
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
         let handle = executor.execute(config).await.expect("Execution failed");
@@ -357,14 +485,24 @@ mod tests {
             store_paths: vec![],
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
         let mut handle = executor.execute(config).await.expect("Execution failed");
 
-        // Read multiple lines
-        let line1 = handle.stdout.recv().await.expect("No line1");
-        let line2 = handle.stdout.recv().await.expect("No line2");
-        let line3 = handle.stdout.recv().await.expect("No line3");
+        // Read multiple lines (extract stdout from IoHandle)
+        let (line1, line2, line3) = match handle.io {
+            IoHandle::Piped {
+                ref mut stdout,
+                stderr: _,
+            } => {
+                let l1 = stdout.recv().await.expect("No line1");
+                let l2 = stdout.recv().await.expect("No line2");
+                let l3 = stdout.recv().await.expect("No line3");
+                (l1, l2, l3)
+            }
+            _ => panic!("Expected piped mode"),
+        };
 
         assert_eq!(line1, "line1");
         assert_eq!(line2, "line2");
@@ -390,11 +528,18 @@ mod tests {
             store_paths: vec![],
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
         let mut handle = executor.execute(config).await.expect("Execution failed");
 
-        let line = handle.stdout.recv().await.expect("No stdout received");
+        let line = match handle.io {
+            IoHandle::Piped {
+                ref mut stdout,
+                stderr: _,
+            } => stdout.recv().await.expect("No stdout received"),
+            _ => panic!("Expected piped mode"),
+        };
 
         // On macOS, /tmp is a symlink to /private/tmp, so we canonicalize both
         let expected = std::fs::canonicalize(&tmp_dir)
@@ -434,11 +579,18 @@ mod tests {
             store_paths: vec![],
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
         let mut handle = executor.execute(config).await.expect("Execution failed");
 
-        let line = handle.stdout.recv().await.expect("No stdout received");
+        let line = match handle.io {
+            IoHandle::Piped {
+                ref mut stdout,
+                stderr: _,
+            } => stdout.recv().await.expect("No stdout received"),
+            _ => panic!("Expected piped mode"),
+        };
         assert_eq!(line, "test_value");
 
         let exit_code = handle.exit_code.await.expect("Failed to get exit code");
@@ -460,6 +612,7 @@ mod tests {
             store_paths: vec![],
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
         let result = executor.execute(config).await;
@@ -489,6 +642,7 @@ mod tests {
             store_paths: vec![],
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
         let result = executor.execute(config).await;
@@ -529,16 +683,23 @@ mod tests {
             store_paths: vec![curl_derivation],
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
-        let mut handle = executor.execute(config).await.expect("Execution failed");
+        let handle = executor.execute(config).await.expect("Execution failed");
+
+        // Extract stdout/stderr from IoHandle
+        let (mut stdout_rx, mut stderr_rx) = match handle.io {
+            IoHandle::Piped { stdout, stderr } => (stdout, stderr),
+            _ => panic!("Expected piped mode"),
+        };
 
         // Try to read stdout with a timeout
         let result = tokio::time::timeout(Duration::from_secs(3), async {
             // Spawn tasks to collect all output
             let stdout_task = tokio::spawn(async move {
                 let mut lines = Vec::new();
-                while let Some(line) = handle.stdout.recv().await {
+                while let Some(line) = stdout_rx.recv().await {
                     lines.push(line);
                 }
                 lines
@@ -546,7 +707,7 @@ mod tests {
 
             let stderr_task = tokio::spawn(async move {
                 let mut lines = Vec::new();
-                while let Some(line) = handle.stderr.recv().await {
+                while let Some(line) = stderr_rx.recv().await {
                     lines.push(line);
                 }
                 lines
@@ -602,12 +763,19 @@ mod tests {
             store_paths: vec![derivation],
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
+            interactive: false,
         };
 
         let mut handle = executor.execute(config).await.expect("Execution failed");
 
         // Should get ACCESS_DENIED due to sandbox restrictions
-        let line = handle.stdout.recv().await.expect("No stdout received");
+        let line = match handle.io {
+            IoHandle::Piped {
+                ref mut stdout,
+                stderr: _,
+            } => stdout.recv().await.expect("No stdout received"),
+            _ => panic!("Expected piped mode"),
+        };
         assert!(
             line.contains("ACCESS_DENIED"),
             "Sandbox should have restricted access to /etc/passwd, got: {}",

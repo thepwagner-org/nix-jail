@@ -7,7 +7,7 @@
 //! - Log streaming
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::{broadcast, mpsc};
@@ -19,10 +19,55 @@ use crate::executor::{create_executor, ExecutionConfig, HardeningProfile};
 use crate::jail::{LogEntry, LogSource, NetworkPolicy};
 use crate::job_dir::JobDirectory;
 use crate::job_workspace::JobWorkspace;
+use crate::log_sink::{LogSink, StorageLogSink};
 use crate::proxy_manager::ProxyManager;
+use crate::root::JobRoot;
 use crate::storage::{JobMetadata, JobStatus, JobStorage, LogEntry as StorageLogEntry};
 use crate::streaming;
 use crate::workspace;
+
+/// Error type for orchestration failures
+#[derive(Debug, thiserror::Error)]
+pub enum OrchestrationError {
+    #[error("failed to resolve state directory: {0}")]
+    StateDirError(String),
+
+    #[error("failed to create job directory: {0}")]
+    JobDirError(String),
+
+    #[error("failed to prepare workspace: {0}")]
+    WorkspaceError(String),
+
+    #[error("failed to configure proxy: {0}")]
+    ProxyConfigError(String),
+
+    #[error("failed to start proxy: {0}")]
+    ProxyStartError(String),
+
+    #[error("failed to compute flake closure: {0}")]
+    FlakeClosureError(String),
+
+    #[error("failed to find packages: {0}")]
+    PackageError(String),
+
+    #[error("failed to compute closure: {0}")]
+    ClosureError(String),
+
+    #[error("failed to prepare root: {0}")]
+    RootError(String),
+
+    #[error("invalid hardening profile '{0}': {1}")]
+    HardeningProfileError(String, String),
+
+    #[error("failed to execute job: {0}")]
+    ExecutionError(String),
+
+    #[error("proxy stdout not available")]
+    ProxyStdoutError,
+
+    #[error("proxy stderr not available")]
+    ProxyStderrError,
+}
 
 /// Extract credential names referenced in a network policy
 fn extract_credential_names(policy: Option<&NetworkPolicy>) -> HashSet<String> {
@@ -114,8 +159,13 @@ pub async fn execute_job(
     registry: crate::job_registry::JobRegistry,
     job_root: Arc<dyn crate::root::JobRoot>,
     job_workspace: Arc<dyn JobWorkspace>,
+    interactive: bool,
+    session_registry: Option<Arc<crate::session::SessionRegistry>>,
 ) {
     tracing::debug!(status = %job.status.to_string(), "executing job");
+
+    // Create log sink for this job (replaces send_info/send_error pattern)
+    let log_sink: Arc<dyn LogSink> = Arc::new(StorageLogSink::new(storage.clone(), tx.clone()));
 
     // Create platform-specific executor early so we can use its methods
     let executor = create_executor();
@@ -161,13 +211,10 @@ pub async fn execute_job(
     let state_dir = match config.state_dir.canonicalize() {
         Ok(path) => path,
         Err(e) => {
-            send_error(
+            log_sink.error(
                 &job_id,
-                format!("Failed to resolve state_dir to absolute path: {}", e),
-                &storage,
-                &tx,
-            )
-            .await;
+                &format!("Failed to resolve state_dir to absolute path: {}", e),
+            );
             let _ = storage.update_job_status(&job_id, JobStatus::Failed);
             return;
         }
@@ -176,13 +223,7 @@ pub async fn execute_job(
     let job_dir = match JobDirectory::new(&state_dir, &job_id) {
         Ok(dir) => dir,
         Err(e) => {
-            send_error(
-                &job_id,
-                format!("Failed to create job directory: {}", e),
-                &storage,
-                &tx,
-            )
-            .await;
+            log_sink.error(&job_id, &format!("Failed to create job directory: {}", e));
             let _ = storage.update_job_status(&job_id, JobStatus::Failed);
             return;
         }
@@ -209,13 +250,7 @@ pub async fn execute_job(
                 dir
             }
             Err(e) => {
-                send_error(
-                    &job_id,
-                    format!("Failed to prepare workspace: {}", e),
-                    &storage,
-                    &tx,
-                )
-                .await;
+                log_sink.error(&job_id, &format!("Failed to prepare workspace: {}", e));
                 let _ = storage.update_job_status(&job_id, JobStatus::Failed);
                 return;
             }
@@ -280,36 +315,27 @@ pub async fn execute_job(
                 );
 
                 if let Some(ref policy) = job.network_policy {
-                    send_info(
+                    log_sink.info(
                         &job_id,
-                        format!(
+                        &format!(
                             "Network policy configured with {} rules",
                             policy.rules.len()
                         ),
-                        &storage,
-                        &tx,
-                    )
-                    .await;
+                    );
                 }
                 Some(path)
             }
             Err(e) => {
                 let error_msg = format!("Failed to configure proxy: {}", e);
                 tracing::error!(job_id = %job_id, error = %error_msg, "Failed to create proxy config");
-                send_error(&job_id, error_msg, &storage, &tx).await;
+                log_sink.error(&job_id, &error_msg);
                 return;
             }
         }
     } else {
         // No network policy or empty rules - skip proxy entirely and block all network access
         tracing::info!("no network rules configured - skipping proxy (network will be blocked)");
-        send_info(
-            &job_id,
-            "Network access blocked (no policy or empty rules)".to_string(),
-            &storage,
-            &tx,
-        )
-        .await;
+        log_sink.info(&job_id, "Network access blocked (no policy or empty rules)");
         None
     };
 
@@ -318,25 +344,19 @@ pub async fn execute_job(
         // Flake detected - use flake shell and ignore explicit packages
         if !packages.is_empty() {
             let pkg_list = packages.join(", ");
-            send_info(
+            log_sink.info(
                 &job_id,
-                format!(
+                &format!(
                     "Found flake.nix - using flake shell (ignoring specified packages: {})",
                     pkg_list
                 ),
-                &storage,
-                &tx,
-            )
-            .await;
+            );
         }
 
-        send_info(
+        log_sink.info(
             &job_id,
-            format!("Computing flake closure from {}", workspace_dir.display()),
-            &storage,
-            &tx,
-        )
-        .await;
+            &format!("Computing flake closure from {}", workspace_dir.display()),
+        );
 
         match workspace::compute_flake_closure(&workspace_dir).await {
             Ok(paths) => {
@@ -345,23 +365,14 @@ pub async fn execute_job(
                     path_count = paths.len(),
                     "computed flake closure"
                 );
-                send_info(
+                log_sink.info(
                     &job_id,
-                    format!("Flake closure: {} store paths", paths.len()),
-                    &storage,
-                    &tx,
-                )
-                .await;
+                    &format!("Flake closure: {} store paths", paths.len()),
+                );
                 paths
             }
             Err(e) => {
-                send_error(
-                    &job_id,
-                    format!("Failed to compute flake closure: {}", e),
-                    &storage,
-                    &tx,
-                )
-                .await;
+                log_sink.error(&job_id, &format!("Failed to compute flake closure: {}", e));
                 let _ = storage.update_job_status(&job_id, JobStatus::Failed);
                 return;
             }
@@ -375,7 +386,7 @@ pub async fn execute_job(
             nixpkgs_version,
             &job_id,
             &storage,
-            &tx,
+            &log_sink,
         )
         .instrument(tracing::info_span!("resolve_packages"))
         .await;
@@ -396,13 +407,7 @@ pub async fn execute_job(
                 c
             }
             Err(e) => {
-                send_error(
-                    &job_id,
-                    format!("Failed to compute closure: {}", e),
-                    &storage,
-                    &tx,
-                )
-                .await;
+                log_sink.error(&job_id, &format!("Failed to compute closure: {}", e));
                 let _ = storage.update_job_status(&job_id, JobStatus::Failed);
                 return;
             }
@@ -430,17 +435,11 @@ pub async fn execute_job(
                     format!("Using bind-mount strategy ({} store paths)", paths.len())
                 }
             };
-            send_info(&job_id, msg, &storage, &tx).await;
+            log_sink.info(&job_id, &msg);
             (setup, hit)
         }
         Err(e) => {
-            send_error(
-                &job_id,
-                format!("Failed to prepare root: {}", e),
-                &storage,
-                &tx,
-            )
-            .await;
+            log_sink.error(&job_id, &format!("Failed to prepare root: {}", e));
             let _ = storage.update_job_status(&job_id, JobStatus::Failed);
             return;
         }
@@ -455,7 +454,7 @@ pub async fn execute_job(
             config_path.clone(),
             executor.proxy_listen_addr(),
             &storage,
-            &tx,
+            &log_sink,
         )
         .instrument(tracing::info_span!("start_proxy"))
         .await
@@ -499,23 +498,17 @@ pub async fn execute_job(
                     tracing::info!(job_id = %job_id, "added security wrapper to PATH");
                 }
                 tracing::info!(job_id = %job_id, "claude code configured with dummy token (proxy will inject real token)");
-                send_info(
+                log_sink.info(
                     &job_id,
-                    "Claude Code configured (OAuth via proxy injection)".to_string(),
-                    &storage,
-                    &tx,
-                )
-                .await;
+                    "Claude Code configured (OAuth via proxy injection)",
+                );
             }
             Err(e) => {
                 tracing::warn!(job_id = %job_id, error = %e, "failed to copy claude configuration");
-                send_info(
+                log_sink.info(
                     &job_id,
-                    format!("Warning: Could not configure Claude Code: {}", e),
-                    &storage,
-                    &tx,
-                )
-                .await;
+                    &format!("Warning: Could not configure Claude Code: {}", e),
+                );
             }
         }
     }
@@ -530,23 +523,16 @@ pub async fn execute_job(
             if let Some(ref dummy_token) = github_cred.dummy_token {
                 let _ = env.insert("GITHUB_TOKEN".to_string(), dummy_token.clone());
                 tracing::info!(job_id = %job_id, "set GITHUB_TOKEN with dummy token (proxy will inject real token)");
-                send_info(
+                log_sink.info(
                     &job_id,
-                    "GitHub token configured (proxy will inject real token)".to_string(),
-                    &storage,
-                    &tx,
-                )
-                .await;
+                    "GitHub token configured (proxy will inject real token)",
+                );
             } else {
                 tracing::warn!(job_id = %job_id, "github credential has no dummy_token configured");
-                send_info(
+                log_sink.info(
                     &job_id,
-                    "Warning: GitHub credential has no dummy_token (GITHUB_TOKEN not set)"
-                        .to_string(),
-                    &storage,
-                    &tx,
-                )
-                .await;
+                    "Warning: GitHub credential has no dummy_token (GITHUB_TOKEN not set)",
+                );
             }
         }
     }
@@ -563,13 +549,10 @@ pub async fn execute_job(
         match HardeningProfile::from_str(profile_str) {
             Ok(profile) => profile,
             Err(e) => {
-                send_error(
+                log_sink.error(
                     &job_id,
-                    format!("Invalid hardening profile '{}': {}", profile_str, e),
-                    &storage,
-                    &tx,
-                )
-                .await;
+                    &format!("Invalid hardening profile '{}': {}", profile_str, e),
+                );
                 return;
             }
         }
@@ -586,6 +569,7 @@ pub async fn execute_job(
         store_paths: closure.clone(), // For command path resolution
         proxy_port: proxy.as_ref().map(|p| p.port),
         hardening_profile,
+        interactive,
     };
 
     // Execute job using platform-specific executor (created earlier)
@@ -599,46 +583,58 @@ pub async fn execute_job(
             h
         }
         Err(e) => {
-            send_error(
-                &job_id,
-                format!("Failed to execute job: {}", e),
-                &storage,
-                &tx,
-            )
-            .await;
+            log_sink.error(&job_id, &format!("Failed to execute job: {}", e));
             let _ = storage.update_job_status(&job_id, JobStatus::Failed);
             return;
         }
     };
 
-    let stdout_task = spawn_stream_task(
-        job_id.clone(),
-        LogSource::JobStdout,
-        handle.stdout,
-        storage.clone(),
-        tx.clone(),
-    );
+    // Extract stdout/stderr from handle based on mode
+    let (stdout_task, stderr_task) = match handle.io {
+        crate::executor::IoHandle::Piped { stdout, stderr } => {
+            let stdout_task = spawn_stream_task(
+                job_id.clone(),
+                LogSource::JobStdout,
+                stdout,
+                storage.clone(),
+                tx.clone(),
+            );
 
-    let stderr_task = spawn_stream_task(
-        job_id.clone(),
-        LogSource::JobStderr,
-        handle.stderr,
-        storage.clone(),
-        tx.clone(),
-    );
+            let stderr_task = spawn_stream_task(
+                job_id.clone(),
+                LogSource::JobStderr,
+                stderr,
+                storage.clone(),
+                tx.clone(),
+            );
+
+            (stdout_task, stderr_task)
+        }
+        crate::executor::IoHandle::Pty { stdin, stdout } => {
+            // Store PTY channels in session registry for WebSocket access
+            if let Some(ref registry) = session_registry {
+                let _ = registry.set_channels(&job_id, stdin, stdout).await;
+                tracing::info!(job_id = %job_id, "pty channels stored for websocket access");
+                // No streaming tasks needed - WebSocket handles I/O directly
+                (
+                    tokio::spawn(async {}), // dummy task
+                    tokio::spawn(async {}), // dummy task
+                )
+            } else {
+                tracing::error!(job_id = %job_id, "pty mode requires session registry");
+                log_sink.error(&job_id, "PTY mode requires session registry");
+                let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+                return;
+            }
+        }
+    };
 
     let proxy_tasks = if let Some(ref mut proxy) = proxy {
         let proxy_stdout = match proxy.take_stdout() {
             Some(s) => s,
             None => {
                 tracing::error!(job_id = %job_id, "proxy stdout not available");
-                send_error(
-                    &job_id,
-                    "proxy stdout not available".to_string(),
-                    &storage,
-                    &tx,
-                )
-                .await;
+                log_sink.error(&job_id, "proxy stdout not available");
                 let _ = storage.update_job_status(&job_id, JobStatus::Failed);
                 return;
             }
@@ -648,13 +644,7 @@ pub async fn execute_job(
             Some(s) => s,
             None => {
                 tracing::error!(job_id = %job_id, "proxy stderr not available");
-                send_error(
-                    &job_id,
-                    "proxy stderr not available".to_string(),
-                    &storage,
-                    &tx,
-                )
-                .await;
+                log_sink.error(&job_id, "proxy stderr not available");
                 let _ = storage.update_job_status(&job_id, JobStatus::Failed);
                 return;
             }
@@ -747,28 +737,15 @@ pub async fn execute_job(
                 head_before: &before_sha,
                 base_branch: &original_branch,
                 config: &config,
-                storage: &storage,
-                tx: &tx,
+                log_sink: &log_sink,
             })
             .await
             {
                 Ok(pr_url) => {
-                    send_info(
-                        &job_id,
-                        format!("Pull request created: {}", pr_url),
-                        &storage,
-                        &tx,
-                    )
-                    .await;
+                    log_sink.info(&job_id, &format!("Pull request created: {}", pr_url));
                 }
                 Err(e) => {
-                    send_info(
-                        &job_id,
-                        format!("PR creation skipped: {}", e),
-                        &storage,
-                        &tx,
-                    )
-                    .await;
+                    log_sink.info(&job_id, &format!("PR creation skipped: {}", e));
                 }
             }
         }
@@ -800,7 +777,7 @@ async fn start_proxy(
     proxy_config_path: std::path::PathBuf,
     proxy_listen_addr: &str,
     storage: &JobStorage,
-    tx: &broadcast::Sender<Result<LogEntry, Status>>,
+    log_sink: &Arc<dyn LogSink>,
 ) -> Option<ProxyManager> {
     // Get platform-specific listen host from the provided address
     let listen_host = proxy_listen_addr
@@ -815,7 +792,7 @@ async fn start_proxy(
             Some(p)
         }
         Err(e) => {
-            send_error(job_id, format!("Failed to start proxy: {}", e), storage, tx).await;
+            log_sink.error(job_id, &format!("Failed to start proxy: {}", e));
             let _ = storage.update_job_status(job_id, JobStatus::Failed);
             None
         }
@@ -875,7 +852,7 @@ async fn find_packages(
     nixpkgs_version: Option<&str>,
     job_id: &str,
     storage: &JobStorage,
-    tx: &broadcast::Sender<Result<LogEntry, Status>>,
+    log_sink: &Arc<dyn LogSink>,
 ) -> Option<Vec<std::path::PathBuf>> {
     if is_exec_mode {
         let pkg_refs: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
@@ -886,13 +863,7 @@ async fn find_packages(
                 Some(paths)
             }
             Err(e) => {
-                send_error(
-                    job_id,
-                    format!("Failed to find packages: {}", e),
-                    storage,
-                    tx,
-                )
-                .await;
+                log_sink.error(job_id, &format!("Failed to find packages: {}", e));
                 let _ = storage.update_job_status(job_id, JobStatus::Failed);
                 None
             }
@@ -911,24 +882,9 @@ async fn find_packages(
 
 /// Detect hashbang from script content and return (interpreter_name, is_bash)
 fn detect_hashbang(script: &str) -> Option<(String, bool)> {
-    let first_line = script.lines().next()?;
-    if !first_line.starts_with("#!") {
-        return None;
-    }
-
-    let shebang = first_line.trim_start_matches("#!").trim();
-
-    // Handle "#!/usr/bin/env bash" or "#!/usr/bin/env python3"
-    if shebang.contains("/env ") || shebang.contains("/env\t") {
-        let binary = shebang.split_whitespace().last()?;
-        let is_bash = binary == "bash" || binary == "sh";
-        return Some((binary.to_string(), is_bash));
-    }
-
-    // Handle "#!/bin/bash" or "#!/usr/bin/python3"
-    let binary = shebang.split('/').next_back()?.split_whitespace().next()?;
-    let is_bash = binary == "bash" || binary == "sh";
-    Some((binary.to_string(), is_bash))
+    let interpreter = crate::hashbang::detect_interpreter(script)?;
+    let is_bash = crate::hashbang::is_bash_like(&interpreter);
+    Some((interpreter, is_bash))
 }
 
 fn build_command(is_exec_mode: bool, script: String) -> Vec<String> {
@@ -967,68 +923,6 @@ fn build_command(is_exec_mode: bool, script: String) -> Vec<String> {
     }
 }
 
-async fn send_info(
-    job_id: &str,
-    message: String,
-    storage: &JobStorage,
-    tx: &broadcast::Sender<Result<LogEntry, Status>>,
-) {
-    tracing::info!(info = %message, "job info");
-    let msg = format!("[INFO] {}\n", message);
-
-    let _ = storage.append_log(
-        job_id,
-        &StorageLogEntry {
-            timestamp: SystemTime::now(),
-            message: msg.clone(),
-            source: LogSource::System as i32,
-        },
-    );
-
-    let _ = tx.send(Ok(LogEntry {
-        content: msg,
-        timestamp: Some(prost_types::Timestamp {
-            seconds: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
-            nanos: 0,
-        }),
-        source: LogSource::System as i32,
-    }));
-}
-
-async fn send_error(
-    job_id: &str,
-    message: String,
-    storage: &JobStorage,
-    tx: &broadcast::Sender<Result<LogEntry, Status>>,
-) {
-    tracing::error!(error = %message, "job error");
-    let msg = format!("[ERROR] {}\n", message);
-
-    let _ = storage.append_log(
-        job_id,
-        &StorageLogEntry {
-            timestamp: SystemTime::now(),
-            message: msg.clone(),
-            source: LogSource::System as i32,
-        },
-    );
-
-    let _ = tx.send(Ok(LogEntry {
-        content: msg,
-        timestamp: Some(prost_types::Timestamp {
-            seconds: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
-            nanos: 0,
-        }),
-        source: LogSource::System as i32,
-    }));
-}
-
 fn spawn_stream_task(
     job_id: String,
     source: LogSource,
@@ -1047,8 +941,7 @@ struct PrCreationContext<'a> {
     head_before: &'a str,
     base_branch: &'a str,
     config: &'a crate::config::ServerConfig,
-    storage: &'a JobStorage,
-    tx: &'a broadcast::Sender<Result<LogEntry, Status>>,
+    log_sink: &'a Arc<dyn LogSink>,
 }
 
 async fn handle_pr_creation(
@@ -1061,8 +954,7 @@ async fn handle_pr_creation(
         head_before,
         base_branch,
         config,
-        storage,
-        tx,
+        log_sink,
     } = ctx;
 
     // Check if HEAD moved (commits were made)
@@ -1080,17 +972,14 @@ async fn handle_pr_creation(
         "commits detected, creating PR"
     );
 
-    send_info(
+    log_sink.info(
         job_id,
-        format!(
+        &format!(
             "Detected commits ({} -> {}), preparing pull request...",
             &head_before[..8],
             &head_after[..8]
         ),
-        storage,
-        tx,
-    )
-    .await;
+    );
 
     // Get commit messages for PR body
     let commits = workspace::git_refs::get_commits_between(repo_dir, head_before, &head_after)?;
@@ -1099,13 +988,10 @@ async fn handle_pr_creation(
     let pr_branch = format!("job-{}", job_id);
     workspace::git_refs::create_and_checkout_branch(repo_dir, &pr_branch)?;
 
-    send_info(
+    log_sink.info(
         job_id,
-        format!("Created branch '{}' for pull request", pr_branch),
-        storage,
-        tx,
-    )
-    .await;
+        &format!("Created branch '{}' for pull request", pr_branch),
+    );
 
     // Get GitHub token
     let github_cred = config
@@ -1123,28 +1009,378 @@ async fn handle_pr_creation(
         })?;
 
     // Push the new branch
-    send_info(
+    log_sink.info(
         job_id,
-        format!("Pushing branch '{}' to remote...", pr_branch),
-        storage,
-        tx,
-    )
-    .await;
+        &format!("Pushing branch '{}' to remote...", pr_branch),
+    );
 
     workspace::git_refs::push_branch(repo_dir, &pr_branch, &token, repo_url)?;
 
     // Create PR: job-${jobID} -> base_branch
-    send_info(
+    log_sink.info(
         job_id,
-        format!("Creating pull request: {} -> {}", pr_branch, base_branch),
-        storage,
-        tx,
-    )
-    .await;
+        &format!("Creating pull request: {} -> {}", pr_branch, base_branch),
+    );
 
     let pr_url =
         workspace::pr::create_pull_request(repo_url, &pr_branch, base_branch, &commits, &token)
             .await?;
 
     Ok(pr_url)
+}
+
+/// Configuration for local (serverless) execution
+#[derive(Debug)]
+pub struct LocalExecutionConfig {
+    /// Nix packages to include in the environment
+    pub packages: Vec<String>,
+
+    /// Command to execute (e.g., ["bash", "-c", "..."])
+    pub command: Vec<String>,
+
+    /// Working directory for execution
+    pub working_dir: PathBuf,
+
+    /// Network policy (optional)
+    pub network_policy: Option<NetworkPolicy>,
+
+    /// Credentials for proxy injection
+    pub credentials: Vec<Credential>,
+
+    /// Hardening profile
+    pub hardening_profile: HardeningProfile,
+
+    /// State directory for job files
+    pub state_dir: PathBuf,
+
+    /// Nixpkgs version (optional)
+    pub nixpkgs_version: Option<String>,
+}
+
+/// Execute a job locally without a server
+///
+/// This is the client-side execution path for `nix-jail run`.
+/// Unlike `execute_job()`, this:
+/// - Uses LogSink instead of storage + broadcast
+/// - Doesn't clone git repos (uses provided working_dir)
+/// - Doesn't create PRs
+/// - Returns exit code directly
+pub async fn execute_local(
+    config: LocalExecutionConfig,
+    log_sink: Arc<dyn LogSink>,
+) -> Result<i32, OrchestrationError> {
+    let job_id = ulid::Ulid::new().to_string();
+    tracing::info!(job_id = %job_id, "starting local execution");
+
+    let executor = create_executor();
+
+    // Create job directory
+    let state_dir = config
+        .state_dir
+        .canonicalize()
+        .map_err(|e| OrchestrationError::StateDirError(e.to_string()))?;
+
+    let job_dir = JobDirectory::new(&state_dir, &job_id)
+        .map_err(|e| OrchestrationError::JobDirError(e.to_string()))?;
+
+    // Detect flake.nix in working directory
+    let has_flake = workspace::flake::detect_flake(&config.working_dir);
+
+    // Only start proxy if network policy has rules
+    let has_network_rules = config
+        .network_policy
+        .as_ref()
+        .map(|policy| !policy.rules.is_empty())
+        .unwrap_or(false);
+
+    // Phase 1: Create proxy config if needed
+    let proxy_config_path = if has_network_rules {
+        let filtered_credentials =
+            filter_credentials(&config.credentials, config.network_policy.as_ref());
+
+        let proxy_username = Some(format!("job-{}", job_id));
+        let proxy_password = Some(workspace::generate_proxy_password());
+
+        let ca_cert_host_path =
+            crate::proxy_manager::ProxyManager::ca_cert_host_path(&job_dir.root);
+        let config_result = workspace::write_proxy_config(
+            &job_dir.base,
+            &ca_cert_host_path,
+            executor.proxy_listen_addr(),
+            config.network_policy.clone(),
+            &filtered_credentials,
+            proxy_username,
+            proxy_password,
+        );
+
+        match config_result {
+            Ok(path) => {
+                log_sink.info(
+                    &job_id,
+                    &format!(
+                        "Network policy configured with {} rules",
+                        config
+                            .network_policy
+                            .as_ref()
+                            .map(|p| p.rules.len())
+                            .unwrap_or(0)
+                    ),
+                );
+                Some(path)
+            }
+            Err(e) => {
+                return Err(OrchestrationError::ProxyConfigError(e.to_string()));
+            }
+        }
+    } else {
+        log_sink.info(&job_id, "Network access blocked (no policy)");
+        None
+    };
+
+    // Phase 2: Resolve packages
+    let store_paths = if has_flake {
+        log_sink.info(
+            &job_id,
+            &format!(
+                "Computing flake closure from {}",
+                config.working_dir.display()
+            ),
+        );
+        workspace::compute_flake_closure(&config.working_dir)
+            .await
+            .map_err(|e| OrchestrationError::FlakeClosureError(e.to_string()))?
+    } else if !config.packages.is_empty() {
+        let pkg_refs: Vec<&str> = config.packages.iter().map(|s| s.as_str()).collect();
+        workspace::find_nix_packages_cached(&pkg_refs, config.nixpkgs_version.as_deref())
+            .await
+            .map_err(|e| OrchestrationError::PackageError(e.to_string()))?
+    } else {
+        vec![]
+    };
+
+    // Compute closure
+    let closure = if !store_paths.is_empty() {
+        workspace::compute_combined_closure(&store_paths)
+            .await
+            .map_err(|e| OrchestrationError::ClosureError(e.to_string()))?
+    } else {
+        vec![]
+    };
+
+    log_sink.info(&job_id, &format!("Closure: {} store paths", closure.len()));
+
+    // Phase 3: Prepare root with bind-mount strategy (no caching for local execution)
+    let job_root = crate::root::BindMountJobRoot::new();
+    let (store_setup, _) = job_root
+        .create(&job_dir.root, &closure)
+        .await
+        .map_err(|e| OrchestrationError::RootError(e.to_string()))?;
+
+    log_sink.info(
+        &job_id,
+        &format!("Using bind-mount strategy ({} store paths)", closure.len()),
+    );
+
+    // Phase 4: Start proxy if configured
+    let mut proxy = if let Some(ref config_path) = proxy_config_path {
+        let listen_host = executor
+            .proxy_listen_addr()
+            .split(':')
+            .next()
+            .unwrap_or("127.0.0.1")
+            .to_string();
+
+        match ProxyManager::start(
+            job_id.clone(),
+            job_dir.root.clone(),
+            config_path.clone(),
+            listen_host,
+        )
+        .await
+        {
+            Ok(p) => {
+                tracing::debug!(port = p.port, "proxy started");
+                Some(p)
+            }
+            Err(e) => {
+                return Err(OrchestrationError::ProxyStartError(e.to_string()));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Phase 5: Build environment
+    let mut env = build_environment(
+        proxy.as_ref(),
+        &config.working_dir,
+        executor.proxy_connect_host(),
+        executor.uses_chroot(),
+        &job_dir.root,
+    );
+
+    // Update PATH with package binaries
+    if !store_paths.is_empty() {
+        let path_env = workspace::build_path_env(&store_paths);
+        let current_path = env.get("PATH").cloned().unwrap_or_default();
+        let _ = env.insert("PATH".to_string(), format!("{}:{}", path_env, current_path));
+    }
+
+    // Configure credentials if needed
+    let filtered_credentials =
+        filter_credentials(&config.credentials, config.network_policy.as_ref());
+
+    if has_credential_with_type(&filtered_credentials, CredentialType::Claude) {
+        if let Ok(()) =
+            workspace::setup_claude_config(&config.working_dir, &job_id, &filtered_credentials)
+        {
+            let wrapper_bin = job_dir.base.join("bin");
+            if wrapper_bin.exists() {
+                let current_path = env.get("PATH").map(|s| s.as_str()).unwrap_or("");
+                let _ = env.insert(
+                    "PATH".to_string(),
+                    format!("{}:{}", wrapper_bin.display(), current_path),
+                );
+            }
+            log_sink.info(
+                &job_id,
+                "Claude Code configured (OAuth via proxy injection)",
+            );
+        }
+    }
+
+    if has_credential_with_type(&filtered_credentials, CredentialType::GitHub) {
+        if let Some(github_cred) = filtered_credentials
+            .iter()
+            .find(|c| c.credential_type == CredentialType::GitHub)
+        {
+            if let Some(ref dummy_token) = github_cred.dummy_token {
+                let _ = env.insert("GITHUB_TOKEN".to_string(), dummy_token.clone());
+                log_sink.info(
+                    &job_id,
+                    "GitHub token configured (proxy will inject real token)",
+                );
+            }
+        }
+    }
+
+    // Phase 6: Execute
+    let exec_config = ExecutionConfig {
+        job_id: job_id.clone(),
+        command: config.command,
+        env,
+        working_dir: config.working_dir.clone(),
+        root_dir: job_dir.root.clone(),
+        store_setup,
+        timeout: std::time::Duration::from_secs(3600),
+        store_paths: closure.clone(),
+        proxy_port: proxy.as_ref().map(|p| p.port),
+        hardening_profile: config.hardening_profile,
+        interactive: false,
+    };
+
+    let handle = executor
+        .execute(exec_config)
+        .await
+        .map_err(|e| OrchestrationError::ExecutionError(e.to_string()))?;
+
+    // Extract stdout/stderr from handle based on mode
+    let (stdout_task, stderr_task) = match handle.io {
+        crate::executor::IoHandle::Piped { stdout, stderr } => {
+            let log_sink_stdout = log_sink.clone();
+            let log_sink_stderr = log_sink.clone();
+            let job_id_stdout = job_id.clone();
+            let job_id_stderr = job_id.clone();
+
+            let stdout_task = tokio::spawn(async move {
+                streaming::stream_to_sink(
+                    job_id_stdout,
+                    LogSource::JobStdout,
+                    stdout,
+                    log_sink_stdout,
+                )
+                .await
+            });
+
+            let stderr_task = tokio::spawn(async move {
+                streaming::stream_to_sink(
+                    job_id_stderr,
+                    LogSource::JobStderr,
+                    stderr,
+                    log_sink_stderr,
+                )
+                .await
+            });
+
+            (stdout_task, stderr_task)
+        }
+        crate::executor::IoHandle::Pty { .. } => {
+            // PTY mode not currently supported in local execution
+            return Err(OrchestrationError::ExecutionError(
+                "PTY mode not supported in local execution".to_string(),
+            ));
+        }
+    };
+
+    // Handle proxy streams if running
+    let proxy_tasks = if let Some(ref mut p) = proxy {
+        let proxy_stdout = p
+            .take_stdout()
+            .ok_or(OrchestrationError::ProxyStdoutError)?;
+        let proxy_stderr = p
+            .take_stderr()
+            .ok_or(OrchestrationError::ProxyStderrError)?;
+
+        let log_sink_pout = log_sink.clone();
+        let log_sink_perr = log_sink.clone();
+        let job_id_pout = job_id.clone();
+        let job_id_perr = job_id.clone();
+
+        let pout_task = tokio::spawn(async move {
+            streaming::stream_to_sink(
+                job_id_pout,
+                LogSource::ProxyStdout,
+                proxy_stdout,
+                log_sink_pout,
+            )
+            .await
+        });
+
+        let perr_task = tokio::spawn(async move {
+            streaming::stream_to_sink(
+                job_id_perr,
+                LogSource::ProxyStderr,
+                proxy_stderr,
+                log_sink_perr,
+            )
+            .await
+        });
+
+        Some((pout_task, perr_task))
+    } else {
+        None
+    };
+
+    // Wait for job to complete
+    let exit_code = handle.exit_code.await.unwrap_or(-1);
+
+    // Cleanup
+    if let Some(ref mut p) = proxy {
+        p.stop().await;
+    }
+
+    if let Some((pout, perr)) = proxy_tasks {
+        let _ = tokio::join!(stdout_task, stderr_task, pout, perr);
+    } else {
+        let _ = tokio::join!(stdout_task, stderr_task);
+    }
+
+    log_sink.done(&job_id, exit_code);
+
+    // Cleanup job directory
+    if let Err(e) = job_root.cleanup(&job_dir.root) {
+        tracing::warn!(error = %e, "failed to cleanup root directory");
+    }
+
+    Ok(exit_code)
 }
