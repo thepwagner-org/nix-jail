@@ -1246,6 +1246,7 @@ mod tests {
     // DNS resolution and caching tests
 
     #[tokio::test]
+    #[ignore] // Requires network
     async fn test_dns_resolution_ipv4() {
         // Test that DNS resolution works and IP CIDR matching works together
         let policy = NetworkPolicy {
@@ -1273,6 +1274,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires network
     async fn test_dns_resolution_outside_cidr() {
         // Test that hostnames resolving outside CIDR are denied
         let policy = NetworkPolicy {
@@ -1300,6 +1302,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires network
     async fn test_dns_cache_reuse() {
         // Test that DNS lookups are cached (by doing multiple evaluations)
         let policy = NetworkPolicy {
@@ -1351,6 +1354,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires network
     async fn test_dns_multiple_ips() {
         // Test hostname that resolves to multiple IPs
         // If any IP matches the CIDR, the rule should match
@@ -1379,6 +1383,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires network
     async fn test_dns_lookup_failure() {
         // Test graceful handling of DNS lookup failures
         let policy = NetworkPolicy {
@@ -1406,6 +1411,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires network
     async fn test_dns_ipv6_resolution() {
         // Test IPv6 DNS resolution
         let policy = NetworkPolicy {

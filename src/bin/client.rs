@@ -49,8 +49,8 @@ struct Cli {
     #[arg(short, long)]
     server: Option<String>,
 
-    /// OpenTelemetry OTLP endpoint for distributed tracing (e.g., "http://localhost:4317")
-    #[arg(long)]
+    /// OpenTelemetry OTLP endpoint for distributed tracing
+    #[arg(long, default_value = "http://tempo.pwagner.net:4317")]
     otlp_endpoint: Option<String>,
 
     #[command(subcommand)]

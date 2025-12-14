@@ -98,50 +98,13 @@ cargo run --bin client -- exec \
 
 ## Distributed Tracing
 
-nix-jail supports OpenTelemetry tracing for debugging and performance analysis.
+nix-jail supports OpenTelemetry tracing via Tempo at `tempo.pwagner.net`.
 
-### Start the observability stack
-
-```bash
-docker compose up -d
-```
-
-This starts:
-- **Grafana** at http://localhost:3000 (no login required)
-- **Tempo** receiving OTLP on `localhost:4317`
-
-### Enable tracing in server.toml
-
-Add to your `server.toml`:
+The client sends traces by default. To enable server-side tracing, add to `server.toml`:
 
 ```toml
 [server]
-otlp_endpoint = "http://localhost:4317"
-```
-
-Then run normally:
-
-```bash
-cargo run --bin server -- --config server.toml
-```
-
-Alternatively, use the environment variable:
-
-```bash
-OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo run --bin server -- --config server.toml
-```
-
-### View traces in Grafana
-
-1. Open http://localhost:3000
-2. Go to Explore (compass icon)
-3. Select "Tempo" datasource
-4. Search by service name: `nix-jail-server`, `nix-jail-client`, or `nix-jail-proxy`
-
-### Stop the stack
-
-```bash
-docker compose down
+otlp_endpoint = "http://tempo.pwagner.net:4317"
 ```
 
 ## See Also

@@ -345,6 +345,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires network
     fn test_clone_with_commit_sha() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
 

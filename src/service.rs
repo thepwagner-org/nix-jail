@@ -201,14 +201,16 @@ impl JailService for JailServiceImpl {
             async move {
                 orchestration::execute_job(
                     job_for_exec,
-                    storage_for_exec,
-                    config_for_exec,
-                    log_tx_for_exec,
-                    registry_for_exec,
-                    job_root_for_exec,
-                    job_workspace_for_exec,
+                    orchestration::ExecuteJobContext {
+                        storage: storage_for_exec,
+                        config: config_for_exec,
+                        tx: log_tx_for_exec,
+                        registry: registry_for_exec,
+                        job_root: job_root_for_exec,
+                        job_workspace: job_workspace_for_exec,
+                        session_registry: session_registry_for_exec,
+                    },
                     interactive,
-                    session_registry_for_exec,
                 )
                 .await;
             }

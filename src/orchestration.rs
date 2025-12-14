@@ -69,6 +69,18 @@ pub enum OrchestrationError {
     ProxyStderrError,
 }
 
+/// Context for job execution containing all required services and configuration
+#[derive(Debug)]
+pub struct ExecuteJobContext {
+    pub storage: JobStorage,
+    pub config: crate::config::ServerConfig,
+    pub tx: broadcast::Sender<Result<LogEntry, Status>>,
+    pub registry: crate::job_registry::JobRegistry,
+    pub job_root: Arc<dyn JobRoot>,
+    pub job_workspace: Arc<dyn JobWorkspace>,
+    pub session_registry: Option<Arc<crate::session::SessionRegistry>>,
+}
+
 /// Extract credential names referenced in a network policy
 fn extract_credential_names(policy: Option<&NetworkPolicy>) -> HashSet<String> {
     let mut names = HashSet::new();
@@ -151,18 +163,18 @@ pub async fn serve_stored_logs(
 /// This function is designed to be spawned as a background task by the caller.
 /// It uses a broadcast channel to allow multiple clients to subscribe to the same job's output.
 /// Note: This function is called from within an instrumented span created by the service layer.
-pub async fn execute_job(
-    job: JobMetadata,
-    storage: JobStorage,
-    config: crate::config::ServerConfig,
-    tx: broadcast::Sender<Result<LogEntry, Status>>,
-    registry: crate::job_registry::JobRegistry,
-    job_root: Arc<dyn crate::root::JobRoot>,
-    job_workspace: Arc<dyn JobWorkspace>,
-    interactive: bool,
-    session_registry: Option<Arc<crate::session::SessionRegistry>>,
-) {
+pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: bool) {
     tracing::debug!(status = %job.status.to_string(), "executing job");
+
+    let ExecuteJobContext {
+        storage,
+        config,
+        tx,
+        registry,
+        job_root,
+        job_workspace,
+        session_registry,
+    } = ctx;
 
     // Create log sink for this job (replaces send_info/send_error pattern)
     let log_sink: Arc<dyn LogSink> = Arc::new(StorageLogSink::new(storage.clone(), tx.clone()));
