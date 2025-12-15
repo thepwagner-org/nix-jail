@@ -1113,7 +1113,6 @@ async fn handle_pr_creation(
 }
 
 /// Configuration for local (serverless) execution
-#[derive(Debug)]
 pub struct LocalExecutionConfig {
     /// Nix packages to include in the environment
     pub packages: Vec<String>,
@@ -1144,6 +1143,22 @@ pub struct LocalExecutionConfig {
 
     /// Terminal size for PTY mode (rows, cols)
     pub pty_size: Option<(u16, u16)>,
+
+    /// Callback invoked right before PTY I/O starts (for enabling raw mode)
+    pub on_pty_ready: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl std::fmt::Debug for LocalExecutionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalExecutionConfig")
+            .field("packages", &self.packages)
+            .field("command", &self.command)
+            .field("working_dir", &self.working_dir)
+            .field("interactive", &self.interactive)
+            .field("pty_size", &self.pty_size)
+            .field("on_pty_ready", &self.on_pty_ready.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Execute a job locally without a server
@@ -1315,6 +1330,11 @@ pub async fn execute_local(
         crate::executor::IoHandle::Pty { stdin, stdout } => {
             // PTY mode: connect directly to user's terminal
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            // Call the on_pty_ready callback (enables raw mode at the right time)
+            if let Some(callback) = config.on_pty_ready {
+                callback();
+            }
 
             // Forward user stdin to PTY stdin
             let stdin_task = tokio::spawn(async move {

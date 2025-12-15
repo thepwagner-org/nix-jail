@@ -763,6 +763,24 @@ async fn run_local(
         None
     };
 
+    // For interactive mode, we defer raw mode until PTY I/O starts
+    // Use shared state to keep the guard alive
+    let raw_guard_holder: std::sync::Arc<std::sync::Mutex<Option<RawModeGuard>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+
+    let on_pty_ready: Option<Box<dyn FnOnce() + Send>> = if interactive {
+        let holder = raw_guard_holder.clone();
+        Some(Box::new(move || {
+            if let Ok(guard) = enable_raw_mode() {
+                if let Ok(mut lock) = holder.lock() {
+                    *lock = Some(guard);
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // Build execution config
     let exec_config = LocalExecutionConfig {
         packages,
@@ -775,13 +793,7 @@ async fn run_local(
         nixpkgs_version: Some(nixpkgs_version),
         interactive,
         pty_size,
-    };
-
-    // Enable raw mode for interactive sessions
-    let _raw_guard = if interactive {
-        Some(enable_raw_mode()?)
-    } else {
-        None
+        on_pty_ready,
     };
 
     // Create executor and job root
@@ -791,6 +803,9 @@ async fn run_local(
 
     // Execute
     let exit_code = execute_local(exec_config, executor, job_root, log_sink).await?;
+
+    // Drop raw mode guard explicitly (though it would drop anyway)
+    drop(raw_guard_holder);
 
     Ok(exit_code)
 }
