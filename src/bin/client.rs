@@ -225,6 +225,16 @@ enum Commands {
         #[arg(short, long)]
         interactive: bool,
 
+        /// Executor backend to use for sandboxing
+        ///
+        /// Available options:
+        ///   - "auto"    - Platform default (systemd on Linux, sandbox on macOS)
+        ///   - "systemd" - Linux systemd-run with 33 hardening properties
+        ///   - "docker"  - Docker container (cross-platform)
+        ///   - "sandbox" - macOS sandbox-exec with SBPL profiles
+        #[arg(long, default_value = "auto")]
+        executor: String,
+
         /// Command to execute (everything after --)
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -255,6 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config,
         show_prefix,
         interactive,
+        executor,
         command,
     } = cli.command
     {
@@ -269,6 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config,
             show_prefix,
             interactive,
+            executor,
             command,
         )
         .instrument(tracing::info_span!("run"))
@@ -673,6 +685,7 @@ async fn run_local(
     config_path: Option<std::path::PathBuf>,
     show_prefix: bool,
     interactive: bool,
+    executor_type: String,
     command: Vec<String>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     tracing::info!(packages = ?packages, "running locally");
@@ -797,7 +810,12 @@ async fn run_local(
     };
 
     // Create executor and job root
-    let executor = nix_jail::executor::create_executor();
+    let executor_type: nix_jail::executor::ExecutorType = executor_type
+        .parse()
+        .map_err(|e: String| format!("invalid executor type: {}", e))?;
+    let executor = nix_jail::executor::create_executor_with_type(executor_type)
+        .map_err(|e| format!("failed to create executor: {}", e))?;
+    tracing::info!(executor = %executor.name(), "using executor");
     let job_root: std::sync::Arc<dyn nix_jail::root::JobRoot> =
         std::sync::Arc::new(nix_jail::root::BindMountJobRoot::new());
 
