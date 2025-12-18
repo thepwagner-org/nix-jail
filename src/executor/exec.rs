@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 /// Resolves command paths from the Nix closure.
 ///
-/// If the first argument is "bash", finds bash in the closure and returns
-/// the full path. This is necessary when running in isolated roots where
-/// "bash" is not in PATH.
+/// If the first argument is not an absolute path, searches for it in the
+/// closure's bin directories. This is necessary when running in isolated
+/// roots where PATH lookup happens before environment setup.
 ///
 /// # Arguments
 /// * `command` - The command and arguments
@@ -17,18 +17,28 @@ use std::path::PathBuf;
 pub fn resolve_command_paths(command: &[String], closure: &[PathBuf]) -> Vec<String> {
     let mut resolved_command = command.to_vec();
 
-    if !resolved_command.is_empty() && resolved_command[0] == "bash" {
-        if let Some(bash_path) = closure
-            .iter()
-            .find(|p| p.to_string_lossy().contains("bash-"))
-        {
-            let full_bash = bash_path.join("bin/bash");
-            if full_bash.exists() {
-                resolved_command[0] = full_bash.to_string_lossy().to_string();
-                tracing::debug!(bash = %resolved_command[0], "resolved bash from closure");
-            }
+    if resolved_command.is_empty() {
+        return resolved_command;
+    }
+
+    let cmd = resolved_command[0].clone();
+
+    // Skip if already an absolute path
+    if cmd.starts_with('/') {
+        return resolved_command;
+    }
+
+    // Search for command in closure bin directories
+    for store_path in closure {
+        let bin_path = store_path.join("bin").join(&cmd);
+        if bin_path.exists() {
+            let resolved = bin_path.to_string_lossy().to_string();
+            tracing::debug!(command = %cmd, resolved = %resolved, "resolved command from closure");
+            resolved_command[0] = resolved;
+            return resolved_command;
         }
     }
 
+    tracing::warn!(command = %cmd, "could not resolve command in closure");
     resolved_command
 }
