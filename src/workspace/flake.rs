@@ -240,7 +240,7 @@ mod tests {
         let system = get_system_arch();
         let flake_content = format!(
             r#"{{
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
   outputs = {{ nixpkgs, ... }}: {{
     devShells.{}.default = nixpkgs.legacyPackages.{}.mkShell {{
       packages = [ nixpkgs.legacyPackages.{}.hello ];

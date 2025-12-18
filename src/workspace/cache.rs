@@ -120,7 +120,7 @@ mod tests {
     fn test_cache_key_version() {
         // Different versions should create different keys
         let key1 = CacheKey::new(&["bash"], Some("nixos-24.05"));
-        let key2 = CacheKey::new(&["bash"], Some("nixos-25.05"));
+        let key2 = CacheKey::new(&["bash"], Some("nixos-25.11"));
         let key3 = CacheKey::new(&["bash"], None);
 
         assert_ne!(key1, key2);
@@ -154,10 +154,10 @@ mod tests {
         let paths_25 = vec![PathBuf::from("/nix/store/bash-25")];
 
         cache.insert(&["bash"], Some("nixos-24.05"), paths_24.clone());
-        cache.insert(&["bash"], Some("nixos-25.05"), paths_25.clone());
+        cache.insert(&["bash"], Some("nixos-25.11"), paths_25.clone());
 
         assert_eq!(cache.get(&["bash"], Some("nixos-24.05")), Some(paths_24));
-        assert_eq!(cache.get(&["bash"], Some("nixos-25.05")), Some(paths_25));
+        assert_eq!(cache.get(&["bash"], Some("nixos-25.11")), Some(paths_25));
         assert!(cache.get(&["bash"], None).is_none());
     }
 

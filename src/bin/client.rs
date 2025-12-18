@@ -117,7 +117,7 @@ enum Commands {
         ///   - "nixos-24.05#sha256:abc..."      - release with explicit hash
         ///   - "nixos-unstable"                 - unstable branch
         ///   - "ae2fc9e0...f068c1bfdc11c71"     - 40-char commit SHA
-        #[arg(long, alias = "nixpkgs", default_value = "nixos-25.05")]
+        #[arg(long, alias = "nixpkgs", default_value = "nixos-25.11")]
         nixpkgs_version: String,
 
         /// Hardening profile for systemd execution (Linux only)
@@ -225,7 +225,7 @@ enum Commands {
         workdir: Option<std::path::PathBuf>,
 
         /// Nixpkgs version to use for package resolution
-        #[arg(long, alias = "nixpkgs", default_value = "nixos-25.05")]
+        #[arg(long, alias = "nixpkgs", default_value = "nixos-25.11")]
         nixpkgs_version: String,
 
         /// Hardening profile for systemd execution (Linux only)

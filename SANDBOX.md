@@ -221,7 +221,7 @@ nix-jail resolves Nix packages using `nix-instantiate --eval` with in-memory cac
 
 **Multi-version Nixpkgs Support:**
 ```bash
-# Use default (nixos-25.05, pinned stable)
+# Use default (nixos-25.11, pinned stable)
 nix-jail exec -p bash -s script.sh
 
 # Use a specific release

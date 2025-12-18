@@ -23,7 +23,7 @@ fn get_package_cache() -> &'static NixPackageCache {
 /// Specification for which nixpkgs version to use
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NixpkgsSpec {
-    /// Use default nixos-25.05 (pinned stable)
+    /// Use default nixos-25.11 (pinned stable)
     Default,
     /// Use a release branch (e.g., "nixos-24.05" or "nixos-unstable")
     Branch {
@@ -115,8 +115,8 @@ impl NixpkgsSpec {
     pub fn build_import_expr(&self) -> String {
         match self {
             NixpkgsSpec::Default => {
-                // Default: nixos-25.05
-                "import (fetchTarball \"https://github.com/NixOS/nixpkgs/archive/nixos-25.05.tar.gz\") { config = { allowUnfree = true; }; }".to_string()
+                // Default: nixos-25.11
+                "import (fetchTarball \"https://github.com/NixOS/nixpkgs/archive/nixos-25.11.tar.gz\") { config = { allowUnfree = true; }; }".to_string()
             }
             NixpkgsSpec::Branch {
                 name,
@@ -292,7 +292,7 @@ pub async fn compute_nix_closure(store_path: &Path) -> Result<Vec<PathBuf>, Work
 ///
 /// # Arguments
 /// * `packages` - List of package names to resolve
-/// * `nixpkgs_version` - Optional nixpkgs version specification (None = default nixos-25.05)
+/// * `nixpkgs_version` - Optional nixpkgs version specification (None = default nixos-25.11)
 pub async fn find_nix_packages_with_version(
     packages: &[&str],
     nixpkgs_version: Option<&str>,

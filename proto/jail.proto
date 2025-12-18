@@ -22,7 +22,7 @@ message JobRequest {
   optional NetworkPolicy network_policy = 5;
 
   // Nixpkgs version to use for package resolution (optional)
-  // If omitted, defaults to nixos-25.05 (pinned stable)
+  // If omitted, defaults to nixos-25.11 (pinned stable)
   //
   // Supported formats:
   //   - "nixos-24.05"                    - release branch (hash auto-discovered)
