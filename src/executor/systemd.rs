@@ -650,8 +650,16 @@ impl Executor for SystemdExecutor {
             .arg("--unit")
             .arg(&unit_name)
             .arg("--quiet") // Don't print unit name to stderr
-            .arg("--wait") // Wait for unit to finish
-            .arg("--pty"); // Connect via PTY (unbuffered, unlike --pipe)
+            .arg("--wait"); // Wait for unit to finish
+
+        // Use --pty for interactive sessions, --pipe for batch jobs
+        // --pty connects to a PTY (required for interactive terminals)
+        // --pipe connects stdout/stderr for streaming (required for log capture)
+        if config.interactive {
+            let _ = cmd.arg("--pty");
+        } else {
+            let _ = cmd.arg("--pipe");
+        }
 
         // Add all hardening properties
         for prop in properties {
@@ -659,7 +667,7 @@ impl Executor for SystemdExecutor {
         }
 
         // Add network isolation, working directory, and TERM
-        // We use --pty for unbuffered I/O, but set TERM=dumb to prevent ANSI escape codes
+        // Set TERM=dumb to prevent ANSI escape codes in non-interactive mode
         match &network_setup {
             NetworkSetup::Namespace { netns_path, .. } => {
                 // Join the pre-configured namespace with veth pair for proxy access
