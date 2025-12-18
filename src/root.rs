@@ -332,6 +332,19 @@ for path in $closure; do
     cp -a "$path" /target/store/
 done
 
+# Create /nix/bin with symlinks to all binaries (for scratch image entrypoint)
+# Note: symlinks must point to /nix/store (final mount point) not /target/store
+mkdir -p /target/bin
+for bindir in /target/store/*/bin; do
+    if [ -d "$bindir" ]; then
+        # Get the store path portion (e.g., xyz-package-1.0) to construct /nix/store path
+        store_path=$(basename $(dirname "$bindir"))
+        for bin in "$bindir"/*; do
+            [ -f "$bin" ] && ln -sf "/nix/store/$store_path/bin/$(basename "$bin")" /target/bin/ 2>/dev/null || true
+        done
+    fi
+done
+
 echo "Copied $(echo $closure | wc -w) runtime paths"
 "#,
             nixpkgs = nixpkgs,

@@ -315,9 +315,10 @@ impl Executor for DockerExecutor {
         // Choose base image based on store setup strategy
         let base_image = match &config.store_setup {
             crate::root::StoreSetup::DockerVolume { .. } => {
-                // For DockerVolume, use alpine which has sh and basic utils
-                // We mount our pre-built /nix/store over the empty /nix directory
-                "alpine:latest"
+                // For DockerVolume, use busybox (minimal image, no package manager)
+                // Volume provides /nix/store/* and /nix/bin/* symlinks
+                // Can't use scratch directly with docker run - it's only for Dockerfiles
+                "busybox"
             }
             _ => {
                 // For other strategies, use nixos/nix which has Nix installed
@@ -330,18 +331,16 @@ impl Executor for DockerExecutor {
         // For DockerVolume, wrap in a shell that sets up PATH from /nix/store/*/bin
         match &config.store_setup {
             crate::root::StoreSetup::DockerVolume { .. } => {
-                // Run through sh with PATH setup - find all bin directories in /nix/store
+                // Run through busybox's /bin/sh to set PATH, then exec the Nix binary
                 // Shell-escape arguments by wrapping in single quotes and escaping single quotes
                 let escaped_cmd = resolved_command
                     .iter()
                     .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
                     .collect::<Vec<_>>()
                     .join(" ");
-                let wrapper_script = format!(
-                    r#"export PATH="$(find /nix/store -maxdepth 2 -type d -name bin 2>/dev/null | tr '\n' ':')$PATH" && exec {}"#,
-                    escaped_cmd
-                );
-                let _ = cmd.arg("sh").arg("-c").arg(wrapper_script);
+                let wrapper_script =
+                    format!(r#"export PATH="/nix/bin:$PATH" && exec {}"#, escaped_cmd);
+                let _ = cmd.arg("/bin/sh").arg("-c").arg(wrapper_script);
             }
             _ => {
                 for arg in &resolved_command {
