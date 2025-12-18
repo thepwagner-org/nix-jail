@@ -51,14 +51,19 @@ impl Executor for SandboxExecutor {
             // Resolve command paths from closure (e.g., "bash" -> "/nix/store/.../bin/bash")
             let resolved_command = super::exec::resolve_command_paths(&config.command, closure);
 
-            // Generate sandbox profile (canonicalize workspace to handle /tmp -> /private/tmp symlink on macOS)
+            // Generate sandbox profile (canonicalize paths to handle /tmp -> /private/tmp symlink on macOS)
             let canonical_workspace = config
                 .working_dir
                 .canonicalize()
                 .unwrap_or_else(|_| config.working_dir.clone());
+            let canonical_root = config
+                .root_dir
+                .canonicalize()
+                .unwrap_or_else(|_| config.root_dir.clone());
             let profile = super::sandbox_policy::generate_profile(
                 closure,
                 &canonical_workspace,
+                &canonical_root,
                 config.proxy_port,
             );
 

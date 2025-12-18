@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 /// Creates a profile that restricts filesystem access to:
 /// - The Nix store paths in the derivation closure (read-only)
 /// - The workspace directory (read-write)
+/// - The job root directory (for CA cert access when using proxy)
 /// - Essential macOS system resources (metadata, sysctls)
 /// - Network access only to the specified proxy port on localhost (if proxy_port is Some)
 ///
@@ -25,6 +26,7 @@ use std::path::{Path, PathBuf};
 pub fn generate_profile(
     closure_paths: &[PathBuf],
     workspace_path: &Path,
+    root_dir: &Path,
     proxy_port: Option<u16>,
 ) -> String {
     let mut profile = String::from("(version 1)\n");
@@ -107,8 +109,8 @@ pub fn generate_profile(
     ));
 
     // Allow wrapper bin directory (for security wrapper script)
-    if let Some(job_root) = workspace_path.parent() {
-        let wrapper_bin = job_root.join("bin");
+    if let Some(job_base) = workspace_path.parent() {
+        let wrapper_bin = job_base.join("bin");
         profile.push_str(";; Wrapper bin directory (security wrapper)\n");
         profile.push_str(&format!(
             "(allow file-read-metadata (subpath \"{}\"))\n",
@@ -121,6 +123,15 @@ pub fn generate_profile(
         profile.push_str(&format!(
             "(allow process-exec* (subpath \"{}\"))\n\n",
             wrapper_bin.display()
+        ));
+    }
+
+    // Allow reading CA cert from job root directory (for MITM proxy TLS)
+    if proxy_port.is_some() {
+        profile.push_str(";; Job root directory (CA cert for proxy TLS)\n");
+        profile.push_str(&format!(
+            "(allow file-read* (subpath \"{}\"))\n\n",
+            root_dir.display()
         ));
     }
 
@@ -198,7 +209,8 @@ mod tests {
     fn test_generate_profile_basic() {
         let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
         let workspace = PathBuf::from("/tmp/workspace");
-        let profile = generate_profile(&closure, &workspace, Some(3128));
+        let root = PathBuf::from("/tmp/root");
+        let profile = generate_profile(&closure, &workspace, &root, Some(3128));
 
         // Should contain deny-by-default
         assert!(profile.contains("(deny default)"));
@@ -211,6 +223,9 @@ mod tests {
 
         // Should mention proxy port in comments
         assert!(profile.contains("3128"));
+
+        // Should allow reading from root dir for CA cert
+        assert!(profile.contains("/tmp/root"));
     }
 
     #[test]
@@ -220,7 +235,8 @@ mod tests {
             PathBuf::from("/nix/store/def-coreutils-9.0"),
         ];
         let workspace = PathBuf::from("/tmp/workspace");
-        let profile = generate_profile(&closure, &workspace, Some(3128));
+        let root = PathBuf::from("/tmp/root");
+        let profile = generate_profile(&closure, &workspace, &root, Some(3128));
 
         // Should contain all closure paths
         assert!(profile.contains("/nix/store/abc-bash-5.0"));
@@ -231,7 +247,8 @@ mod tests {
     fn test_generate_profile_contains_essential_rules() {
         let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
         let workspace = PathBuf::from("/tmp/workspace");
-        let profile = generate_profile(&closure, &workspace, Some(3128));
+        let root = PathBuf::from("/tmp/root");
+        let profile = generate_profile(&closure, &workspace, &root, Some(3128));
 
         // Should have essential system access
         assert!(profile.contains("(allow sysctl-read)"));
@@ -246,7 +263,8 @@ mod tests {
     fn test_generate_profile_without_proxy() {
         let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
         let workspace = PathBuf::from("/tmp/workspace");
-        let profile = generate_profile(&closure, &workspace, None);
+        let root = PathBuf::from("/tmp/root");
+        let profile = generate_profile(&closure, &workspace, &root, None);
 
         // Should contain deny-by-default
         assert!(profile.contains("(deny default)"));
@@ -254,5 +272,8 @@ mod tests {
         // Should NOT allow network access
         assert!(!profile.contains("localhost"));
         assert!(profile.contains("completely blocked"));
+
+        // Should NOT allow reading from root dir when proxy is disabled
+        assert!(!profile.contains("/tmp/root"));
     }
 }

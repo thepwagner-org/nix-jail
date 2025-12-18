@@ -202,8 +202,8 @@ fn add_filesystem_mounts(cmd: &mut Command, config: &ExecutionConfig) {
         }
     }
 
-    // SSL certificates for proxy (if they exist in workspace)
-    let ca_cert_path = config.working_dir.join("etc/ssl/certs/ca-certificates.crt");
+    // SSL certificates for proxy (CA cert is written to job root directory)
+    let ca_cert_path = config.root_dir.join("etc/ssl/certs/ca-certificates.crt");
     if ca_cert_path.exists() {
         let _ = cmd.arg("-v").arg(format!(
             "{}:/etc/ssl/certs/ca-certificates.crt:ro",
@@ -437,11 +437,14 @@ impl Executor for DockerExecutor {
     }
 
     fn proxy_connect_host(&self) -> &'static str {
-        // Docker containers access host services via special hostname
-        // On Linux Docker, this resolves to the host's IP on the docker0 bridge
-        // Note: For production use, we should dynamically get the gateway IP
-        // For now, use the standard Docker bridge gateway
-        "172.17.0.1"
+        // Docker containers access host services via platform-specific means:
+        // - macOS Docker Desktop: host.docker.internal (DNS resolves to host)
+        // - Linux Docker: 172.17.0.1 (docker0 bridge gateway)
+        if cfg!(target_os = "macos") {
+            "host.docker.internal"
+        } else {
+            "172.17.0.1"
+        }
     }
 
     fn uses_chroot(&self) -> bool {
@@ -567,6 +570,10 @@ mod tests {
         let executor = DockerExecutor::new();
 
         assert_eq!(executor.proxy_listen_addr(), "0.0.0.0:3128");
+        // proxy_connect_host is platform-specific
+        #[cfg(target_os = "macos")]
+        assert_eq!(executor.proxy_connect_host(), "host.docker.internal");
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(executor.proxy_connect_host(), "172.17.0.1");
         assert!(executor.uses_chroot());
         assert_eq!(executor.name(), "DockerExecutor (docker run)");

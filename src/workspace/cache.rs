@@ -450,7 +450,8 @@ mod tests {
     fn test_disk_cache_expiration() {
         let temp_dir = tempfile::tempdir().unwrap();
         // Use 2 second TTL for reliable testing
-        let cache = DiskPackageCache::with_ttl(temp_dir.path().to_path_buf(), Duration::from_secs(2));
+        let cache =
+            DiskPackageCache::with_ttl(temp_dir.path().to_path_buf(), Duration::from_secs(2));
 
         cache.insert(&["bash"], None, vec![PathBuf::from("/nix/store/bash")]);
 
