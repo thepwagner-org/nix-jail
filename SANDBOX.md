@@ -66,12 +66,17 @@ The proxy injects credentials to outgoing requests - this allows the sandbox to 
 
 **macOS:** Proxy listens on localhost, sandbox has localhost-only network access enforced by SBPL profile.
 
-**Linux:** Stronger kernel-level isolation using network namespaces with veth pairs:
+**Linux (systemd):** Stronger kernel-level isolation using network namespaces with veth pairs:
 - Proxy binds to `0.0.0.0:3128` (before veth exists), jobs connect via their veth interface
 - Each job gets a unique /30 subnet from 10.0.0.0/16 (e.g., first job: proxy=10.0.0.1, sandbox=10.0.0.2)
 - Supports ~16,384 concurrent jobs with isolated subnets preventing cross-job communication
 - Sandbox can ONLY communicate with proxy - kernel enforced, no escape possible
 - Uses `rtnetlink` for production-grade network namespace configuration
+
+**Docker:** Custom bridge network "nix-jail" isolates containers:
+- Proxy binds to `0.0.0.0:3128`, accessible at bridge gateway (172.17.0.1)
+- Containers connect to nix-jail network, route all traffic through proxy
+- Network isolation via Docker's built-in network namespaces
 
 This architecture ensures sandboxed code cannot bypass the proxy even with privilege escalation.
 
@@ -145,16 +150,68 @@ The default security posture includes all 33 hardening properties. However, hard
 
 **Store Strategy:**
 
-nix-jail supports two strategies for making the Nix store available inside the sandbox, configurable via `store_strategy` in server config:
+nix-jail supports three strategies for making the Nix store available inside the sandbox, configurable via `store_strategy` in server config:
 
 - **cached** (default): Caches and snapshots the closure into the chroot root directory. Uses btrfs snapshots for O(1) creation when available, with LRU cache for repeated executions. Allows inspecting the full chroot after job completion.
 - **bind-mount**: Bind-mounts each store path from host `/nix/store` directly into the chroot using `BindReadOnlyPaths`. Instant startup, no disk space overhead, but chroot is empty after job completion.
+- **docker-volume**: Caches closures in named Docker volumes. Essential for macOS where host `/nix/store` contains darwin binaries but containers need Linux binaries. On cache miss, runs `nix-build` inside a container to populate the volume with correct-architecture packages. See Docker executor section for details.
 
 **Isolation Mechanisms:**
 
 - **Filesystem:** RootDirectory property creates chroot-like isolation. Nix closure copied into root (default) or via bind-mounts. Workspace bind-mounted to `/workspace`.
 - **Network:** Dedicated network namespace per job with veth pair connecting sandbox to proxy. Job cannot access host network or other jobs.
 - **Execution:** Jobs run as dynamically-created users with no capabilities, memory-safe execution enforced, and comprehensive syscall filtering.
+
+#### Docker (DockerExecutor)
+
+The **DockerExecutor** provides cross-platform container isolation using Docker. Available on any system with Docker (Linux, macOS with Docker Desktop, WSL2).
+
+```bash
+docker run --rm \
+  --cap-drop=ALL --security-opt=no-new-privileges \
+  --read-only --tmpfs /tmp:noexec,nosuid,size=64m \
+  --cpus=2 --memory=2g --pids-limit=100 \
+  --network=nix-jail \
+  -v /workspace:/workspace \
+  nixos/nix:latest /bin/bash /workspace/script.sh
+```
+
+**Security Hardening:**
+
+- `--cap-drop=ALL`: Remove all Linux capabilities
+- `--security-opt=no-new-privileges`: Prevent privilege escalation
+- `--read-only`: Immutable root filesystem
+- `--tmpfs=/tmp:noexec,nosuid,size=64m`: Private temp with execute/setuid disabled
+- Resource limits: 2 CPUs, 2GB RAM, 100 PIDs, 1024 file descriptors (matches systemd defaults)
+
+**Network:** Custom Docker bridge network "nix-jail" routes all traffic through the proxy at 172.17.0.1:3128.
+
+**Store Strategy for Docker:**
+
+On macOS, the host `/nix/store` contains darwin binaries which cannot run in Linux containers. The `docker-volume` store strategy solves this:
+
+1. **Cache key**: Compute hash from requested packages (same as btrfs cache)
+2. **Cache miss**: Create named Docker volume, run `nix-build` inside a container to populate it with Linux binaries from cache.nixos.org
+3. **Cache hit**: Volume already exists, mount directly (instant)
+4. **Job execution**: Mount volume at `/nix:ro`, set PATH dynamically from `/nix/store/*/bin`
+
+```bash
+# Cache miss: populate volume with Linux packages
+docker run --rm -v nix-jail-{hash}:/nix nixos/nix:latest \
+  nix-build -E 'with import <nixpkgs> {}; [cowsay bash]' --no-out-link
+
+# Job execution: use alpine with pre-populated volume
+docker run --rm -v nix-jail-{hash}:/nix:ro alpine:latest \
+  sh -c 'export PATH="$(find /nix/store -maxdepth 2 -type d -name bin | tr "\n" ":")$PATH" && cowsay hello'
+```
+
+This enables the same caching semantics as btrfs snapshots but works across the macOS/Linux boundary.
+
+**Isolation Mechanisms:**
+
+- **Filesystem:** Container has read-only root with workspace bind-mounted. Nix store from host bind-mounts, volume mounts, or container image.
+- **Network:** Custom bridge network isolates containers. Proxy at bridge gateway controls all egress.
+- **Execution:** Runs as nobody:nogroup (65534:65534) with no capabilities.
 
 ## Features
 
@@ -248,21 +305,26 @@ Each layer independently blocks common attack vectors. Even if one layer is bypa
 - Suitable for trusted workloads running untrusted code
 - Not suitable for multi-tenant production without additional isolation
 
-**Alternative Sandboxing Technologies**
+**Sandboxing Technology Comparison**
 
-| Feature | systemd | bubblewrap | nsjail | Firecracker |
-|---------|---------|------------|--------|-------------|
-| **Nix Closures** | RootDirectory | 100+ bind flags | 100+ -R flags | VM filesystem |
-| **Resource Limits** | Built-in | Manual cgroups | Built-in | VM resources |
-| **Seccomp** | @system-service | Manual BPF | Kafel DSL | VM isolation |
-| **Network** | Namespace + veth | Manual setup | Manual/macvlan | VM networking |
-| **Kernel Protection** | ProtectKernel* | Basic namespaces | Basic namespaces | VM boundary |
-| **Privilege** | Root required | Unprivileged | Root required | Root required |
-| **Complexity** | 1,355 LOC | ~1,200 LOC | ~1,700 LOC | ~2,000 LOC |
+nix-jail supports three executor backends. The table compares these to external alternatives:
 
-**Why systemd:** Nix package closures typically contain 10-100+ packages. systemd's RootDirectory property handles this with a single chroot, while bubblewrap/nsjail require explicit bind mount flags for every package in the closure. systemd also provides comprehensive hardening (33 properties) and built-in resource limits without manual cgroup setup. Present on 99% of modern Linux distributions.
+| Feature | systemd | Docker | sandbox-exec | bubblewrap | nsjail | Firecracker |
+|---------|---------|--------|--------------|------------|--------|-------------|
+| **Platform** | Linux | Cross-platform | macOS | Linux | Linux | Linux |
+| **Nix Closures** | RootDirectory | Volume mounts | Closure allow rules | 100+ bind flags | 100+ -R flags | VM filesystem |
+| **Resource Limits** | Built-in | Built-in | ulimit | Manual cgroups | Built-in | VM resources |
+| **Seccomp** | @system-service | Default profile | N/A | Manual BPF | Kafel DSL | VM isolation |
+| **Network** | Namespace + veth | Bridge network | SBPL rules | Manual setup | Manual/macvlan | VM networking |
+| **Privilege** | Root required | Root (daemon) | User | Unprivileged | Root required | Root required |
 
-**When alternatives are better:** bubblewrap for unprivileged sandboxing or non-systemd Linux (Alpine, Gentoo). nsjail for fine-grained seccomp (browser/JIT sandboxing). Firecracker for VM-level isolation in multi-tenant production, though 8-10x spawn overhead provides minimal benefit against supply chain attacks where the MITM proxy already blocks exfiltration.
+**nix-jail backends (built-in):** systemd (Linux default), Docker (cross-platform), sandbox-exec (macOS default).
+
+**Why systemd on Linux:** Nix package closures typically contain 10-100+ packages. systemd's RootDirectory property handles this with a single chroot, comprehensive hardening (33 properties), and built-in resource limits. Present on 99% of modern Linux distributions.
+
+**Why Docker:** Cross-platform support (Linux, macOS with Docker Desktop, WSL2). Useful for non-systemd Linux (Alpine, Gentoo) or unified tooling across platforms.
+
+**When external alternatives are better:** bubblewrap for unprivileged sandboxing. nsjail for fine-grained seccomp (browser/JIT sandboxing). Firecracker for VM-level isolation in multi-tenant production.
 
 **Prior art:** [hermit](https://github.com/thepwagner/hermit) - Firecracker + MITM proxy for SLSA builds (Go)
 
@@ -276,6 +338,7 @@ Core implementation organized by responsibility:
 - `src/executor/sandbox.rs` - macOS SandboxExecutor
 - `src/executor/sandbox_policy.rs` - SBPL profile generation
 - `src/executor/systemd.rs` - Linux SystemdExecutor
+- `src/executor/docker.rs` - Cross-platform DockerExecutor
 
 **Network:**
 - `src/proxy/mod.rs` - MITM proxy server
@@ -307,8 +370,10 @@ The proxy enforces rule-based network policies with server-controlled credential
 [server]
 addr = "127.0.0.1:50051"
 state_dir = "/var/lib/nix-jail"
-# Store strategy: "cached" (default) or "bind-mount"
+# Store strategy: "cached" (default), "bind-mount", or "docker-volume"
 store_strategy = "cached"
+# Executor: "systemd" (Linux default), "sandbox" (macOS default), or "docker"
+executor = "systemd"
 
 [[credentials]]
 name = "anthropic"

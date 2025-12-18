@@ -179,6 +179,11 @@ fn generate_hardening_properties(
                 ));
             }
         }
+        crate::root::StoreSetup::DockerVolume { .. } => {
+            // DockerVolume is only valid with DockerExecutor
+            // This shouldn't happen - config validation should prevent it
+            tracing::warn!("docker volume store setup used with systemd executor, ignoring");
+        }
     }
 
     props

@@ -195,6 +195,11 @@ fn add_filesystem_mounts(cmd: &mut Command, config: &ExecutionConfig) {
                     .arg(format!("{}:{}:ro", path.display(), path.display()));
             }
         }
+        crate::root::StoreSetup::DockerVolume { name } => {
+            // Mount named Docker volume containing Nix store
+            // The volume was pre-populated by DockerVolumeJobRoot
+            let _ = cmd.arg("-v").arg(format!("{}:/nix:ro", name));
+        }
     }
 
     // SSL certificates for proxy (if they exist in workspace)
@@ -265,8 +270,15 @@ impl Executor for DockerExecutor {
             self.ensure_network().await?;
         }
 
-        // Resolve command paths from closure
-        let resolved_command = resolve_command_in_closure(command, &config.store_paths);
+        // Resolve command paths from closure (skip for DockerVolume - paths are different architecture)
+        let resolved_command = match &config.store_setup {
+            crate::root::StoreSetup::DockerVolume { .. } => {
+                // Don't resolve - the volume has different (Linux) paths than host (macOS)
+                // The PATH will be set up to find binaries
+                command.to_vec()
+            }
+            _ => resolve_command_in_closure(command, &config.store_paths),
+        };
 
         // Build docker run command
         let container_name = format!("nix-jail-{}", job_id);
@@ -300,13 +312,42 @@ impl Executor for DockerExecutor {
         // Working directory inside container
         let _ = cmd.arg("-w").arg("/workspace");
 
-        // Use a minimal base image that has /nix/store structure
-        // nixos/nix is a good choice as it already has Nix installed
-        let _ = cmd.arg("nixos/nix:latest");
+        // Choose base image based on store setup strategy
+        let base_image = match &config.store_setup {
+            crate::root::StoreSetup::DockerVolume { .. } => {
+                // For DockerVolume, use alpine which has sh and basic utils
+                // We mount our pre-built /nix/store over the empty /nix directory
+                "alpine:latest"
+            }
+            _ => {
+                // For other strategies, use nixos/nix which has Nix installed
+                "nixos/nix:latest"
+            }
+        };
+        let _ = cmd.arg(base_image);
 
         // Command to execute
-        for arg in &resolved_command {
-            let _ = cmd.arg(arg);
+        // For DockerVolume, wrap in a shell that sets up PATH from /nix/store/*/bin
+        match &config.store_setup {
+            crate::root::StoreSetup::DockerVolume { .. } => {
+                // Run through sh with PATH setup - find all bin directories in /nix/store
+                // Shell-escape arguments by wrapping in single quotes and escaping single quotes
+                let escaped_cmd = resolved_command
+                    .iter()
+                    .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let wrapper_script = format!(
+                    r#"export PATH="$(find /nix/store -maxdepth 2 -type d -name bin 2>/dev/null | tr '\n' ':')$PATH" && exec {}"#,
+                    escaped_cmd
+                );
+                let _ = cmd.arg("sh").arg("-c").arg(wrapper_script);
+            }
+            _ => {
+                for arg in &resolved_command {
+                    let _ = cmd.arg(arg);
+                }
+            }
         }
 
         // Configure stdio

@@ -19,6 +19,11 @@ pub enum StoreSetup {
     ///
     /// Executor should use: `--property=BindReadOnlyPaths={path}:{path}` for each
     BindMounts { paths: Vec<PathBuf> },
+
+    /// Docker volume contains the Nix store closure
+    ///
+    /// Executor should use: `-v {name}:/nix/store:ro`
+    DockerVolume { name: String },
 }
 
 /// Strategy for setting up the Nix store in the sandbox
@@ -37,6 +42,14 @@ pub enum StoreStrategy {
     /// Instant startup, no copying required. Uses BindReadOnlyPaths
     /// for each store path in the closure.
     BindMount,
+
+    /// Use Docker volumes for the Nix store (for Docker executor)
+    ///
+    /// Caches closures in named Docker volumes. On cache miss, runs
+    /// nix-build inside a container to populate the volume with
+    /// correct-architecture binaries. Essential for macOS where
+    /// host /nix/store has different architecture than container.
+    DockerVolume,
 }
 
 impl std::str::FromStr for StoreStrategy {
@@ -46,8 +59,9 @@ impl std::str::FromStr for StoreStrategy {
         match s.to_lowercase().as_str() {
             "cached" | "copy" => Ok(StoreStrategy::Cached),
             "bind-mount" | "bind_mount" | "bindmount" => Ok(StoreStrategy::BindMount),
+            "docker-volume" | "docker_volume" | "dockervolume" => Ok(StoreStrategy::DockerVolume),
             _ => Err(format!(
-                "unknown store strategy '{}'. valid options: 'cached', 'bind-mount'",
+                "unknown store strategy '{}'. valid options: 'cached', 'bind-mount', 'docker-volume'",
                 s
             )),
         }
@@ -205,6 +219,199 @@ impl JobRoot for BindMountJobRoot {
     }
 }
 
+/// Job root that uses Docker volumes for the Nix store
+///
+/// Caches closures in named Docker volumes. On cache miss, runs nix-build
+/// inside a container to populate the volume. Essential for macOS where
+/// host /nix/store has different architecture than container.
+#[derive(Debug, Default)]
+pub struct DockerVolumeJobRoot {
+    /// Nixpkgs channel/version to use for nix-build
+    nixpkgs_version: Option<String>,
+    /// Package names to install (used instead of extracting from closure)
+    packages: Vec<String>,
+}
+
+impl DockerVolumeJobRoot {
+    /// Create a new Docker volume job root
+    pub fn new() -> Self {
+        Self {
+            nixpkgs_version: None,
+            packages: vec![],
+        }
+    }
+
+    /// Create with specific packages and nixpkgs version
+    pub fn with_packages(packages: Vec<String>, nixpkgs_version: Option<String>) -> Self {
+        Self {
+            nixpkgs_version,
+            packages,
+        }
+    }
+
+    /// Compute the volume name from closure hash
+    fn volume_name(closure: &[PathBuf]) -> String {
+        let hash = crate::cache::compute_closure_hash(closure);
+        // Use first 16 chars of hash for readability
+        format!("nix-jail-{}", &hash[..16])
+    }
+
+    /// Check if a Docker volume exists
+    async fn volume_exists(name: &str) -> Result<bool, RootError> {
+        let output = tokio::process::Command::new("docker")
+            .args(["volume", "inspect", name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map_err(RootError::Io)?;
+
+        Ok(output.success())
+    }
+
+    /// Create a Docker volume
+    async fn create_volume(name: &str) -> Result<(), RootError> {
+        let output = tokio::process::Command::new("docker")
+            .args(["volume", "create", name])
+            .output()
+            .await
+            .map_err(RootError::Io)?;
+
+        if !output.status.success() {
+            return Err(RootError::Io(std::io::Error::other(format!(
+                "failed to create docker volume '{}': {}",
+                name,
+                String::from_utf8_lossy(&output.stderr)
+            ))));
+        }
+
+        tracing::info!(volume = name, "created docker volume");
+        Ok(())
+    }
+
+    /// Populate a Docker volume with packages using nix-build inside a container
+    async fn populate_volume(
+        name: &str,
+        packages: &[String],
+        nixpkgs_version: Option<&str>,
+    ) -> Result<(), RootError> {
+        if packages.is_empty() {
+            tracing::warn!(volume = name, "no packages to install in docker volume");
+            return Ok(());
+        }
+
+        // Build nix expression to install packages
+        let nixpkgs = nixpkgs_version.unwrap_or("nixos-unstable");
+        let nix_expr = format!(
+            "with import (fetchTarball \"https://github.com/NixOS/nixpkgs/archive/{}.tar.gz\") {{}}; [{}]",
+            nixpkgs,
+            packages.join(" ")
+        );
+
+        tracing::info!(
+            volume = name,
+            packages = ?packages,
+            nixpkgs = nixpkgs,
+            "populating docker volume with nix-build"
+        );
+
+        let output = tokio::process::Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "-v",
+                &format!("{}:/nix", name),
+                "nixos/nix:latest",
+                "nix-build",
+                "-E",
+                &nix_expr,
+                "--no-out-link",
+            ])
+            .output()
+            .await
+            .map_err(RootError::Io)?;
+
+        if !output.status.success() {
+            return Err(RootError::Io(std::io::Error::other(format!(
+                "failed to populate docker volume '{}': {}",
+                name,
+                String::from_utf8_lossy(&output.stderr)
+            ))));
+        }
+
+        tracing::info!(
+            volume = name,
+            packages = packages.len(),
+            "docker volume populated"
+        );
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl JobRoot for DockerVolumeJobRoot {
+    async fn create(
+        &self,
+        root_dir: &Path,
+        closure: &[PathBuf],
+    ) -> Result<(StoreSetup, bool), RootError> {
+        // Create minimal root directory (may be needed for other files)
+        std::fs::create_dir_all(root_dir)?;
+
+        if closure.is_empty() {
+            // Empty closure - return empty volume name
+            return Ok((
+                StoreSetup::DockerVolume {
+                    name: "nix-jail-empty".to_string(),
+                },
+                false,
+            ));
+        }
+
+        let volume_name = Self::volume_name(closure);
+
+        // Check for cache hit
+        if Self::volume_exists(&volume_name).await? {
+            tracing::info!(volume = %volume_name, "docker volume cache hit");
+            return Ok((
+                StoreSetup::DockerVolume { name: volume_name },
+                true, // cache hit
+            ));
+        }
+
+        // Cache miss - create and populate volume
+        tracing::info!(
+            volume = %volume_name,
+            closure_count = closure.len(),
+            "docker volume cache miss, creating and populating"
+        );
+
+        Self::create_volume(&volume_name).await?;
+        Self::populate_volume(
+            &volume_name,
+            &self.packages,
+            self.nixpkgs_version.as_deref(),
+        )
+        .await?;
+
+        Ok((
+            StoreSetup::DockerVolume { name: volume_name },
+            false, // cache miss
+        ))
+    }
+
+    fn cleanup(&self, root_dir: &Path) -> Result<(), RootError> {
+        // Only clean up the root directory, not the Docker volume
+        // (volumes are cached for reuse)
+        if root_dir.exists() {
+            StandardStorage
+                .delete_dir(root_dir)
+                .map_err(|e| RootError::Io(std::io::Error::other(e.to_string())))?;
+        }
+        Ok(())
+    }
+}
+
 /// Create a JobRoot based on the configured strategy
 ///
 /// This is the factory function for selecting the appropriate implementation.
@@ -212,6 +419,7 @@ pub fn get_job_root(strategy: StoreStrategy, cache_manager: CacheManager) -> Arc
     match strategy {
         StoreStrategy::Cached => Arc::new(CachedJobRoot::new(cache_manager)),
         StoreStrategy::BindMount => Arc::new(BindMountJobRoot::new()),
+        StoreStrategy::DockerVolume => Arc::new(DockerVolumeJobRoot::new()),
     }
 }
 
@@ -236,6 +444,14 @@ mod tests {
         assert_eq!(
             "bindmount".parse::<StoreStrategy>().unwrap(),
             StoreStrategy::BindMount
+        );
+        assert_eq!(
+            "docker-volume".parse::<StoreStrategy>().unwrap(),
+            StoreStrategy::DockerVolume
+        );
+        assert_eq!(
+            "dockervolume".parse::<StoreStrategy>().unwrap(),
+            StoreStrategy::DockerVolume
         );
         assert!("invalid".parse::<StoreStrategy>().is_err());
     }

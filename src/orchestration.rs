@@ -406,6 +406,12 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
                 (crate::root::StoreSetup::BindMounts { paths }, _) => {
                     format!("Using bind-mount strategy ({} store paths)", paths.len())
                 }
+                (crate::root::StoreSetup::DockerVolume { name }, true) => {
+                    format!("Docker volume cache hit: {}", name)
+                }
+                (crate::root::StoreSetup::DockerVolume { name }, false) => {
+                    format!("Docker volume cache miss: created {}", name)
+                }
             };
             log_sink.info(&job_id, &msg);
             (setup, hit)
@@ -445,8 +451,10 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         &job_dir.root,
     );
 
-    // Update PATH with package binaries
-    if !store_paths.is_empty() {
+    // Update PATH with package binaries (skip for DockerVolume - paths are different architecture)
+    if !store_paths.is_empty()
+        && !matches!(store_setup, crate::root::StoreSetup::DockerVolume { .. })
+    {
         let path_env = workspace::build_path_env(&store_paths);
         let current_path = env.get("PATH").cloned().unwrap_or_default();
         let _ = env.insert("PATH".to_string(), format!("{}:{}", path_env, current_path));
@@ -1233,6 +1241,12 @@ pub async fn execute_local(
         (crate::root::StoreSetup::BindMounts { paths }, _) => {
             format!("Using bind-mount strategy ({} store paths)", paths.len())
         }
+        (crate::root::StoreSetup::DockerVolume { name }, true) => {
+            format!("Docker volume cache hit: {}", name)
+        }
+        (crate::root::StoreSetup::DockerVolume { name }, false) => {
+            format!("Docker volume cache miss: created {}", name)
+        }
     };
     log_sink.info(&job_id, &msg);
 
@@ -1254,8 +1268,10 @@ pub async fn execute_local(
         &job_dir.root,
     );
 
-    // Update PATH with package binaries
-    if !store_paths.is_empty() {
+    // Update PATH with package binaries (skip for DockerVolume - paths are different architecture)
+    if !store_paths.is_empty()
+        && !matches!(store_setup, crate::root::StoreSetup::DockerVolume { .. })
+    {
         let path_env = workspace::build_path_env(&store_paths);
         let current_path = env.get("PATH").cloned().unwrap_or_default();
         let _ = env.insert("PATH".to_string(), format!("{}:{}", path_env, current_path));

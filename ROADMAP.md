@@ -20,32 +20,18 @@ macOS SandboxExecutor could enforce resource limits using ulimit-based restricti
 - Processes: 100
 Linux SystemdExecutor already has these via systemd properties (CPUQuota, MemoryMax, TasksMax, RuntimeMaxSec).
 
-## Filesystem Caching with btrfs
+## Filesystem Caching with btrfs ✓ IMPLEMENTED
 
-On Linux systems with btrfs, we could use copy-on-write snapshots for O(1) workspace creation.
-**Cache structure:**
-```
-cache/
-  derivations/{hash}/     # Nix closure as root filesystem
-  repos/{hash}/           # Git repository state
-```
-**Closure caching:**
-- Compute closure with `nix-store -qR`
-- Copy with reflinks: `cp --reflink=always`
-- O(1) snapshots for new jobs
-- Metadata tracking in SQLite (last used, reference counts, disk usage)
-**Repository isolation:**
-Host maintains full clone (or treeless `--filter=blob:none`); sandbox receives only what's needed:
-- **Sparse-checkout** materializes only job-relevant paths (critical for monorepos - CI for `projects/foo/` never sees `projects/bar/`)
-- **Minimal `.git`** in sandbox: HEAD, index, config, refs - no history blobs
-- **Path allowlist** in job config: `paths: ["projects/foo/", "shared/lib/"]`
-- **Full local git ops** in sandbox: status, diff, add, commit all work
-- **Post-job sync**: extract new commits from sandbox, merge into host clone, push from host
-**Garbage collection:**
-- LRU eviction based on last used time
-- Configurable disk quota
-- Manual `nix-jail gc` command
-**Performance target:** <25ms job spawn time from cache hits
+Closure caching is now implemented via the `store_strategy` config option:
+- **cached**: btrfs snapshots with LRU cache (Linux)
+- **bind-mount**: Zero-copy bind mounts from host `/nix/store`
+- **docker-volume**: Docker volumes with Linux binaries built in-container (macOS)
+
+See [SANDBOX.md](SANDBOX.md) for details.
+
+**Remaining work:**
+- Repository isolation (sparse-checkout for monorepos)
+- Remote caching (S3-backed closure cache)
 
 ## Platform Abstraction
 

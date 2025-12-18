@@ -133,6 +133,25 @@ enum Commands {
         #[arg(long)]
         hardening_profile: Option<String>,
 
+        /// Executor backend to use for sandboxing
+        ///
+        /// Available options:
+        ///   - "auto"    - Platform default (systemd on Linux, sandbox on macOS)
+        ///   - "systemd" - Linux systemd-run with 33 hardening properties
+        ///   - "docker"  - Docker container (cross-platform)
+        ///   - "sandbox" - macOS sandbox-exec with SBPL profiles
+        #[arg(long, default_value = "auto")]
+        executor: String,
+
+        /// Store strategy for making Nix packages available
+        ///
+        /// Available options:
+        ///   - "cached"        - Cache closures with btrfs snapshots/reflinks (default)
+        ///   - "bind-mount"    - Bind-mount store paths directly
+        ///   - "docker-volume" - Use Docker volumes (requires --executor docker)
+        #[arg(long, default_value = "cached")]
+        store_strategy: String,
+
         /// Enable automatic pull request creation for git repositories
         /// After successful execution, commits will be pushed to a new branch (job-${jobID})
         /// and a pull request will be created to the original branch.
@@ -235,6 +254,15 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         executor: String,
 
+        /// Store strategy for making Nix packages available
+        ///
+        /// Available options:
+        ///   - "cached"        - Cache closures with btrfs snapshots/reflinks (default)
+        ///   - "bind-mount"    - Bind-mount store paths directly
+        ///   - "docker-volume" - Use Docker volumes (requires --executor docker)
+        #[arg(long, default_value = "cached")]
+        store_strategy: String,
+
         /// Command to execute (everything after --)
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -266,6 +294,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         show_prefix,
         interactive,
         executor,
+        store_strategy,
         command,
     } = cli.command
     {
@@ -281,6 +310,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             show_prefix,
             interactive,
             executor,
+            store_strategy,
             command,
         )
         .instrument(tracing::info_span!("run"))
@@ -314,6 +344,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             git_ref,
             nixpkgs_version,
             hardening_profile,
+            executor,
+            store_strategy,
             push,
             output,
         } => {
@@ -329,6 +361,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 git_ref,
                 nixpkgs_version,
                 hardening_profile,
+                executor,
+                store_strategy,
                 push,
                 output,
             )
@@ -375,6 +409,8 @@ async fn exec_job(
     git_ref: Option<String>,
     nixpkgs_version: String,
     hardening_profile: Option<String>,
+    executor: String,
+    store_strategy: String,
     push: bool,
     output: OutputOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -686,6 +722,7 @@ async fn run_local(
     show_prefix: bool,
     interactive: bool,
     executor_type: String,
+    store_strategy: String,
     command: Vec<String>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     tracing::info!(packages = ?packages, "running locally");
@@ -794,7 +831,9 @@ async fn run_local(
         None
     };
 
-    // Build execution config
+    // Build execution config (clone packages/nixpkgs_version for later use by DockerVolumeJobRoot)
+    let packages_for_docker = packages.clone();
+    let nixpkgs_for_docker = nixpkgs_version.clone();
     let exec_config = LocalExecutionConfig {
         packages,
         command,
@@ -816,8 +855,28 @@ async fn run_local(
     let executor = nix_jail::executor::create_executor_with_type(executor_type)
         .map_err(|e| format!("failed to create executor: {}", e))?;
     tracing::info!(executor = %executor.name(), "using executor");
-    let job_root: std::sync::Arc<dyn nix_jail::root::JobRoot> =
-        std::sync::Arc::new(nix_jail::root::BindMountJobRoot::new());
+
+    let store_strategy: nix_jail::root::StoreStrategy = store_strategy
+        .parse()
+        .map_err(|e: String| format!("invalid store strategy: {}", e))?;
+    let job_root: std::sync::Arc<dyn nix_jail::root::JobRoot> = match store_strategy {
+        nix_jail::root::StoreStrategy::Cached => {
+            // For local runs, use bind-mount as we don't have a cache manager
+            tracing::info!("using bind-mount strategy for local execution");
+            std::sync::Arc::new(nix_jail::root::BindMountJobRoot::new())
+        }
+        nix_jail::root::StoreStrategy::BindMount => {
+            std::sync::Arc::new(nix_jail::root::BindMountJobRoot::new())
+        }
+        nix_jail::root::StoreStrategy::DockerVolume => {
+            tracing::info!("using docker volume strategy");
+            std::sync::Arc::new(nix_jail::root::DockerVolumeJobRoot::with_packages(
+                packages_for_docker,
+                Some(nixpkgs_for_docker),
+            ))
+        }
+    };
+    tracing::info!(strategy = ?store_strategy, "using store strategy");
 
     // Execute
     let exit_code = execute_local(exec_config, executor, job_root, log_sink).await?;

@@ -26,8 +26,13 @@ cargo run --bin client -- exec -p curl -s examples/scripts/curl.sh \
 ## How it works
 
 The server spawns jobs through a pipeline: resolve Nix packages, set up workspace, start a per-job MITM proxy, execute in platform sandbox, cleanup.
+
 **macOS:** Apple sandbox-exec with SBPL profiles. Localhost-only network forces proxy usage.
-**Linux:** systemd transient units with 33 hardening properties. Network namespaces with veth pairs provide kernel-enforced proxy-only communication.
+
+**Linux (systemd):** systemd transient units with 33 hardening properties. Network namespaces with veth pairs provide kernel-enforced proxy-only communication.
+
+**Docker:** Container isolation with capability dropping, read-only root, and resource limits. Cross-platform (Linux, macOS with Docker Desktop, WSL2).
+
 The proxy intercepts HTTPS traffic, enforces host+path policies, and injects credentials from the host keychain. Code in the sandbox cannot access the real tokens.
 
 ## Features
@@ -42,7 +47,7 @@ The proxy intercepts HTTPS traffic, enforces host+path policies, and injects cre
 ## Requirements
 
 - Nix
-- macOS or Linux with systemd
+- One of: macOS, Linux with systemd, or Docker
 - Root access (daemon manages network namespaces and sandboxing)
 
 ## Getting started
@@ -57,6 +62,14 @@ cargo run --bin client -- exec -p bash -p coreutils -s examples/scripts/bash-env
 # Run with network access to specific hosts
 cargo run --bin client -- exec -p curl -s examples/scripts/curl.sh \
   --allow-host "httpbin.org"
+
+# Use Docker executor (cross-platform, no systemd required)
+cargo run --bin client -- exec -p bash -p coreutils -s examples/scripts/bash-env.sh \
+  --executor docker
+
+# Docker on macOS: use docker-volume strategy (builds Linux binaries in container)
+cargo run --bin client -- run -p cowsay -p bash --executor docker \
+  --store-strategy docker-volume -- cowsay "Hello from Docker!"
 
 # Use Claude Code in a sandbox (with credential injection)
 cargo run --bin client -- exec -p claude-code --nixpkgs nixos-unstable \
@@ -73,4 +86,4 @@ cargo run --bin client -- exec -p claude-code --nixpkgs nixos-unstable \
 
 ## Status
 
-Early development (v0.1.0). The core works but APIs may change.
+Early development (v0.5.0). The core works but APIs may change.
