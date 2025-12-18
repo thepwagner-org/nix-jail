@@ -290,6 +290,8 @@ impl DockerVolumeJobRoot {
     }
 
     /// Populate a Docker volume with packages using nix-build inside a container
+    ///
+    /// Only copies the runtime closure (not build-time deps, .drv files, patches, etc.)
     async fn populate_volume(
         name: &str,
         packages: &[String],
@@ -300,19 +302,40 @@ impl DockerVolumeJobRoot {
             return Ok(());
         }
 
-        // Build nix expression to install packages
         let nixpkgs = nixpkgs_version.unwrap_or("nixos-unstable");
-        let nix_expr = format!(
-            "with import (fetchTarball \"https://github.com/NixOS/nixpkgs/archive/{}.tar.gz\") {{}}; [{}]",
-            nixpkgs,
-            packages.join(" ")
-        );
 
         tracing::info!(
             volume = name,
             packages = ?packages,
             nixpkgs = nixpkgs,
-            "populating docker volume with nix-build"
+            "populating docker volume with runtime closure only"
+        );
+
+        // Build packages in container, copy only runtime closure to target volume
+        // Uses two volumes: temp build volume (discarded) and target volume (kept)
+        //
+        // This avoids polluting the target with build-time deps, .drv files, patches
+
+        // Step 1: Build packages in a temp container, export closure to target volume
+        let build_script = format!(
+            r#"
+set -e
+
+# Build packages and capture output paths
+outputs=$(nix-build --no-out-link -E 'with import (fetchTarball "https://github.com/NixOS/nixpkgs/archive/{nixpkgs}.tar.gz") {{}}; [{packages}]')
+
+# Get runtime closure (only what's needed to run, not build)
+closure=$(nix-store -qR $outputs)
+
+# Copy closure paths to target volume
+for path in $closure; do
+    cp -a "$path" /target/store/
+done
+
+echo "Copied $(echo $closure | wc -w) runtime paths"
+"#,
+            nixpkgs = nixpkgs,
+            packages = packages.join(" ")
         );
 
         let output = tokio::process::Command::new("docker")
@@ -320,12 +343,11 @@ impl DockerVolumeJobRoot {
                 "run",
                 "--rm",
                 "-v",
-                &format!("{}:/nix", name),
+                &format!("{}:/target", name), // Target volume for closure only
                 "nixos/nix:latest",
-                "nix-build",
-                "-E",
-                &nix_expr,
-                "--no-out-link",
+                "sh",
+                "-c",
+                &build_script,
             ])
             .output()
             .await
@@ -342,7 +364,8 @@ impl DockerVolumeJobRoot {
         tracing::info!(
             volume = name,
             packages = packages.len(),
-            "docker volume populated"
+            stdout = %String::from_utf8_lossy(&output.stdout).trim(),
+            "docker volume populated with runtime closure"
         );
         Ok(())
     }
