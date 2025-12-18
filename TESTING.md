@@ -37,13 +37,15 @@ nix-jail run -p coreutils -- ls ~/
 
 ### macOS + Docker
 
+macOS requires `--store-strategy docker-volume` because /nix/store can't be bind-mounted into Docker.
+
 ```bash
 # Basic execution (uses busybox container with Nix closure in Docker volume)
-nix-jail run --executor docker -p cowsay -- cowsay "Hello from Docker"
+nix-jail run --executor docker --store-strategy docker-volume -p cowsay -- cowsay "Hello from Docker"
 
 # Verify Docker volume caching (second run should be faster)
-time nix-jail run --executor docker -p cowsay -- cowsay "First run"
-time nix-jail run --executor docker -p cowsay -- cowsay "Second run (cached)"
+time nix-jail run --executor docker --store-strategy docker-volume -p cowsay -- cowsay "First run"
+time nix-jail run --executor docker --store-strategy docker-volume -p cowsay -- cowsay "Second run (cached)"
 ```
 
 ### Linux + systemd-run (default)
