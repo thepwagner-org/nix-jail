@@ -694,14 +694,20 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
     registry.remove(&job_id).await;
 
     // Cleanup root directory and workspace
-    let _cleanup_span = tracing::info_span!("cleanup").entered();
-    if let Err(e) = job_root.cleanup(&job_dir.root) {
-        tracing::warn!(error = %e, "failed to cleanup root directory");
+    // Try executor-specific cleanup first (handles privilege escalation on Linux)
+    if let Err(e) = executor
+        .cleanup_root(&job_dir.root)
+        .instrument(tracing::info_span!("cleanup_root"))
+        .await
+    {
+        tracing::debug!(error = %e, "executor cleanup failed, trying direct cleanup");
+        if let Err(e) = job_root.cleanup(&job_dir.root) {
+            tracing::warn!(error = %e, "failed to cleanup root directory");
+        }
     }
     if let Err(e) = job_workspace.cleanup(&job_dir.workspace) {
         tracing::warn!(error = %e, "failed to cleanup workspace");
     }
-    drop(_cleanup_span);
 }
 
 // Helper functions
@@ -749,6 +755,10 @@ fn build_environment(
     let _ = env.insert("LOGNAME".to_string(), "sbc-admin".to_string());
 
     let _ = env.insert("TMPDIR".to_string(), "/tmp".to_string());
+
+    // Set minimal locale to avoid locale warnings (sandbox doesn't have full locale data)
+    let _ = env.insert("LANG".to_string(), "C".to_string());
+    let _ = env.insert("LC_ALL".to_string(), "C".to_string());
 
     env
 }
@@ -1441,8 +1451,13 @@ pub async fn execute_local(
     log_sink.done(&job_id, exit_code);
 
     // Cleanup job directory
-    if let Err(e) = job_root.cleanup(&job_dir.root) {
-        tracing::warn!(error = %e, "failed to cleanup root directory");
+    // Try executor-specific cleanup first (handles privilege escalation on Linux)
+    if let Err(e) = executor.cleanup_root(&job_dir.root).await {
+        tracing::debug!(error = %e, "executor cleanup failed, trying direct cleanup");
+        // Fall back to JobRoot cleanup
+        if let Err(e) = job_root.cleanup(&job_dir.root) {
+            tracing::warn!(error = %e, "failed to cleanup root directory");
+        }
     }
 
     Ok(exit_code)

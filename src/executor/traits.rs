@@ -191,6 +191,15 @@ pub trait Executor: Send + Sync {
 
     /// Get the executor name for display/logging
     fn name(&self) -> &'static str;
+
+    /// Clean up job root directory with executor-specific privileges
+    ///
+    /// Default implementation returns Ok (cleanup handled by JobRoot).
+    /// Executors that need privilege escalation (e.g., SystemdExecutor via polkit)
+    /// can override this to run cleanup with elevated permissions.
+    async fn cleanup_root(&self, _root_dir: &std::path::Path) -> Result<(), ExecutorError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -849,6 +849,42 @@ impl Executor for SystemdExecutor {
     fn name(&self) -> &'static str {
         "SystemdExecutor (systemd-run)"
     }
+
+    async fn cleanup_root(&self, root_dir: &std::path::Path) -> Result<(), ExecutorError> {
+        if !root_dir.exists() {
+            return Ok(());
+        }
+
+        tracing::debug!(root_dir = %root_dir.display(), "cleaning up root directory via systemd-run");
+
+        // Use systemd-run to delete with same privileges as job execution
+        // This handles the case where polkit granted us permission to run units
+        // but the files created are owned by root
+        let status = Command::new("systemd-run")
+            .args([
+                "--quiet",
+                "--wait",
+                "--pipe",
+                "--collect", // Auto-cleanup unit after completion
+                "--",
+                "rm",
+                "-rf",
+            ])
+            .arg(root_dir)
+            .status()
+            .await
+            .map_err(|e| ExecutorError::SpawnFailed(format!("cleanup: {}", e)))?;
+
+        if status.success() {
+            tracing::debug!(root_dir = %root_dir.display(), "cleanup completed");
+            Ok(())
+        } else {
+            Err(ExecutorError::SpawnFailed(format!(
+                "cleanup failed with exit code: {:?}",
+                status.code()
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
