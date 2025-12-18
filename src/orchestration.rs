@@ -773,7 +773,8 @@ async fn find_packages(
 ) -> Option<Vec<std::path::PathBuf>> {
     if is_exec_mode {
         let pkg_refs: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
-        match workspace::find_nix_packages_cached(&pkg_refs, nixpkgs_version).await {
+        // Server mode: in-memory cache only (daemon stays running)
+        match workspace::find_nix_packages_cached(&pkg_refs, nixpkgs_version, None).await {
             Ok(paths) => {
                 let version_info = nixpkgs_version.unwrap_or("(none)");
                 tracing::info!(packages = ?packages, nixpkgs_version = %version_info, "found nix packages");
@@ -904,6 +905,9 @@ async fn configure_proxy(
 ///
 /// Handles both flake-based and explicit package resolution.
 /// Returns (store_paths, closure).
+///
+/// # Arguments
+/// * `cache_dir` - Directory for persistent disk cache (L2). If None, only in-memory cache is used.
 async fn resolve_packages_and_closure(
     job_id: &str,
     working_dir: &Path,
@@ -911,6 +915,7 @@ async fn resolve_packages_and_closure(
     nixpkgs_version: Option<&str>,
     has_flake: bool,
     log_sink: &Arc<dyn LogSink>,
+    cache_dir: Option<&Path>,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>), OrchestrationError> {
     let store_paths = if has_flake {
         if !packages.is_empty() {
@@ -931,7 +936,7 @@ async fn resolve_packages_and_closure(
             .map_err(|e| OrchestrationError::FlakeClosureError(e.to_string()))?
     } else if !packages.is_empty() {
         let pkg_refs: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
-        workspace::find_nix_packages_cached(&pkg_refs, nixpkgs_version)
+        workspace::find_nix_packages_cached(&pkg_refs, nixpkgs_version, cache_dir)
             .await
             .map_err(|e| OrchestrationError::PackageError(e.to_string()))?
     } else {
@@ -1220,6 +1225,7 @@ pub async fn execute_local(
     .await?;
 
     // Phase 2: Resolve packages and compute closure
+    // CLI mode: use disk cache for persistence across process restarts
     let (store_paths, closure) = resolve_packages_and_closure(
         &job_id,
         &config.working_dir,
@@ -1227,6 +1233,7 @@ pub async fn execute_local(
         config.nixpkgs_version.as_deref(),
         has_flake,
         &log_sink,
+        Some(&state_dir),
     )
     .instrument(tracing::info_span!("resolve_packages"))
     .await?;

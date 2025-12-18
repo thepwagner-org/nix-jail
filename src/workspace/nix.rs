@@ -373,52 +373,77 @@ pub async fn find_nix_packages(packages: &[&str]) -> Result<Vec<PathBuf>, Worksp
 /// Find multiple Nix packages with caching (recommended for production use)
 ///
 /// This is a cached wrapper around find_nix_packages_with_version that uses
-/// a global in-memory cache to avoid expensive Nix operations for repeated
-/// package resolution requests.
+/// a two-level cache:
+/// - L1: In-memory cache (moka) - fast, process-local
+/// - L2: Disk cache (JSON files) - persistent across process restarts
 ///
 /// Cache behavior:
-/// - Check cache first - return immediately if hit (saves ~330ms)
-/// - On cache miss - call find_nix_packages_with_version()
-/// - Store result in cache for future requests
+/// - L1 hit: Return immediately (~0ms)
+/// - L1 miss, L2 hit: Promote to L1 and return (~1ms)
+/// - Both miss: Resolve packages (~330ms), store in both caches
 /// - Cache keys are sorted package lists + version (order-independent)
 ///
 /// # Arguments
 /// * `packages` - List of package names to resolve
 /// * `nixpkgs_version` - Optional nixpkgs version specification
+/// * `cache_dir` - Optional directory for disk cache (L2). If None, only L1 is used.
 ///
 /// # Returns
 /// Store paths in the same order as the input packages.
 pub async fn find_nix_packages_cached(
     packages: &[&str],
     nixpkgs_version: Option<&str>,
+    cache_dir: Option<&Path>,
 ) -> Result<Vec<PathBuf>, WorkspaceError> {
-    let cache = get_package_cache();
+    let memory_cache = get_package_cache();
 
-    // Try cache first
-    if let Some(paths) = cache.get(packages, nixpkgs_version) {
+    // L1: Check in-memory cache
+    if let Some(paths) = memory_cache.get(packages, nixpkgs_version) {
         tracing::debug!(
-            "cache hit for {} packages with nixpkgs version {:?}",
-            packages.len(),
-            nixpkgs_version
+            packages_count = packages.len(),
+            nixpkgs_version = ?nixpkgs_version,
+            "L1 cache hit (in-memory)"
         );
         return Ok(paths);
     }
 
-    // Cache miss - resolve packages
+    // L2: Check disk cache (if cache_dir provided)
+    if let Some(dir) = cache_dir {
+        let disk_cache = super::cache::DiskPackageCache::new(dir.join("packages"));
+        if let Some(paths) = disk_cache.get(packages, nixpkgs_version) {
+            tracing::debug!(
+                packages_count = packages.len(),
+                nixpkgs_version = ?nixpkgs_version,
+                "L2 cache hit (disk) - promoting to L1"
+            );
+            // Promote to L1
+            memory_cache.insert(packages, nixpkgs_version, paths.clone());
+            return Ok(paths);
+        }
+    }
+
+    // Both miss - resolve packages
     tracing::debug!(
-        "cache miss for {} packages with nixpkgs version {:?} - resolving",
-        packages.len(),
-        nixpkgs_version
+        packages_count = packages.len(),
+        nixpkgs_version = ?nixpkgs_version,
+        "cache miss - resolving packages"
     );
 
     let paths = find_nix_packages_with_version(packages, nixpkgs_version).await?;
 
-    // Store in cache for next time
-    cache.insert(packages, nixpkgs_version, paths.clone());
+    // Store in L1 (always)
+    memory_cache.insert(packages, nixpkgs_version, paths.clone());
+
+    // Store in L2 (if cache_dir provided)
+    if let Some(dir) = cache_dir {
+        let disk_cache = super::cache::DiskPackageCache::new(dir.join("packages"));
+        disk_cache.insert(packages, nixpkgs_version, paths.clone());
+    }
+
     tracing::debug!(
-        "cached {} store paths (cache now has {} entries)",
-        paths.len(),
-        cache.entry_count()
+        packages_count = paths.len(),
+        memory_cache_entries = memory_cache.entry_count(),
+        "cached store paths"
     );
 
     Ok(paths)
