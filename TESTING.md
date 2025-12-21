@@ -141,6 +141,66 @@ cd /path/to/flake-project
 nix-jail run -- bash -c 'echo "Using flake closure"'
 ```
 
+## Git Workspace Testing
+
+Test sparse checkout of remote repositories into Docker volumes.
+
+### Test 1: Basic git workspace
+
+```bash
+# Clone a subpath from a monorepo
+nix-jail run --executor docker --store-strategy docker-volume \
+  --repo "https://user:TOKEN@git.example.com/pwagner/pwagner.git" \
+  --path "projects/nix-jail" \
+  -p bash -p git \
+  -- bash -c "pwd && ls -la"
+```
+
+### Test 2: Verify sparse checkout
+
+```bash
+# Should show only the requested path, minimal objects
+nix-jail run --executor docker --store-strategy docker-volume \
+  --repo "https://user:TOKEN@git.example.com/pwagner/pwagner.git" \
+  --path "projects/nix-jail" \
+  -p bash -p git \
+  -- bash -c '
+echo "=== Sparse checkout path ==="
+git sparse-checkout list
+
+echo "=== Git objects (should be minimal) ==="
+git count-objects -v
+'
+```
+
+### Test 3: Volume caching
+
+```bash
+# First run - creates volume
+time nix-jail run --executor docker --store-strategy docker-volume \
+  --repo "https://user:TOKEN@git.example.com/pwagner/pwagner.git" \
+  --path "projects/nix-jail" \
+  -p bash -- echo "First run"
+
+# Second run - should be instant (volume cache hit)
+time nix-jail run --executor docker --store-strategy docker-volume \
+  --repo "https://user:TOKEN@git.example.com/pwagner/pwagner.git" \
+  --path "projects/nix-jail" \
+  -p bash -- echo "Second run (cached)"
+```
+
+### Test 4: Specific git ref
+
+```bash
+# Checkout a specific commit
+nix-jail run --executor docker --store-strategy docker-volume \
+  --repo "https://user:TOKEN@git.example.com/pwagner/pwagner.git" \
+  --path "projects/nix-jail" \
+  --git-ref "main" \
+  -p bash -p git \
+  -- git log -1 --oneline
+```
+
 ## Platform-Specific Setup
 
 ### NixOS: polkit for non-root systemd-run
