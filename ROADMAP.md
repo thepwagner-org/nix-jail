@@ -20,19 +20,6 @@ macOS SandboxExecutor could enforce resource limits using ulimit-based restricti
 - Processes: 100
 Linux SystemdExecutor already has these via systemd properties (CPUQuota, MemoryMax, TasksMax, RuntimeMaxSec).
 
-## Filesystem Caching with btrfs ✓ IMPLEMENTED
-
-Closure caching is now implemented via the `store_strategy` config option:
-- **cached**: btrfs snapshots with LRU cache (Linux)
-- **bind-mount**: Zero-copy bind mounts from host `/nix/store`
-- **docker-volume**: Docker volumes with Linux binaries built in-container (macOS)
-
-See [SANDBOX.md](SANDBOX.md) for details.
-
-**Remaining work:**
-- Repository isolation (sparse-checkout for monorepos)
-- Remote caching (S3-backed closure cache)
-
 ## Platform Abstraction
 
 Formalize platform abstractions to make adding new isolation backends easier.

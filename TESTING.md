@@ -190,7 +190,7 @@ otlp_endpoint = "http://tempo.example.com:4317"
 
 ### "Permission denied" on Linux cleanup
 
-If running as non-root via polkit, ensure the cleanup fix is applied (v0.5.4+).
+If running as non-root via polkit, ensure the cleanup fix is applied.
 
 ### Docker volume not found
 
@@ -204,7 +204,7 @@ docker volume prune
 
 ### Locale warnings
 
-Fixed in v0.5.4 - jobs now run with `LANG=C`.
+Jobs now run with `LANG=C`.
 
 ## See Also
 

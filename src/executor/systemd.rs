@@ -87,8 +87,8 @@ fn workspace_to_chroot_path(host_path: &Path, workspace_root: &Path) -> PathBuf 
 /// - Resource limits (5 properties)
 /// - Cleanup/isolation (4 properties)
 ///
-/// Reference: PLAN.md:123-186
-/// SECURITY: NEVER remove/weaken these without documented justification (CLAUDE.md:11)
+/// Reference: SANDBOX.md Appendix C (Linux Hardening Reference)
+/// SECURITY: NEVER remove/weaken these without documented justification (CLAUDE.md)
 fn generate_hardening_properties(
     root_dir: &Path,
     workspace: &Path,

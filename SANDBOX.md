@@ -298,9 +298,8 @@ nix-jail provides five overlapping defense layers:
 
 Each layer independently blocks common attack vectors. Even if one layer is bypassed, the others remain effective.
 
-### Security Score & Trade-offs
+### Security Trade-offs
 
-**Security Score:** 75/100
 - Blocks 99% of supply chain attacks through defense-in-depth
 - Suitable for trusted workloads running untrusted code
 - Not suitable for multi-tenant production without additional isolation

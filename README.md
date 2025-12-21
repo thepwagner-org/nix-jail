@@ -86,4 +86,4 @@ cargo run --bin client -- exec -p claude-code --nixpkgs nixos-unstable \
 
 ## Status
 
-Early development (v0.5.0). The core works but APIs may change.
+Early development. The core works but APIs may change.
