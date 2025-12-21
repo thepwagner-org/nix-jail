@@ -172,9 +172,31 @@ fn add_network_config(cmd: &mut Command, config: &ExecutionConfig, network_name:
 /// Adds filesystem mounts to the docker command
 fn add_filesystem_mounts(cmd: &mut Command, config: &ExecutionConfig) {
     // Workspace (read-write)
-    let _ = cmd
-        .arg("-v")
-        .arg(format!("{}:/workspace", config.working_dir.display()));
+    // Check for special docker-volume: prefix (from DockerVolumeWorkspace)
+    let working_dir_str = config.working_dir.to_string_lossy();
+    if let Some(volume_spec) = working_dir_str.strip_prefix("docker-volume:") {
+        // Format: docker-volume:{volume_name}[:{subpath}]
+        let parts: Vec<&str> = volume_spec.splitn(2, ':').collect();
+        let volume_name = parts[0];
+        let subpath = parts.get(1).copied().unwrap_or("");
+
+        if subpath.is_empty() {
+            // Mount volume root as workspace
+            let _ = cmd.arg("-v").arg(format!("{}:/workspace", volume_name));
+        } else {
+            // Mount volume and set working directory to subpath
+            // The wrapper script will cd to the subpath
+            let _ = cmd
+                .arg("-v")
+                .arg(format!("{}:/workspace-root", volume_name));
+            let _ = cmd.arg("-e").arg(format!("WORKSPACE_SUBPATH={}", subpath));
+        }
+    } else {
+        // Standard bind-mount from host filesystem
+        let _ = cmd
+            .arg("-v")
+            .arg(format!("{}:/workspace", config.working_dir.display()));
+    };
 
     // Nix store based on strategy
     match &config.store_setup {
@@ -338,8 +360,17 @@ impl Executor for DockerExecutor {
                     .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
                     .collect::<Vec<_>>()
                     .join(" ");
-                let wrapper_script =
-                    format!(r#"export PATH="/nix/bin:$PATH" && exec {}"#, escaped_cmd);
+                // Handle WORKSPACE_SUBPATH for DockerVolumeWorkspace (cd to subpath first)
+                // The subpath is set via WORKSPACE_SUBPATH env var in add_filesystem_mounts()
+                // Also mark /workspace-root as safe for git (ownership mismatch in Docker)
+                // We set GIT_CONFIG_COUNT to inject safe.directory config without needing git binary
+                let wrapper_script = format!(
+                    r#"export PATH="/nix/bin:$PATH" && \
+                    export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/workspace-root && \
+                    if [ -n "$WORKSPACE_SUBPATH" ]; then cd "/workspace-root/$WORKSPACE_SUBPATH"; fi && \
+                    exec {}"#,
+                    escaped_cmd
+                );
                 let _ = cmd.arg("/bin/sh").arg("-c").arg(wrapper_script);
             }
             _ => {

@@ -220,7 +220,19 @@ enum Commands {
         #[arg(long)]
         allow_cidr: Vec<String>,
 
-        /// Working directory (defaults to current directory)
+        /// Git repository URL (optional, for git workspace mode)
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Path within repository (optional, defaults to ".")
+        #[arg(long)]
+        path: Option<String>,
+
+        /// Git ref to checkout: branch, tag, or commit SHA (optional, uses default branch if omitted)
+        #[arg(long, alias = "ref")]
+        git_ref: Option<String>,
+
+        /// Working directory (defaults to current directory, ignored if --repo is set)
         #[arg(long)]
         workdir: Option<std::path::PathBuf>,
 
@@ -287,6 +299,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         policy,
         allow_host,
         allow_cidr,
+        repo,
+        path,
+        git_ref,
         workdir,
         nixpkgs_version,
         hardening_profile,
@@ -303,6 +318,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             policy,
             allow_host,
             allow_cidr,
+            repo,
+            path,
+            git_ref,
             workdir,
             nixpkgs_version,
             hardening_profile,
@@ -715,6 +733,9 @@ async fn run_local(
     policy_path: Option<std::path::PathBuf>,
     allow_hosts: Vec<String>,
     allow_cidrs: Vec<String>,
+    repo: Option<String>,
+    path: Option<String>,
+    git_ref: Option<String>,
     workdir: Option<std::path::PathBuf>,
     nixpkgs_version: String,
     hardening_profile: Option<String>,
@@ -725,12 +746,137 @@ async fn run_local(
     store_strategy: String,
     command: Vec<String>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
-    tracing::info!(packages = ?packages, "running locally");
+    tracing::info!(packages = ?packages, repo = ?repo, path = ?path, "running locally");
 
-    // Determine working directory
-    let working_dir = match workdir {
-        Some(dir) => dir.canonicalize()?,
-        None => std::env::current_dir()?,
+    // Determine state directory for workspace/cache
+    let state_dir = std::env::temp_dir().join("nix-jail-local");
+    std::fs::create_dir_all(&state_dir)?;
+
+    // Determine working directory - git workspace or local directory
+    let (working_dir, _workspace_cleanup) = if let Some(ref repo_url) = repo {
+        // Git workspace mode - clone repo into Docker volume or host directory
+        tracing::info!(repo = %repo_url, path = ?path, git_ref = ?git_ref, "setting up git workspace");
+
+        // For Docker volumes, clone directly into volume without local mirror
+        let use_docker_volumes = store_strategy == "docker-volume";
+
+        if use_docker_volumes {
+            // Clone directly into Docker volume
+            use nix_jail::job_workspace::MirrorJobWorkspace;
+            use nix_jail::workspace::git::resolve_ref_to_commit;
+
+            // Resolve ref from remote (no local mirror needed)
+            let commit_sha = resolve_ref_to_commit(repo_url, git_ref.as_deref(), None)
+                .map_err(|e| format!("failed to resolve git ref: {}", e))?;
+            tracing::info!(commit = %commit_sha, "resolved git ref");
+
+            // Compute cache key for volume name
+            let cache_key =
+                MirrorJobWorkspace::compute_cache_key(repo_url, &commit_sha, path.as_deref());
+            let volume_name = format!("nix-jail-ws-{}", &cache_key[..16]);
+
+            // Check if volume already exists (cache hit)
+            let volume_exists = std::process::Command::new("docker")
+                .args(["volume", "inspect", &volume_name])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+            if !volume_exists {
+                // Create volume
+                let output = std::process::Command::new("docker")
+                    .args(["volume", "create", &volume_name])
+                    .output()
+                    .map_err(|e| format!("failed to create docker volume: {}", e))?;
+                if !output.status.success() {
+                    return Err(format!(
+                        "docker volume create failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                    .into());
+                }
+
+                // Clone into volume using nixos/nix container
+                let sparse_path = path.as_deref().unwrap_or(".");
+                let script = format!(
+                    r#"set -e
+cd /workspace
+git clone --depth 1 --filter=blob:none --sparse --no-checkout '{repo}' .
+git sparse-checkout set '{sparse_path}'
+git checkout"#,
+                    repo = repo_url,
+                    sparse_path = sparse_path
+                );
+
+                tracing::info!(volume = %volume_name, "cloning into docker volume");
+                let output = std::process::Command::new("docker")
+                    .args([
+                        "run",
+                        "--rm",
+                        "-v",
+                        &format!("{}:/workspace", volume_name),
+                        "nixos/nix:latest",
+                        "nix-shell",
+                        "-p",
+                        "git",
+                        "--run",
+                        &script,
+                    ])
+                    .output()
+                    .map_err(|e| format!("failed to run docker clone: {}", e))?;
+
+                if !output.status.success() {
+                    return Err(format!(
+                        "docker clone failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                    .into());
+                }
+            } else {
+                tracing::info!(volume = %volume_name, "docker volume cache hit");
+            }
+
+            // Return volume reference
+            let volume_path = if let Some(ref subpath) = path {
+                if !subpath.is_empty() && subpath != "." {
+                    format!("docker-volume:{}:{}", volume_name, subpath)
+                } else {
+                    format!("docker-volume:{}", volume_name)
+                }
+            } else {
+                format!("docker-volume:{}", volume_name)
+            };
+
+            (std::path::PathBuf::from(volume_path), None)
+        } else {
+            // Clone to host directory using StandardJobWorkspace
+            use nix_jail::job_workspace::{JobWorkspace, StandardJobWorkspace};
+
+            let workspace_dir = state_dir.join(format!("ws-{}", ulid::Ulid::new()));
+            let src_dir = workspace_dir.join("src");
+
+            let workspace = StandardJobWorkspace::new();
+            let result_path = workspace
+                .setup(
+                    &src_dir,
+                    repo_url,
+                    git_ref.as_deref(),
+                    path.as_deref(),
+                    None, // No token (could load from config)
+                )
+                .await
+                .map_err(|e| format!("failed to setup git workspace: {}", e))?;
+
+            tracing::info!(working_dir = %result_path.display(), "git workspace ready");
+            (result_path, Some(workspace_dir))
+        }
+    } else {
+        // Local directory mode
+        let dir = match workdir {
+            Some(dir) => dir.canonicalize()?,
+            None => std::env::current_dir()?,
+        };
+        (dir, None)
     };
 
     // Load network policy if provided
@@ -798,10 +944,6 @@ async fn run_local(
     } else {
         vec![]
     };
-
-    // Determine state directory
-    let state_dir = std::env::temp_dir().join("nix-jail-local");
-    std::fs::create_dir_all(&state_dir)?;
 
     // Create log sink
     let log_sink = Arc::new(StdioLogSink::new(show_prefix));
