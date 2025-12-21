@@ -17,6 +17,9 @@ pub struct ServerConfig {
     pub store_strategy: StoreStrategy,
     /// OpenTelemetry OTLP endpoint for distributed tracing (e.g., "http://localhost:4317")
     pub otlp_endpoint: Option<String>,
+    /// Path to existing monorepo clone for sparse checkout support
+    /// If set, uses this as the source for workspace clones instead of fetching fresh
+    pub monorepo_path: Option<PathBuf>,
 }
 
 /// Type of credential for determining setup requirements
@@ -85,6 +88,7 @@ impl Default for ServerConfig {
             credentials: Vec::new(),
             store_strategy: StoreStrategy::default(),
             otlp_endpoint: None,
+            monorepo_path: None,
         }
     }
 }
@@ -229,6 +233,8 @@ struct ServerSection {
     store_strategy: String,
     /// OpenTelemetry OTLP endpoint (e.g., "http://localhost:4317")
     otlp_endpoint: Option<String>,
+    /// Path to existing monorepo clone for sparse checkout support
+    monorepo_path: Option<String>,
 }
 
 impl Default for ServerSection {
@@ -239,6 +245,7 @@ impl Default for ServerSection {
             db_path: default_db_path(),
             store_strategy: default_store_strategy(),
             otlp_endpoint: None,
+            monorepo_path: None,
         }
     }
 }
@@ -290,6 +297,7 @@ impl ServerConfig {
             credentials: config.credentials,
             store_strategy,
             otlp_endpoint: config.server.otlp_endpoint,
+            monorepo_path: config.server.monorepo_path.map(PathBuf::from),
         })
     }
 

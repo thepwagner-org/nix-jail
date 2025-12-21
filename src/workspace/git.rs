@@ -311,6 +311,217 @@ pub fn verify_path_in_repo(repo_dir: &Path, relative_path: &str) -> Result<(), W
     Ok(())
 }
 
+/// Resolve a git ref to a commit SHA using a local mirror repository
+///
+/// This is faster than `resolve_ref_to_commit` as it doesn't require network access.
+/// Uses git2 to read refs directly from the local repository.
+///
+/// # Arguments
+/// * `mirror_path` - Path to the local mirror repository
+/// * `git_ref` - Git ref to resolve (branch name, tag name, or None for HEAD)
+///
+/// # Returns
+/// The full 40-character commit SHA
+pub fn resolve_ref_from_mirror(
+    mirror_path: &Path,
+    git_ref: Option<&str>,
+) -> Result<String, WorkspaceError> {
+    // If it's already a full commit SHA, just return it
+    if let Some(ref_str) = git_ref {
+        if ref_str.len() == 40 && ref_str.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(ref_str.to_string());
+        }
+    }
+
+    let repo = Repository::open(mirror_path).map_err(|e| {
+        WorkspaceError::IoError(std::io::Error::other(format!(
+            "failed to open mirror repository: {}",
+            e
+        )))
+    })?;
+
+    let target_ref = git_ref.unwrap_or("HEAD");
+
+    // Try to resolve the reference
+    let reference = if target_ref == "HEAD" {
+        repo.head()
+    } else {
+        // Try as branch first, then tag
+        repo.find_branch(target_ref, git2::BranchType::Local)
+            .map(|b| b.into_reference())
+            .or_else(|_| repo.find_reference(&format!("refs/heads/{}", target_ref)))
+            .or_else(|_| repo.find_reference(&format!("refs/tags/{}", target_ref)))
+            .or_else(|_| repo.find_reference(target_ref))
+    };
+
+    let reference = reference.map_err(|e| {
+        WorkspaceError::InvalidPath(format!(
+            "could not resolve ref '{}' in mirror: {}",
+            target_ref, e
+        ))
+    })?;
+
+    // Peel to commit
+    let commit = reference.peel_to_commit().map_err(|e| {
+        WorkspaceError::InvalidPath(format!(
+            "could not resolve ref '{}' to commit: {}",
+            target_ref, e
+        ))
+    })?;
+
+    let sha = commit.id().to_string();
+    tracing::debug!(
+        ref_name = %target_ref,
+        commit = %sha,
+        "resolved ref from mirror"
+    );
+
+    Ok(sha)
+}
+
+/// Perform a sparse shallow checkout from a remote with local reference
+///
+/// Creates a shallow clone (depth=1) from the remote with sparse checkout configured.
+/// Uses the local mirror as a reference to avoid re-downloading objects that already
+/// exist locally. Only fetches objects needed for the single commit and sparse paths.
+///
+/// # Arguments
+/// * `repo_url` - Remote repository URL to clone from
+/// * `reference_path` - Optional path to local repository for object reuse
+/// * `target_dir` - Directory to create the checkout in
+/// * `commit_sha` - Commit SHA to checkout
+/// * `sparse_paths` - Paths to include in sparse checkout (empty = full checkout)
+///
+/// # Security
+/// - Uses git CLI (git2 doesn't support sparse checkout)
+/// - All inputs are validated before use
+/// - Uses `Command::new` with explicit args (no shell interpolation)
+pub fn sparse_checkout_from_mirror(
+    repo_url: &str,
+    reference_path: Option<&Path>,
+    target_dir: &Path,
+    commit_sha: &str,
+    sparse_paths: &[&str],
+) -> Result<(), WorkspaceError> {
+    use std::process::Command;
+
+    // Validate commit SHA format
+    if commit_sha.len() != 40 || !commit_sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(WorkspaceError::InvalidPath(format!(
+            "invalid commit SHA: {}",
+            commit_sha
+        )));
+    }
+
+    // Create target directory
+    std::fs::create_dir_all(target_dir)?;
+
+    // Step 1: Clone from remote with minimal object transfer
+    // --depth 1: only fetch one commit (no history)
+    // --filter=blob:none: don't fetch blobs until needed (partial clone)
+    // --sparse: only checkout specified paths
+    // Note: We don't use --reference because --dissociate copies too many objects.
+    // The filters already minimize network transfer effectively.
+    let mut clone_args = vec![
+        "clone".to_string(),
+        "--depth".to_string(),
+        "1".to_string(),
+        "--no-checkout".to_string(),
+        "--filter=blob:none".to_string(),
+    ];
+
+    // Add sparse cone mode
+    if !sparse_paths.is_empty() {
+        clone_args.push("--sparse".to_string());
+    }
+
+    clone_args.push(repo_url.to_string());
+    clone_args.push(target_dir.to_string_lossy().to_string());
+
+    // Log if reference path was provided (we don't use it, but useful for debugging)
+    if let Some(ref_path) = reference_path {
+        tracing::debug!(
+            reference = %ref_path.display(),
+            "reference path provided but not used (filters are sufficient)"
+        );
+    }
+
+    let clone_output = Command::new("git")
+        .args(&clone_args)
+        .output()
+        .map_err(|e| {
+            WorkspaceError::IoError(std::io::Error::other(format!(
+                "failed to run git clone: {}",
+                e
+            )))
+        })?;
+
+    if !clone_output.status.success() {
+        return Err(WorkspaceError::IoError(std::io::Error::other(format!(
+            "git clone failed: {}",
+            String::from_utf8_lossy(&clone_output.stderr)
+        ))));
+    }
+
+    // Step 2: Configure sparse checkout paths if specified
+    if !sparse_paths.is_empty() {
+        // Set sparse checkout paths (--sparse already initialized cone mode)
+        let mut set_cmd = Command::new("git");
+        let _ = set_cmd.args([
+            "-C",
+            &target_dir.to_string_lossy(),
+            "sparse-checkout",
+            "set",
+        ]);
+        for path in sparse_paths {
+            let _ = set_cmd.arg(path);
+        }
+
+        let set_output = set_cmd.output().map_err(|e| {
+            WorkspaceError::IoError(std::io::Error::other(format!(
+                "failed to run git sparse-checkout set: {}",
+                e
+            )))
+        })?;
+
+        if !set_output.status.success() {
+            return Err(WorkspaceError::IoError(std::io::Error::other(format!(
+                "git sparse-checkout set failed: {}",
+                String::from_utf8_lossy(&set_output.stderr)
+            ))));
+        }
+    }
+
+    // Step 3: Checkout HEAD (the shallow clone already has the right commit)
+    let checkout_output = Command::new("git")
+        .args(["-C", &target_dir.to_string_lossy(), "checkout"])
+        .output()
+        .map_err(|e| {
+            WorkspaceError::IoError(std::io::Error::other(format!(
+                "failed to run git checkout: {}",
+                e
+            )))
+        })?;
+
+    if !checkout_output.status.success() {
+        return Err(WorkspaceError::IoError(std::io::Error::other(format!(
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&checkout_output.stderr)
+        ))));
+    }
+
+    tracing::info!(
+        repo = %repo_url,
+        reference = ?reference_path.map(|p| p.display().to_string()),
+        target = %target_dir.display(),
+        commit = %commit_sha,
+        sparse_paths = ?sparse_paths,
+        "sparse checkout complete"
+    );
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

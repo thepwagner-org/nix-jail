@@ -4,7 +4,7 @@
 //! different strategies to set up job workspaces (git clone, caching, etc.).
 
 use crate::cache::{CacheManager, StandardStorage, WorkspaceStorage};
-use crate::workspace::{git, WorkspaceError};
+use crate::workspace::{git, mirror::RepoMirror, WorkspaceError};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -301,6 +301,118 @@ impl JobWorkspace for CachedJobWorkspace {
     }
 }
 
+/// Mirror-based workspace setup with sparse checkout support
+///
+/// Uses an existing local repository as the source for sparse checkouts.
+/// Ideal for monorepo workflows where you already have the repo cloned
+/// (e.g., ~/src) and only need a specific subpath for each job.
+///
+/// Flow:
+/// 1. Fetch updates on the local repo
+/// 2. Resolve ref using local repo (no network needed after fetch)
+/// 3. Sparse blobless checkout from local repo to workspace
+#[derive(Debug)]
+pub struct MirrorJobWorkspace {
+    mirror: RepoMirror,
+    storage: Arc<dyn WorkspaceStorage>,
+}
+
+impl MirrorJobWorkspace {
+    /// Create a new MirrorJobWorkspace using an existing local repository
+    ///
+    /// The `local_repo` path should point to a full clone of the repository
+    /// that will be used as the source for sparse checkouts.
+    pub fn new(local_repo: impl Into<PathBuf>, storage: Arc<dyn WorkspaceStorage>) -> Self {
+        Self {
+            mirror: RepoMirror::new(local_repo),
+            storage,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl JobWorkspace for MirrorJobWorkspace {
+    async fn setup(
+        &self,
+        workspace_dir: &Path,
+        repo: &str,
+        git_ref: Option<&str>,
+        path: Option<&str>,
+        github_token: Option<&str>,
+    ) -> Result<PathBuf, WorkspaceError> {
+        if repo.is_empty() {
+            // No repo - create workspace using storage backend
+            self.storage
+                .create_dir(workspace_dir)
+                .map_err(|e| WorkspaceError::IoError(std::io::Error::other(e.to_string())))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(workspace_dir, std::fs::Permissions::from_mode(0o777))?;
+            }
+            return Ok(workspace_dir.to_path_buf());
+        }
+
+        // Step 1: Sync mirror (fetch --all)
+        let mirror_path = self.mirror.sync(repo, github_token)?;
+
+        // Step 2: Resolve ref using mirror (no network needed)
+        let commit_sha = git::resolve_ref_from_mirror(&mirror_path, git_ref)?;
+
+        tracing::info!(
+            repo = %repo,
+            git_ref = ?git_ref,
+            commit = %commit_sha,
+            path = ?path,
+            "setting up sparse checkout from mirror"
+        );
+
+        // Step 3: Sparse blobless checkout from remote, using mirror as reference
+        let sparse_paths: Vec<&str> = path
+            .filter(|p| !p.is_empty() && *p != ".")
+            .into_iter()
+            .collect();
+
+        git::sparse_checkout_from_mirror(
+            repo,
+            Some(&mirror_path),
+            workspace_dir,
+            &commit_sha,
+            &sparse_paths,
+        )?;
+
+        // Make workspace writable for job execution
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(workspace_dir, std::fs::Permissions::from_mode(0o777))?;
+        }
+
+        // Step 4: Return working directory (may be subpath within checkout)
+        let working_dir = if let Some(subpath) = path {
+            if !subpath.is_empty() && subpath != "." {
+                workspace_dir.join(subpath)
+            } else {
+                workspace_dir.to_path_buf()
+            }
+        } else {
+            workspace_dir.to_path_buf()
+        };
+
+        Ok(working_dir)
+    }
+
+    fn cleanup(&self, workspace_dir: &Path) -> Result<(), WorkspaceError> {
+        // Delete workspace (if it exists)
+        if workspace_dir.exists() {
+            self.storage
+                .delete_dir(workspace_dir)
+                .map_err(|e| WorkspaceError::IoError(std::io::Error::other(e.to_string())))?;
+        }
+        Ok(())
+    }
+}
+
 /// Create a JobWorkspace based on configuration
 ///
 /// If cache_manager is provided, uses CachedJobWorkspace for efficient operations.
@@ -310,6 +422,17 @@ pub fn get_job_workspace(cache_manager: Option<CacheManager>) -> Arc<dyn JobWork
         Some(cm) => Arc::new(CachedJobWorkspace::new(cm)),
         None => Arc::new(StandardJobWorkspace::new()),
     }
+}
+
+/// Create a mirror-based JobWorkspace for monorepo support
+///
+/// Uses an existing local repository with sparse checkouts for efficient
+/// monorepo cloning. The `local_repo` path should point to the full clone.
+pub fn get_mirror_workspace(
+    local_repo: impl Into<PathBuf>,
+    storage: Arc<dyn WorkspaceStorage>,
+) -> Arc<dyn JobWorkspace> {
+    Arc::new(MirrorJobWorkspace::new(local_repo, storage))
 }
 
 #[cfg(test)]
@@ -330,5 +453,143 @@ mod tests {
 
         assert!(workspace_dir.exists());
         assert_eq!(result_dir, workspace_dir);
+    }
+
+    /// Integration test for MirrorJobWorkspace sparse checkout
+    ///
+    /// Run with: cargo test test_mirror_sparse_checkout -- --ignored --nocapture
+    ///
+    /// Requires: The current directory to be inside a git repository
+    #[tokio::test]
+    #[ignore] // Requires local git repo
+    async fn test_mirror_sparse_checkout() {
+        use std::process::Command;
+
+        // Find the repo root (we're in projects/nix-jail, repo root is ~/src or similar)
+        let output = Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .expect("Failed to run git");
+        let repo_root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        println!("Using repo root: {}", repo_root);
+
+        // Get current commit
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("Failed to get HEAD");
+        let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        println!("Current commit: {}", commit);
+
+        // Get remote URL (needed for actual clone)
+        let output = Command::new("git")
+            .args(["-C", &repo_root, "remote", "get-url", "origin"])
+            .output()
+            .expect("Failed to get remote URL");
+        let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        println!("Remote URL: {}", remote_url);
+
+        // Create workspace
+        let temp = tempdir().expect("Failed to create temp dir");
+        let workspace_dir = temp.path().join("workspace");
+
+        let storage: Arc<dyn WorkspaceStorage> = Arc::new(StandardStorage);
+        let ws = MirrorJobWorkspace::new(&repo_root, storage);
+
+        // Setup with sparse checkout of just this project
+        // Uses remote URL for actual clone, local repo as reference
+        let result_dir = ws
+            .setup(
+                &workspace_dir,
+                &remote_url,
+                Some(&commit),
+                Some("projects/nix-jail"),
+                None,
+            )
+            .await
+            .expect("Failed to setup workspace");
+
+        println!("Workspace created at: {}", result_dir.display());
+
+        // Verify the workspace
+        assert!(workspace_dir.exists(), "Workspace dir should exist");
+        assert!(
+            workspace_dir.join(".git").exists(),
+            "Should have .git directory"
+        );
+        assert!(
+            workspace_dir.join("projects/nix-jail/Cargo.toml").exists(),
+            "Should have nix-jail project"
+        );
+
+        // Check git status
+        let output = Command::new("git")
+            .args(["-C", &workspace_dir.to_string_lossy(), "status", "--short"])
+            .output()
+            .expect("Failed to run git status");
+        println!("Git status:\n{}", String::from_utf8_lossy(&output.stdout));
+
+        // Check sparse-checkout config
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &workspace_dir.to_string_lossy(),
+                "sparse-checkout",
+                "list",
+            ])
+            .output()
+            .expect("Failed to run sparse-checkout list");
+        println!(
+            "Sparse checkout paths:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        // Verify origin points to remote URL
+        let output = Command::new("git")
+            .args(["-C", &workspace_dir.to_string_lossy(), "remote", "-v"])
+            .output()
+            .expect("Failed to run git remote");
+        let remotes = String::from_utf8_lossy(&output.stdout);
+        println!("Remotes:\n{}", remotes);
+        assert!(
+            remotes.contains(&remote_url) || remotes.contains("git@"),
+            "Origin should point to remote"
+        );
+
+        // Check what files are actually present (should be sparse)
+        let output = Command::new("ls")
+            .args(["-la", &workspace_dir.to_string_lossy()])
+            .output()
+            .expect("Failed to ls");
+        println!(
+            "Workspace contents:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        // Check object counts - are we copying the whole monorepo's objects?
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &workspace_dir.to_string_lossy(),
+                "count-objects",
+                "-v",
+            ])
+            .output()
+            .expect("Failed to count objects");
+        println!(
+            "Workspace git objects:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        let output = Command::new("git")
+            .args(["-C", &repo_root, "count-objects", "-v"])
+            .output()
+            .expect("Failed to count source objects");
+        println!(
+            "Source repo git objects:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        println!("SUCCESS: Sparse checkout verified!");
     }
 }
