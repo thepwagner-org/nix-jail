@@ -459,9 +459,6 @@ impl Executor for DockerExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::time::Duration;
 
     /// Helper to check if Docker is available
     async fn docker_available() -> bool {
@@ -511,20 +508,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_executor_requires_root_dir() {
-        let config = ExecutionConfig {
-            job_id: "test-no-root".to_string(),
-            command: vec!["echo".to_string(), "test".to_string()],
-            env: HashMap::new(),
-            working_dir: PathBuf::from("/tmp"),
-            root_dir: PathBuf::from("/nonexistent/root/dir"),
-            store_setup: crate::root::StoreSetup::Populated,
-            timeout: Duration::from_secs(10),
-            store_paths: vec![],
-            proxy_port: None,
-            hardening_profile: HardeningProfile::Default,
-            interactive: false,
-            pty_size: None,
-        };
+        use crate::executor::test_helpers::TestConfigBuilder;
+
+        let config = TestConfigBuilder::new("test-no-root")
+            .command(vec!["echo", "test"])
+            .root_dir("/nonexistent/root/dir")
+            .build();
 
         let executor = DockerExecutor::new();
         let result = executor.execute(config).await;
@@ -539,20 +528,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_docker_executor_empty_command() {
-        let config = ExecutionConfig {
-            job_id: "test-empty-cmd".to_string(),
-            command: vec![],
-            env: HashMap::new(),
-            working_dir: PathBuf::from("/tmp"),
-            root_dir: PathBuf::from("/tmp"),
-            store_setup: crate::root::StoreSetup::Populated,
-            timeout: Duration::from_secs(10),
-            store_paths: vec![],
-            proxy_port: None,
-            hardening_profile: HardeningProfile::Default,
-            interactive: false,
-            pty_size: None,
-        };
+        use crate::executor::test_helpers::TestConfigBuilder;
+
+        let config = TestConfigBuilder::new("test-empty-cmd")
+            .command(vec![])
+            .build();
 
         let executor = DockerExecutor::new();
         let result = executor.execute(config).await;

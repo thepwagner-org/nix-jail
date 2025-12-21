@@ -111,6 +111,32 @@ sequenceDiagram
 
 The proxy enforces rule-based network policies with server-controlled credential binding. The server defines available credentials and their allowed hosts, while clients specify per-job policies that can be more restrictive. See [Appendix B](#b-network-policy-specification) for detailed policy configuration.
 
+### Key Abstractions
+
+nix-jail uses trait-based abstractions to support different deployment modes (server vs CLI) and storage backends (btrfs vs reflink vs standard). This enables the same orchestration code to work across platforms.
+
+**WorkspaceStorage** (`src/cache/btrfs.rs`) - Filesystem operations with copy-on-write semantics:
+- `BtrfsStorage`: btrfs subvolumes and instant snapshots (Linux)
+- `ReflinkStorage`: CoW reflinks (XFS, APFS, btrfs without subvolume permissions)
+- `StandardStorage`: fallback `cp -a`
+
+Auto-detected at startup via `detect_storage()`. Used by both JobRoot and JobWorkspace.
+
+**JobRoot** (`src/root.rs`) - Prepares the sandbox root directory (`/nix/store` closure):
+- `CachedJobRoot`: LRU-cached closures with btrfs snapshots for O(1) job startup
+- `BindMountJobRoot`: zero-copy via `BindReadOnlyPaths` (systemd only)
+- `DockerVolumeJobRoot`: named Docker volumes for cross-architecture support
+
+Selected via `store_strategy` in server config. Returns `StoreSetup` enum that tells executors how to mount the store.
+
+**JobWorkspace** (`src/job_workspace.rs`) - Prepares the job workspace (git clone, subpath navigation):
+- `StandardJobWorkspace`: fresh clone each time
+- `CachedJobWorkspace`: caches clones by (repo, commit_sha), snapshots to workspace
+
+**LogSink** (`src/log_sink.rs`) - Decouples log handling from job orchestration:
+- `StorageLogSink`: persists to SQLite, broadcasts to gRPC clients (server mode)
+- `StdioLogSink`: prints to stdout/stderr (CLI mode)
+
 ### Platform Executors
 
 #### macOS (SandboxExecutor)
@@ -355,8 +381,10 @@ Core implementation organized by responsibility:
 **Job Management:**
 - `src/orchestration.rs` - Job execution orchestration
 - `src/job_dir.rs` - JobDirectory struct (base/workspace/root paths)
-- `src/job_workspace.rs` - JobWorkspace trait for workspace setup (git clone, caching)
-- `src/root/mod.rs` - JobRoot trait for root filesystem setup
+- `src/job_workspace.rs` - JobWorkspace trait for workspace setup
+- `src/root.rs` - JobRoot trait for root filesystem setup
+- `src/log_sink.rs` - LogSink trait for log output
+- `src/cache/btrfs.rs` - WorkspaceStorage trait and implementations
 - `src/service.rs` - gRPC service implementation
 - `src/config.rs` - Server configuration management
 

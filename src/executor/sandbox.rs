@@ -352,282 +352,64 @@ impl Default for SandboxExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::HardeningProfile;
-    use crate::root::StoreSetup;
-    use std::collections::HashMap;
-    use std::time::Duration;
+    use crate::executor::executor_tests;
+    use crate::executor::test_helpers::TestConfigBuilder;
+
+    // ========================================
+    // Generic executor tests (shared suite)
+    // ========================================
 
     #[tokio::test]
     async fn test_simple_executor_success() {
-        let executor = SandboxExecutor::new();
-        let config = ExecutionConfig {
-            job_id: "test-1".to_string(),
-            command: vec!["echo".to_string(), "hello world".to_string()],
-            env: HashMap::new(),
-            working_dir: PathBuf::from("/tmp"),
-            root_dir: PathBuf::from("/tmp"),
-            store_setup: StoreSetup::Populated,
-            timeout: Duration::from_secs(10),
-            store_paths: vec![],
-            proxy_port: None,
-            hardening_profile: HardeningProfile::Default,
-            interactive: false,
-            pty_size: None,
-        };
-
-        let handle = executor.execute(config).await.expect("Execution failed");
-
-        // Read stdout
-        let line = if let IoHandle::Piped { mut stdout, .. } = handle.io {
-            stdout.recv().await.expect("No stdout received")
-        } else {
-            panic!("Expected piped mode");
-        };
-        assert_eq!(line, "hello world");
-
-        // Get exit code
-        let exit_code = handle.exit_code.await.expect("Failed to get exit code");
-        assert_eq!(exit_code, 0);
+        executor_tests::test_success_execution(&SandboxExecutor::new()).await;
     }
 
     #[tokio::test]
     async fn test_simple_executor_stderr() {
-        let executor = SandboxExecutor::new();
-        let config = ExecutionConfig {
-            job_id: "test-stderr".to_string(),
-            command: vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "echo error >&2".to_string(),
-            ],
-            env: HashMap::new(),
-            working_dir: PathBuf::from("/tmp"),
-            root_dir: PathBuf::from("/tmp"),
-            store_setup: StoreSetup::Populated,
-            timeout: Duration::from_secs(10),
-            store_paths: vec![],
-            proxy_port: None,
-            hardening_profile: HardeningProfile::Default,
-            interactive: false,
-            pty_size: None,
-        };
-
-        let handle = executor.execute(config).await.expect("Execution failed");
-
-        // Read stderr
-        let line = if let IoHandle::Piped { mut stderr, .. } = handle.io {
-            stderr.recv().await.expect("No stderr received")
-        } else {
-            panic!("Expected piped mode");
-        };
-        assert_eq!(line, "error");
-
-        // Get exit code
-        let exit_code = handle.exit_code.await.expect("Failed to get exit code");
-        assert_eq!(exit_code, 0);
+        executor_tests::test_stderr_capture(&SandboxExecutor::new()).await;
     }
 
     #[tokio::test]
     async fn test_simple_executor_non_zero_exit() {
-        let executor = SandboxExecutor::new();
-        let config = ExecutionConfig {
-            job_id: "test-exit".to_string(),
-            command: vec!["sh".to_string(), "-c".to_string(), "exit 42".to_string()],
-            env: HashMap::new(),
-            working_dir: PathBuf::from("/tmp"),
-            root_dir: PathBuf::from("/tmp"),
-            store_setup: StoreSetup::Populated,
-            timeout: Duration::from_secs(10),
-            store_paths: vec![],
-            proxy_port: None,
-            hardening_profile: HardeningProfile::Default,
-            interactive: false,
-            pty_size: None,
-        };
-
-        let handle = executor.execute(config).await.expect("Execution failed");
-
-        // Get exit code
-        let exit_code = handle.exit_code.await.expect("Failed to get exit code");
-        assert_eq!(exit_code, 42);
+        executor_tests::test_non_zero_exit(&SandboxExecutor::new()).await;
     }
 
     #[tokio::test]
     async fn test_simple_executor_timeout() {
-        let executor = SandboxExecutor::new();
-        let config = ExecutionConfig {
-            job_id: "test-timeout".to_string(),
-            command: vec!["sleep".to_string(), "100".to_string()],
-            env: HashMap::new(),
-            working_dir: PathBuf::from("/tmp"),
-            root_dir: PathBuf::from("/tmp"),
-            store_setup: StoreSetup::Populated,
-            timeout: Duration::from_millis(100), // 100ms timeout
-            store_paths: vec![],
-            proxy_port: None,
-            hardening_profile: HardeningProfile::Default,
-            interactive: false,
-            pty_size: None,
-        };
-
-        let handle = executor.execute(config).await.expect("Execution failed");
-
-        // Should timeout and return -1
-        let exit_code = handle.exit_code.await.expect("Failed to get exit code");
-        assert_eq!(exit_code, -1);
+        executor_tests::test_timeout_handling(&SandboxExecutor::new()).await;
     }
 
     #[tokio::test]
     async fn test_simple_executor_multiline_output() {
-        let executor = SandboxExecutor::new();
-        let config = ExecutionConfig {
-            job_id: "test-multiline".to_string(),
-            command: vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "echo line1; echo line2; echo line3".to_string(),
-            ],
-            env: HashMap::new(),
-            working_dir: PathBuf::from("/tmp"),
-            root_dir: PathBuf::from("/tmp"),
-            store_setup: StoreSetup::Populated,
-            timeout: Duration::from_secs(10),
-            store_paths: vec![],
-            proxy_port: None,
-            hardening_profile: HardeningProfile::Default,
-            interactive: false,
-            pty_size: None,
-        };
-
-        let mut handle = executor.execute(config).await.expect("Execution failed");
-
-        // Read multiple lines (extract stdout from IoHandle)
-        let (line1, line2, line3) = match handle.io {
-            IoHandle::Piped {
-                ref mut stdout,
-                stderr: _,
-            } => {
-                let l1 = stdout.recv().await.expect("No line1");
-                let l2 = stdout.recv().await.expect("No line2");
-                let l3 = stdout.recv().await.expect("No line3");
-                (l1, l2, l3)
-            }
-            _ => panic!("Expected piped mode"),
-        };
-
-        assert_eq!(line1, "line1");
-        assert_eq!(line2, "line2");
-        assert_eq!(line3, "line3");
-
-        let exit_code = handle.exit_code.await.expect("Failed to get exit code");
-        assert_eq!(exit_code, 0);
+        executor_tests::test_multiline_output(&SandboxExecutor::new()).await;
     }
 
     #[tokio::test]
     async fn test_simple_executor_working_directory() {
-        let executor = SandboxExecutor::new();
-        let tmp_dir = PathBuf::from("/tmp");
-
-        let config = ExecutionConfig {
-            job_id: "test-workdir".to_string(),
-            command: vec!["pwd".to_string()],
-            env: HashMap::new(),
-            working_dir: tmp_dir.clone(),
-            root_dir: tmp_dir.clone(),
-            store_setup: StoreSetup::Populated,
-            timeout: Duration::from_secs(10),
-            store_paths: vec![],
-            proxy_port: None,
-            hardening_profile: HardeningProfile::Default,
-            interactive: false,
-            pty_size: None,
-        };
-
-        let mut handle = executor.execute(config).await.expect("Execution failed");
-
-        let line = match handle.io {
-            IoHandle::Piped {
-                ref mut stdout,
-                stderr: _,
-            } => stdout.recv().await.expect("No stdout received"),
-            _ => panic!("Expected piped mode"),
-        };
-
-        // On macOS, /tmp is a symlink to /private/tmp, so we canonicalize both
-        let expected = std::fs::canonicalize(&tmp_dir)
-            .expect("Failed to canonicalize tmp_dir")
-            .to_string_lossy()
-            .to_string();
-        let actual_path = PathBuf::from(&line);
-        let actual = std::fs::canonicalize(&actual_path)
-            .unwrap_or(actual_path.clone())
-            .to_string_lossy()
-            .to_string();
-
-        assert_eq!(actual, expected);
-
-        let exit_code = handle.exit_code.await.expect("Failed to get exit code");
-        assert_eq!(exit_code, 0);
+        executor_tests::test_working_directory(&SandboxExecutor::new()).await;
     }
 
     #[tokio::test]
     async fn test_simple_executor_environment_variables() {
-        let executor = SandboxExecutor::new();
-        let mut env = HashMap::new();
-        let _ = env.insert("TEST_VAR".to_string(), "test_value".to_string());
-
-        let config = ExecutionConfig {
-            job_id: "test-env".to_string(),
-            command: vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "echo $TEST_VAR".to_string(),
-            ],
-            env,
-            working_dir: PathBuf::from("/tmp"),
-            root_dir: PathBuf::from("/tmp"),
-            store_setup: StoreSetup::Populated,
-            timeout: Duration::from_secs(10),
-            store_paths: vec![],
-            proxy_port: None,
-            hardening_profile: HardeningProfile::Default,
-            interactive: false,
-            pty_size: None,
-        };
-
-        let mut handle = executor.execute(config).await.expect("Execution failed");
-
-        let line = match handle.io {
-            IoHandle::Piped {
-                ref mut stdout,
-                stderr: _,
-            } => stdout.recv().await.expect("No stdout received"),
-            _ => panic!("Expected piped mode"),
-        };
-        assert_eq!(line, "test_value");
-
-        let exit_code = handle.exit_code.await.expect("Failed to get exit code");
-        assert_eq!(exit_code, 0);
+        executor_tests::test_environment_variables(&SandboxExecutor::new()).await;
     }
+
+    #[tokio::test]
+    async fn test_simple_executor_empty_command() {
+        executor_tests::test_empty_command_error(&SandboxExecutor::new()).await;
+    }
+
+    // ========================================
+    // macOS-specific tests
+    // ========================================
 
     #[tokio::test]
     #[allow(clippy::panic)]
     async fn test_simple_executor_invalid_command() {
         let executor = SandboxExecutor::new();
-        let config = ExecutionConfig {
-            job_id: "test-invalid".to_string(),
-            command: vec!["this-command-does-not-exist-xyz123".to_string()],
-            env: HashMap::new(),
-            working_dir: PathBuf::from("/tmp"),
-            root_dir: PathBuf::from("/tmp"),
-            store_setup: StoreSetup::Populated,
-            timeout: Duration::from_secs(10),
-            store_paths: vec![],
-            proxy_port: None,
-            hardening_profile: HardeningProfile::Default,
-            interactive: false,
-            pty_size: None,
-        };
+        let config = TestConfigBuilder::new("test-invalid")
+            .command(vec!["this-command-does-not-exist-xyz123"])
+            .build();
 
         let result = executor.execute(config).await;
         assert!(result.is_err());
@@ -642,38 +424,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::panic)]
-    async fn test_simple_executor_empty_command() {
-        let executor = SandboxExecutor::new();
-        let config = ExecutionConfig {
-            job_id: "test-empty".to_string(),
-            command: vec![],
-            env: HashMap::new(),
-            working_dir: PathBuf::from("/tmp"),
-            root_dir: PathBuf::from("/tmp"),
-            store_setup: StoreSetup::Populated,
-            timeout: Duration::from_secs(10),
-            store_paths: vec![],
-            proxy_port: None,
-            hardening_profile: HardeningProfile::Default,
-            interactive: false,
-            pty_size: None,
-        };
-
-        let result = executor.execute(config).await;
-        assert!(result.is_err());
-        match result {
-            Err(ExecutorError::SpawnFailed(msg)) => {
-                assert!(msg.contains("cannot be empty"));
-            }
-            other => {
-                panic!("expected spawnfailed error, got {:?}", other);
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn test_simple_executor_with_sandbox() {
+        use crate::executor::test_helpers::collect_output;
         use crate::workspace::find_nix_package;
 
         let executor = SandboxExecutor::new();
@@ -683,76 +435,26 @@ mod tests {
             .await
             .expect("Failed to find curl derivation");
 
-        let config = ExecutionConfig {
-            job_id: "test-sandbox".to_string(),
-            command: vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "echo 'sandboxed execution'".to_string(),
-            ],
-            env: HashMap::new(),
-            working_dir: PathBuf::from("/tmp"),
-            root_dir: PathBuf::from("/tmp"),
-            store_setup: StoreSetup::Populated,
-            timeout: Duration::from_secs(10),
-            store_paths: vec![curl_derivation],
-            proxy_port: None,
-            hardening_profile: HardeningProfile::Default,
-            interactive: false,
-            pty_size: None,
-        };
+        let config = TestConfigBuilder::new("test-sandbox")
+            .command(vec!["sh", "-c", "echo 'sandboxed execution'"])
+            .store_paths(vec![curl_derivation])
+            .build();
 
         let handle = executor.execute(config).await.expect("Execution failed");
-
-        // Extract stdout/stderr from IoHandle
-        let (mut stdout_rx, mut stderr_rx) = match handle.io {
-            IoHandle::Piped { stdout, stderr } => (stdout, stderr),
-            _ => panic!("Expected piped mode"),
-        };
-
-        // Try to read stdout with a timeout
-        let result = tokio::time::timeout(Duration::from_secs(3), async {
-            // Spawn tasks to collect all output
-            let stdout_task = tokio::spawn(async move {
-                let mut lines = Vec::new();
-                while let Some(line) = stdout_rx.recv().await {
-                    lines.push(line);
-                }
-                lines
-            });
-
-            let stderr_task = tokio::spawn(async move {
-                let mut lines = Vec::new();
-                while let Some(line) = stderr_rx.recv().await {
-                    lines.push(line);
-                }
-                lines
-            });
-
-            // Wait for process to exit
-            let exit_code = handle.exit_code.await.expect("Failed to get exit code");
-
-            // Collect all output
-            let stdout_lines = stdout_task.await.expect("Stdout task failed");
-            let stderr_lines = stderr_task.await.expect("Stderr task failed");
-
-            (exit_code, stdout_lines, stderr_lines)
-        })
-        .await;
-
-        let (exit_code, stdout_lines, stderr_lines) = result.expect("Test timed out");
+        let output = collect_output(handle).await;
 
         assert!(
-            !stdout_lines.is_empty(),
+            !output.stdout.is_empty(),
             "No stdout received. Stderr: {:?}",
-            stderr_lines
+            output.stderr
         );
-        assert_eq!(stdout_lines[0], "sandboxed execution");
-        assert_eq!(exit_code, 0);
+        assert_eq!(output.stdout[0], "sandboxed execution");
+        assert_eq!(output.exit_code, 0);
     }
 
     #[tokio::test]
     async fn test_sandbox_restricts_filesystem_access() {
+        use crate::executor::test_helpers::collect_output;
         use crate::workspace::find_nix_package;
 
         let executor = SandboxExecutor::new();
@@ -762,45 +464,94 @@ mod tests {
             .await
             .expect("Failed to find hello derivation");
 
-        let config = ExecutionConfig {
-            job_id: "test-sandbox-restrict".to_string(),
-            command: vec![
-                "sh".to_string(),
-                "-c".to_string(),
+        let config = TestConfigBuilder::new("test-sandbox-restrict")
+            .command(vec![
+                "sh",
+                "-c",
                 // Try to read /etc/passwd using shell built-in (should fail in sandbox)
-                "read line < /etc/passwd 2>&1 && echo 'ACCESS_GRANTED' || echo 'ACCESS_DENIED'"
-                    .to_string(),
-            ],
-            env: HashMap::new(),
-            working_dir: PathBuf::from("/tmp"),
-            root_dir: PathBuf::from("/tmp"),
-            store_setup: StoreSetup::Populated,
-            timeout: Duration::from_secs(10),
-            store_paths: vec![derivation],
-            proxy_port: None,
-            hardening_profile: HardeningProfile::Default,
-            interactive: false,
-            pty_size: None,
-        };
+                "read line < /etc/passwd 2>&1 && echo 'ACCESS_GRANTED' || echo 'ACCESS_DENIED'",
+            ])
+            .store_paths(vec![derivation])
+            .build();
 
-        let mut handle = executor.execute(config).await.expect("Execution failed");
+        let handle = executor.execute(config).await.expect("Execution failed");
+        let output = collect_output(handle).await;
 
         // Should get ACCESS_DENIED due to sandbox restrictions
-        let line = match handle.io {
-            IoHandle::Piped {
-                ref mut stdout,
-                stderr: _,
-            } => stdout.recv().await.expect("No stdout received"),
-            _ => panic!("Expected piped mode"),
-        };
         assert!(
-            line.contains("ACCESS_DENIED"),
-            "Sandbox should have restricted access to /etc/passwd, got: {}",
-            line
+            !output.stdout.is_empty(),
+            "No stdout received. Stderr: {:?}",
+            output.stderr
         );
+        assert!(
+            output.stdout[0].contains("ACCESS_DENIED"),
+            "Sandbox should have restricted access to /etc/passwd, got: {}",
+            output.stdout[0]
+        );
+        assert_eq!(output.exit_code, 0);
+    }
 
-        let exit_code = handle.exit_code.await.expect("Failed to get exit code");
-        // Exit code 0 if echo succeeded (access was denied)
-        assert_eq!(exit_code, 0);
+    // ========================================
+    // Network isolation tests
+    // ========================================
+
+    #[tokio::test]
+    async fn test_sandbox_blocks_network_without_proxy() {
+        use crate::executor::test_helpers::collect_output;
+        use crate::workspace::find_nix_package;
+
+        let executor = SandboxExecutor::new();
+        let curl_derivation = find_nix_package("curl")
+            .await
+            .expect("Failed to find curl derivation");
+
+        // No proxy_port = network completely blocked by SBPL
+        let config = TestConfigBuilder::new("test-network-blocked")
+            .command(vec!["curl", "--max-time", "2", "https://httpbin.org/get"])
+            .store_paths(vec![curl_derivation])
+            .build();
+
+        let handle = executor.execute(config).await.expect("Execution failed");
+        let output = collect_output(handle).await;
+
+        // curl exit codes: 7 = connection refused, 28 = timeout
+        // Either indicates network was blocked as expected
+        assert_ne!(
+            output.exit_code, 0,
+            "Network should be blocked without proxy, but curl succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_allows_localhost_with_proxy() {
+        use crate::executor::test_helpers::collect_output;
+        use crate::workspace::find_nix_package;
+
+        let executor = SandboxExecutor::new();
+        let curl_derivation = find_nix_package("curl")
+            .await
+            .expect("Failed to find curl derivation");
+
+        // With proxy_port set, SBPL allows localhost:* connections
+        let config = TestConfigBuilder::new("test-localhost-allowed")
+            .command(vec!["curl", "--max-time", "1", "http://127.0.0.1:9999"])
+            .store_paths(vec![curl_derivation])
+            .proxy_port(3128)
+            .build();
+
+        let handle = executor.execute(config).await.expect("Execution failed");
+        let output = collect_output(handle).await;
+
+        // Exit code 7 = connection refused (nothing listening on 9999) - SUCCESS
+        // Exit code 28 = curl timeout (sandbox allowed, just slow)
+        // Exit code -1 = killed by our timeout wrapper
+        // Any of these mean the sandbox allowed the connection attempt
+        // Exit code 6 = couldn't resolve host (sandbox blocked DNS) - FAILURE
+        assert!(
+            output.exit_code == 7 || output.exit_code == 28 || output.exit_code == -1,
+            "Localhost should be reachable with proxy enabled, got exit {}. stderr: {:?}",
+            output.exit_code,
+            output.stderr
+        );
     }
 }

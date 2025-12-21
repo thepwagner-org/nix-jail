@@ -12,6 +12,11 @@ mod exec;
 mod traits;
 mod types;
 
+#[cfg(test)]
+mod executor_tests;
+#[cfg(test)]
+mod test_helpers;
+
 #[cfg(target_os = "macos")]
 pub mod sandbox;
 
