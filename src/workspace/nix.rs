@@ -516,3 +516,35 @@ pub fn build_path_env(store_paths: &[PathBuf]) -> String {
         .collect::<Vec<_>>()
         .join(":")
 }
+
+/// Build NIX_LDFLAGS from store paths (lib directories)
+pub fn build_ldflags_env(store_paths: &[PathBuf]) -> String {
+    store_paths
+        .iter()
+        .filter_map(|p| {
+            let lib = p.join("lib");
+            if lib.exists() {
+                Some(format!("-L{}", lib.display()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Build NIX_CFLAGS_COMPILE from store paths (include directories)
+pub fn build_cflags_env(store_paths: &[PathBuf]) -> String {
+    store_paths
+        .iter()
+        .filter_map(|p| {
+            let inc = p.join("include");
+            if inc.exists() {
+                Some(format!("-isystem {}", inc.display()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}

@@ -468,13 +468,26 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         &job_dir.root,
     );
 
-    // Update PATH with package binaries (skip for DockerVolume - paths are different architecture)
+    // Update PATH, NIX_LDFLAGS, NIX_CFLAGS_COMPILE with package paths
+    // (skip for DockerVolume - paths are different architecture)
     if !store_paths.is_empty()
         && !matches!(store_setup, crate::root::StoreSetup::DockerVolume { .. })
     {
         let path_env = workspace::build_path_env(&store_paths);
         let current_path = env.get("PATH").cloned().unwrap_or_default();
         let _ = env.insert("PATH".to_string(), format!("{}:{}", path_env, current_path));
+
+        // Set NIX_LDFLAGS for linker to find libraries (e.g., libiconv)
+        let ldflags = workspace::build_ldflags_env(&store_paths);
+        if !ldflags.is_empty() {
+            let _ = env.insert("NIX_LDFLAGS".to_string(), ldflags);
+        }
+
+        // Set NIX_CFLAGS_COMPILE for compiler to find headers
+        let cflags = workspace::build_cflags_env(&store_paths);
+        if !cflags.is_empty() {
+            let _ = env.insert("NIX_CFLAGS_COMPILE".to_string(), cflags);
+        }
     }
 
     // Configure credentials (Claude Code, GitHub token)
@@ -1303,13 +1316,26 @@ pub async fn execute_local(
         &job_dir.root,
     );
 
-    // Update PATH with package binaries (skip for DockerVolume - paths are different architecture)
+    // Update PATH, NIX_LDFLAGS, NIX_CFLAGS_COMPILE with package paths
+    // (skip for DockerVolume - paths are different architecture)
     if !store_paths.is_empty()
         && !matches!(store_setup, crate::root::StoreSetup::DockerVolume { .. })
     {
         let path_env = workspace::build_path_env(&store_paths);
         let current_path = env.get("PATH").cloned().unwrap_or_default();
         let _ = env.insert("PATH".to_string(), format!("{}:{}", path_env, current_path));
+
+        // Set NIX_LDFLAGS for linker to find libraries (e.g., libiconv)
+        let ldflags = workspace::build_ldflags_env(&store_paths);
+        if !ldflags.is_empty() {
+            let _ = env.insert("NIX_LDFLAGS".to_string(), ldflags);
+        }
+
+        // Set NIX_CFLAGS_COMPILE for compiler to find headers
+        let cflags = workspace::build_cflags_env(&store_paths);
+        if !cflags.is_empty() {
+            let _ = env.insert("NIX_CFLAGS_COMPILE".to_string(), cflags);
+        }
     }
 
     // Configure credentials
