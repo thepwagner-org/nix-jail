@@ -176,6 +176,7 @@ pub fn generate_profile(
     profile.push_str("(allow file-read* (literal \"/dev/random\"))\n");
     profile.push_str("(allow file-read* (literal \"/dev/urandom\"))\n");
     profile.push_str("(allow file-read* (literal \"/dev/dtracehelper\"))\n");
+    profile.push_str("(allow file-read* (subpath \"/dev/fd\"))\n"); // Process substitution for Nix wrappers (read-only)
     profile.push_str("(allow file-read* (subpath \"/usr/lib\"))\n");
     profile.push_str("(allow file-read* (subpath \"/usr/share\"))\n"); // zoneinfo, locale
     profile.push_str("(allow file-read* (literal \"/private/etc/localtime\"))\n"); // Timezone info (node needs this)
