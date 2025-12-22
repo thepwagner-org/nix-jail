@@ -1,0 +1,9 @@
+# nix-jail server configuration
+# Run with: cargo run --bin server -- --config server.toml
+
+[server]
+addr = "127.0.0.1:50051"
+state_dir = "/tmp/nix-jail"
+store_strategy = "cached"  # "cached" (persistent) or "fresh" (ephemeral)
+
+# No credentials needed - running with deny-all network policy
