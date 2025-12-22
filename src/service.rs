@@ -135,6 +135,9 @@ impl JailService for JailServiceImpl {
             validation::validate_network_policy(policy, &self.config.credentials)?;
             tracing::debug!("validated network policy with {} rules", policy.rules.len());
         }
+        if let Some(ref nixpkgs_version) = req.nixpkgs_version {
+            validation::validate_nixpkgs_version(nixpkgs_version)?;
+        }
 
         let job_id = Ulid::new().to_string();
         let interactive = req.interactive.unwrap_or(false);

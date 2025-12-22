@@ -8,6 +8,18 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+/// Execute a schema migration to add a column, ignoring "duplicate column" errors
+/// but logging other errors as warnings
+fn migrate_add_column(conn: &Connection, sql: &str) {
+    if let Err(e) = conn.execute(sql, []) {
+        let err_str = e.to_string();
+        // SQLite returns "duplicate column name" when column already exists
+        if !err_str.contains("duplicate column name") {
+            tracing::warn!(error = %e, sql = %sql, "schema migration failed");
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum JobStatus {
     Pending,
@@ -128,33 +140,15 @@ impl JobStorage {
             [],
         )?;
 
-        // Migrate existing tables to add network_policy column
-        let _ = conn
-            .execute("ALTER TABLE jobs ADD COLUMN network_policy TEXT", [])
-            .ok(); // Ignore error if column already exists
-
-        // Migrate existing tables to add nixpkgs_version column
-        let _ = conn
-            .execute("ALTER TABLE jobs ADD COLUMN nixpkgs_version TEXT", [])
-            .ok(); // Ignore error if column already exists
-
-        // Migrate existing tables to add git_ref column
-        let _ = conn
-            .execute("ALTER TABLE jobs ADD COLUMN git_ref TEXT", [])
-            .ok(); // Ignore error if column already exists
-
-        // Migrate existing tables to add hardening_profile column
-        let _ = conn
-            .execute(
-                "ALTER TABLE jobs ADD COLUMN hardening_profile TEXT DEFAULT 'default'",
-                [],
-            )
-            .ok(); // Ignore error if column already exists
-
-        // Migrate existing tables to add push column
-        let _ = conn
-            .execute("ALTER TABLE jobs ADD COLUMN push BOOLEAN DEFAULT 0", [])
-            .ok(); // Ignore error if column already exists
+        // Migrate existing tables to add new columns
+        migrate_add_column(&conn, "ALTER TABLE jobs ADD COLUMN network_policy TEXT");
+        migrate_add_column(&conn, "ALTER TABLE jobs ADD COLUMN nixpkgs_version TEXT");
+        migrate_add_column(&conn, "ALTER TABLE jobs ADD COLUMN git_ref TEXT");
+        migrate_add_column(
+            &conn,
+            "ALTER TABLE jobs ADD COLUMN hardening_profile TEXT DEFAULT 'default'",
+        );
+        migrate_add_column(&conn, "ALTER TABLE jobs ADD COLUMN push BOOLEAN DEFAULT 0");
 
         let _ = conn.execute(
             "CREATE TABLE IF NOT EXISTS logs (
@@ -168,12 +162,10 @@ impl JobStorage {
         )?;
 
         // Migrate existing logs table to add source column (0 = Unspecified)
-        let _ = conn
-            .execute(
-                "ALTER TABLE logs ADD COLUMN source INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .ok(); // Ignore error if column already exists
+        migrate_add_column(
+            &conn,
+            "ALTER TABLE logs ADD COLUMN source INTEGER NOT NULL DEFAULT 0",
+        );
 
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_logs_job_id ON logs(job_id, timestamp)",

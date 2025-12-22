@@ -238,7 +238,9 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
                 &job_id,
                 &format!("Failed to resolve state_dir to absolute path: {}", e),
             );
-            let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+            if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+            }
             return;
         }
     };
@@ -247,7 +249,9 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         Ok(dir) => dir,
         Err(e) => {
             log_sink.error(&job_id, &format!("Failed to create job directory: {}", e));
-            let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+            if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+            }
             return;
         }
     };
@@ -274,7 +278,9 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
             }
             Err(e) => {
                 log_sink.error(&job_id, &format!("Failed to prepare workspace: {}", e));
-                let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+                if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                    tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                }
                 return;
             }
         }
@@ -306,7 +312,9 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         Ok(path) => path,
         Err(e) => {
             log_sink.error(&job_id, &format!("Failed to configure proxy: {}", e));
-            let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+            if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+            }
             return;
         }
     };
@@ -342,7 +350,9 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
             }
             Err(e) => {
                 log_sink.error(&job_id, &format!("Failed to compute flake closure: {}", e));
-                let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+                if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                    tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                }
                 return;
             }
         }
@@ -377,7 +387,9 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
             }
             Err(e) => {
                 log_sink.error(&job_id, &format!("Failed to compute closure: {}", e));
-                let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+                if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                    tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                }
                 return;
             }
         }
@@ -415,7 +427,9 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         }
         Err(e) => {
             log_sink.error(&job_id, &format!("Failed to prepare root: {}", e));
-            let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+            if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+            }
             return;
         }
     };
@@ -434,7 +448,9 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         Ok(p) => p,
         Err(e) => {
             log_sink.error(&job_id, &format!("Failed to start proxy: {}", e));
-            let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+            if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+            }
             return;
         }
     };
@@ -516,7 +532,9 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         }
         Err(e) => {
             log_sink.error(&job_id, &format!("Failed to execute job: {}", e));
-            let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+            if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+            }
             return;
         }
     };
@@ -555,7 +573,9 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
             } else {
                 tracing::error!(job_id = %job_id, "pty mode requires session registry");
                 log_sink.error(&job_id, "PTY mode requires session registry");
-                let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+                if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                    tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                }
                 return;
             }
         }
@@ -567,7 +587,9 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
             None => {
                 tracing::error!(job_id = %job_id, "proxy stdout not available");
                 log_sink.error(&job_id, "proxy stdout not available");
-                let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+                if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                    tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                }
                 return;
             }
         };
@@ -577,7 +599,9 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
             None => {
                 tracing::error!(job_id = %job_id, "proxy stderr not available");
                 log_sink.error(&job_id, "proxy stderr not available");
-                let _ = storage.update_job_status(&job_id, JobStatus::Failed);
+                if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                    tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                }
                 return;
             }
         };
@@ -603,9 +627,17 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
     };
 
     tracing::debug!("waiting for job to exit");
-    let exit_code = async { handle.exit_code.await.unwrap_or(-1) }
-        .instrument(tracing::info_span!("run_job"))
-        .await;
+    let exit_code = async {
+        match handle.exit_code.await {
+            Ok(code) => code,
+            Err(_) => {
+                tracing::warn!("exit code channel closed unexpectedly");
+                -1
+            }
+        }
+    }
+    .instrument(tracing::info_span!("run_job"))
+    .await;
     tracing::debug!(exit_code = exit_code, "job exited");
 
     // Stop proxy and wait for stream tasks to finish
@@ -683,7 +715,9 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         }
     }
 
-    let _ = storage.update_job_status(&job_id, final_status.clone());
+    if let Err(e) = storage.update_job_status(&job_id, final_status.clone()) {
+        tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+    }
     tracing::info!(exit_code = exit_code, status = %final_status.to_string(), "job completed");
 
     // Remove job from registry - this closes the broadcast channel
@@ -697,7 +731,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         .instrument(tracing::info_span!("cleanup_root"))
         .await
     {
-        tracing::debug!(error = %e, "executor cleanup failed, trying direct cleanup");
+        tracing::warn!(error = %e, "executor cleanup failed, trying direct cleanup");
         if let Err(e) = job_root.cleanup(&job_dir.root) {
             tracing::warn!(error = %e, "failed to cleanup root directory");
         }
@@ -779,7 +813,9 @@ async fn find_packages(
             }
             Err(e) => {
                 log_sink.error(job_id, &format!("Failed to find packages: {}", e));
-                let _ = storage.update_job_status(job_id, JobStatus::Failed);
+                if let Err(e) = storage.update_job_status(job_id, JobStatus::Failed) {
+                    tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                }
                 None
             }
         }
@@ -1434,7 +1470,13 @@ pub async fn execute_local(
     };
 
     // Wait for job to complete
-    let exit_code = handle.exit_code.await.unwrap_or(-1);
+    let exit_code = match handle.exit_code.await {
+        Ok(code) => code,
+        Err(_) => {
+            tracing::warn!("exit code channel closed unexpectedly");
+            -1
+        }
+    };
 
     // Cleanup
     if let Some(ref mut p) = proxy {
@@ -1452,7 +1494,7 @@ pub async fn execute_local(
     // Cleanup job directory
     // Try executor-specific cleanup first (handles privilege escalation on Linux)
     if let Err(e) = executor.cleanup_root(&job_dir.root).await {
-        tracing::debug!(error = %e, "executor cleanup failed, trying direct cleanup");
+        tracing::warn!(error = %e, "executor cleanup failed, trying direct cleanup");
         // Fall back to JobRoot cleanup
         if let Err(e) = job_root.cleanup(&job_dir.root) {
             tracing::warn!(error = %e, "failed to cleanup root directory");

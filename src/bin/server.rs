@@ -193,7 +193,7 @@ async fn handle_websocket_connection(
     let output_task = tokio::spawn(async move {
         while let Some(data) = stdout_rx.recv().await {
             if ws_sender.send(Message::Binary(data)).await.is_err() {
-                tracing::debug!(job_id = %job_id_out, "websocket send failed, client disconnected");
+                tracing::info!(job_id = %job_id_out, "websocket send failed, client disconnected");
                 break;
             }
         }

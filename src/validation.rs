@@ -6,10 +6,13 @@
 use crate::config::Credential;
 use crate::jail::{network_pattern, HostPattern, IpPattern, NetworkPolicy, NetworkRule};
 use ipnetwork::IpNetwork;
-use regex::Regex;
+use regex::RegexBuilder;
 use std::collections::HashSet;
 use std::path::Path;
 use tonic::Status;
+
+/// Maximum compiled regex size to prevent ReDoS attacks
+const MAX_REGEX_SIZE: usize = 10_000;
 
 // Input validation limits
 const MAX_SCRIPT_LEN: usize = 10240;
@@ -146,6 +149,35 @@ pub fn validate_ref(git_ref: &str) -> Result<(), Status> {
     Ok(())
 }
 
+/// Validate nixpkgs version string
+///
+/// Security checks:
+/// - Prevents URL injection in nixpkgs archive URL construction
+/// - Allows branch names (nixos-24.05, nixpkgs-unstable)
+/// - Allows 40-character commit SHAs
+/// - Rejects shell metacharacters
+pub fn validate_nixpkgs_version(version: &str) -> Result<(), Status> {
+    if version.is_empty() {
+        return Err(Status::invalid_argument("nixpkgs version cannot be empty"));
+    }
+
+    // Check for valid 40-char commit SHA
+    let is_valid_sha = version.len() == 40 && version.chars().all(|c| c.is_ascii_hexdigit());
+
+    // Check for safe characters (alphanumeric, hyphen, dot, underscore)
+    let has_safe_chars = version
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '.' || c == '_');
+
+    if !is_valid_sha && !has_safe_chars {
+        return Err(Status::invalid_argument(
+            "nixpkgs version contains invalid characters (allowed: alphanumeric, -, _, .)",
+        ));
+    }
+
+    Ok(())
+}
+
 /// NetworkPolicy validation error
 #[derive(Debug)]
 pub enum NetworkPolicyError {
@@ -235,18 +267,24 @@ fn validate_network_rule(
 
 /// Validate a HostPattern (regex for host and optional path)
 fn validate_host_pattern(pattern: &HostPattern) -> Result<(), NetworkPolicyError> {
-    // Validate host regex compiles
-    let _ = Regex::new(&pattern.host).map_err(|e| NetworkPolicyError::InvalidRegex {
-        pattern: pattern.host.clone(),
-        error: e.to_string(),
-    })?;
+    // Validate host regex compiles with size limit to prevent ReDoS
+    let _ = RegexBuilder::new(&pattern.host)
+        .size_limit(MAX_REGEX_SIZE)
+        .build()
+        .map_err(|e| NetworkPolicyError::InvalidRegex {
+            pattern: pattern.host.clone(),
+            error: e.to_string(),
+        })?;
 
     // Validate path regex if present
     if let Some(path) = &pattern.path {
-        let _ = Regex::new(path).map_err(|e| NetworkPolicyError::InvalidRegex {
-            pattern: path.clone(),
-            error: e.to_string(),
-        })?;
+        let _ = RegexBuilder::new(path)
+            .size_limit(MAX_REGEX_SIZE)
+            .build()
+            .map_err(|e| NetworkPolicyError::InvalidRegex {
+                pattern: path.clone(),
+                error: e.to_string(),
+            })?;
     }
 
     Ok(())
@@ -530,16 +568,28 @@ mod tests {
     }
 
     #[test]
-    fn test_host_regex_dangerous_redos() {
-        // Pattern that could cause catastrophic backtracking (ReDoS)
-        // This should still compile successfully, but may be slow in practice
-        // Note: This doesn't test runtime behavior, just that it compiles
+    fn test_host_regex_simple_redos_pattern_allowed() {
+        // Simple ReDoS patterns that don't exceed size limit still compile
+        // The size limit primarily protects against pathologically large patterns
         let pattern = HostPattern {
             host: r"(a+)+b".to_string(),
             path: None,
         };
-        // Should compile successfully (validation doesn't check for ReDoS)
         assert!(validate_host_pattern(&pattern).is_ok());
+    }
+
+    #[test]
+    fn test_host_regex_exceeds_size_limit() {
+        // Pattern that exceeds compiled regex size limit
+        let huge_pattern = format!("({})+", "a".repeat(10000));
+        let pattern = HostPattern {
+            host: huge_pattern,
+            path: None,
+        };
+        assert!(matches!(
+            validate_host_pattern(&pattern),
+            Err(NetworkPolicyError::InvalidRegex { .. })
+        ));
     }
 
     #[test]
@@ -804,5 +854,38 @@ mod tests {
 
         let too_long = "a".repeat(257);
         assert!(validate_ref(&too_long).is_err());
+    }
+
+    // nixpkgs version validation tests
+
+    #[test]
+    fn test_validate_nixpkgs_version_branch() {
+        assert!(validate_nixpkgs_version("nixos-24.05").is_ok());
+        assert!(validate_nixpkgs_version("nixpkgs-unstable").is_ok());
+        assert!(validate_nixpkgs_version("nixos-unstable").is_ok());
+        assert!(validate_nixpkgs_version("master").is_ok());
+    }
+
+    #[test]
+    fn test_validate_nixpkgs_version_sha() {
+        assert!(validate_nixpkgs_version("a1b2c3d4e5f6789012345678901234567890abcd").is_ok());
+        assert!(validate_nixpkgs_version("0123456789abcdef0123456789abcdef01234567").is_ok());
+    }
+
+    #[test]
+    fn test_validate_nixpkgs_version_empty() {
+        assert!(validate_nixpkgs_version("").is_err());
+    }
+
+    #[test]
+    fn test_validate_nixpkgs_version_invalid_chars() {
+        // Shell metacharacters should be rejected
+        assert!(validate_nixpkgs_version("nixos; rm -rf /").is_err());
+        assert!(validate_nixpkgs_version("nixos && ls").is_err());
+        assert!(validate_nixpkgs_version("nixos | cat").is_err());
+        assert!(validate_nixpkgs_version("nixos`whoami`").is_err());
+        assert!(validate_nixpkgs_version("nixos$(whoami)").is_err());
+        // URL injection
+        assert!(validate_nixpkgs_version("nixos/../../../etc/passwd").is_err());
     }
 }
