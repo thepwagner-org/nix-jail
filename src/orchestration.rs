@@ -488,6 +488,12 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         if !cflags.is_empty() {
             let _ = env.insert("NIX_CFLAGS_COMPILE".to_string(), cflags);
         }
+
+        // Set LIBRARY_PATH for linkers (rustc/cc) that don't use NIX_LDFLAGS
+        let lib_path = workspace::build_library_path_env(&store_paths);
+        if !lib_path.is_empty() {
+            let _ = env.insert("LIBRARY_PATH".to_string(), lib_path);
+        }
     }
 
     // Configure credentials (Claude Code, GitHub token)
@@ -1335,6 +1341,12 @@ pub async fn execute_local(
         let cflags = workspace::build_cflags_env(&store_paths);
         if !cflags.is_empty() {
             let _ = env.insert("NIX_CFLAGS_COMPILE".to_string(), cflags);
+        }
+
+        // Set LIBRARY_PATH for linkers (rustc/cc) that don't use NIX_LDFLAGS
+        let lib_path = workspace::build_library_path_env(&store_paths);
+        if !lib_path.is_empty() {
+            let _ = env.insert("LIBRARY_PATH".to_string(), lib_path);
         }
     }
 

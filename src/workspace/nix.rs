@@ -548,3 +548,19 @@ pub fn build_cflags_env(store_paths: &[PathBuf]) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+/// Build LIBRARY_PATH from store paths (for linkers that don't use NIX_LDFLAGS)
+pub fn build_library_path_env(store_paths: &[PathBuf]) -> String {
+    store_paths
+        .iter()
+        .filter_map(|p| {
+            let lib = p.join("lib");
+            if lib.exists() {
+                Some(lib.display().to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(":")
+}
