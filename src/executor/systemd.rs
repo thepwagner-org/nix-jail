@@ -930,6 +930,7 @@ mod tests {
             env: HashMap::new(),
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let props = generate_hardening_properties(
@@ -1040,6 +1041,7 @@ mod tests {
             env: HashMap::new(),
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let props = generate_hardening_properties(
@@ -1248,6 +1250,7 @@ mod tests {
             env: HashMap::new(),
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let props_default = generate_hardening_properties(
@@ -1276,6 +1279,7 @@ mod tests {
             env: HashMap::new(),
             hardening_profile: HardeningProfile::JitRuntime,
             interactive: false,
+            pty_size: None,
         };
 
         let props_jit = generate_hardening_properties(
@@ -1336,6 +1340,7 @@ mod tests {
             proxy_port: None,
             hardening_profile: HardeningProfile::Default,
             interactive: false,
+            pty_size: None,
         };
 
         let executor = SystemdExecutor::new();

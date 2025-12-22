@@ -280,8 +280,8 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         }
     };
 
-    // Detect flake.nix in workspace
-    let has_flake = workspace::flake::detect_flake(&workspace_dir);
+    // Detect flake source (local flake.nix or .envrc with use flake)
+    let flake_source = workspace::flake::detect_flake_source(&workspace_dir);
 
     // Capture git state before execution (if push enabled and repo provided)
     let (head_before, base_branch) = if job.push && !repo.is_empty() {
@@ -312,25 +312,33 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
     };
 
     // Check if workspace has a flake - if so, use it instead of explicit packages
-    let store_paths = if has_flake {
+    let store_paths = if let Some(ref source) = flake_source {
         // Flake detected - use flake shell and ignore explicit packages
         if !packages.is_empty() {
             let pkg_list = packages.join(", ");
             log_sink.info(
                 &job_id,
                 &format!(
-                    "Found flake.nix - using flake shell (ignoring specified packages: {})",
+                    "Found flake - using flake shell (ignoring specified packages: {})",
                     pkg_list
                 ),
             );
         }
 
-        log_sink.info(
-            &job_id,
-            &format!("Computing flake closure from {}", workspace_dir.display()),
-        );
+        let flake_desc = match source {
+            workspace::FlakeSource::Local { flake_dir } => {
+                format!("local flake at {}", flake_dir.display())
+            }
+            workspace::FlakeSource::Envrc { flake_dir, output } => {
+                match output {
+                    Some(out) => format!("{}#{}", flake_dir.display(), out),
+                    None => format!("{}", flake_dir.display()),
+                }
+            }
+        };
+        log_sink.info(&job_id, &format!("Computing flake closure from {}", flake_desc));
 
-        match workspace::compute_flake_closure(&workspace_dir).await {
+        match workspace::compute_flake_closure(source).await {
             Ok(paths) => {
                 tracing::info!(
                     job_id = %job_id,
@@ -910,28 +918,36 @@ async fn configure_proxy(
 /// * `cache_dir` - Directory for persistent disk cache (L2). If None, only in-memory cache is used.
 async fn resolve_packages_and_closure(
     job_id: &str,
-    working_dir: &Path,
+    _working_dir: &Path,
     packages: &[String],
     nixpkgs_version: Option<&str>,
-    has_flake: bool,
+    flake_source: Option<&workspace::FlakeSource>,
     log_sink: &Arc<dyn LogSink>,
     cache_dir: Option<&Path>,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>), OrchestrationError> {
-    let store_paths = if has_flake {
+    let store_paths = if let Some(source) = flake_source {
         if !packages.is_empty() {
             log_sink.info(
                 job_id,
                 &format!(
-                    "Ignoring explicit packages ({}), using flake.nix",
+                    "Ignoring explicit packages ({}), using flake",
                     packages.join(", ")
                 ),
             );
         }
-        log_sink.info(
-            job_id,
-            &format!("Computing flake closure from {}", working_dir.display()),
-        );
-        workspace::compute_flake_closure(working_dir)
+        let flake_desc = match source {
+            workspace::FlakeSource::Local { flake_dir } => {
+                format!("local flake at {}", flake_dir.display())
+            }
+            workspace::FlakeSource::Envrc { flake_dir, output } => {
+                match output {
+                    Some(out) => format!("{}#{}", flake_dir.display(), out),
+                    None => format!("{}", flake_dir.display()),
+                }
+            }
+        };
+        log_sink.info(job_id, &format!("Computing flake closure from {}", flake_desc));
+        workspace::compute_flake_closure(source)
             .await
             .map_err(|e| OrchestrationError::FlakeClosureError(e.to_string()))?
     } else if !packages.is_empty() {
@@ -1210,8 +1226,8 @@ pub async fn execute_local(
     let job_dir = JobDirectory::new(&state_dir, &job_id)
         .map_err(|e| OrchestrationError::JobDirError(e.to_string()))?;
 
-    // Detect flake.nix in working directory
-    let has_flake = workspace::flake::detect_flake(&config.working_dir);
+    // Detect flake source (local flake.nix or .envrc with use flake)
+    let flake_source = workspace::flake::detect_flake_source(&config.working_dir);
 
     // Phase 1: Create proxy config if needed
     let proxy_config_path = configure_proxy(
@@ -1231,7 +1247,7 @@ pub async fn execute_local(
         &config.working_dir,
         &config.packages,
         config.nixpkgs_version.as_deref(),
-        has_flake,
+        flake_source.as_ref(),
         &log_sink,
         Some(&state_dir),
     )
