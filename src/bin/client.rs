@@ -762,7 +762,7 @@ async fn run_local(
 
         if use_docker_volumes {
             // Clone directly into Docker volume
-            use nix_jail::job_workspace::MirrorJobWorkspace;
+            use nix_jail::job_workspace::CachedJobWorkspace;
             use nix_jail::workspace::git::resolve_ref_to_commit;
 
             // Resolve ref from remote (no local mirror needed)
@@ -772,7 +772,7 @@ async fn run_local(
 
             // Compute cache key for volume name
             let cache_key =
-                MirrorJobWorkspace::compute_cache_key(repo_url, &commit_sha, path.as_deref());
+                CachedJobWorkspace::compute_cache_key(repo_url, &commit_sha, path.as_deref());
             let volume_name = format!("nix-jail-ws-{}", &cache_key[..16]);
 
             // Check if volume already exists (cache hit)
