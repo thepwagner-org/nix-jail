@@ -78,7 +78,14 @@ fn parse_envrc_flake(dir: &Path) -> Option<(PathBuf, Option<String>)> {
             let (path_str, output) = if let Some(hash_pos) = flake_ref.find('#') {
                 let path = &flake_ref[..hash_pos];
                 let output = &flake_ref[hash_pos + 1..];
-                (path, if output.is_empty() { None } else { Some(output.to_string()) })
+                (
+                    path,
+                    if output.is_empty() {
+                        None
+                    } else {
+                        Some(output.to_string())
+                    },
+                )
             } else {
                 (flake_ref, None)
             };
@@ -205,7 +212,12 @@ pub async fn compute_flake_closure(source: &FlakeSource) -> Result<Vec<PathBuf>,
         }
         FlakeSource::Envrc { flake_dir, output } => {
             let output_name = output.as_deref().unwrap_or("default");
-            let ref_str = format!("{}#devShells.{}.{}", flake_dir.display(), system, output_name);
+            let ref_str = format!(
+                "{}#devShells.{}.{}",
+                flake_dir.display(),
+                system,
+                output_name
+            );
             (flake_dir.clone(), ref_str)
         }
     };
@@ -349,7 +361,10 @@ mod tests {
 
         let source = detect_flake_source(&project_dir);
         match source {
-            Some(FlakeSource::Envrc { flake_dir: dir, output }) => {
+            Some(FlakeSource::Envrc {
+                flake_dir: dir,
+                output,
+            }) => {
                 assert_eq!(dir, flake_dir.canonicalize().unwrap());
                 assert_eq!(output, Some("my-project".to_string()));
             }
@@ -369,12 +384,14 @@ mod tests {
         // Create a project subdirectory with .envrc (no output fragment)
         let project_dir = flake_dir.join("subdir");
         fs::create_dir(&project_dir).expect("Failed to create project dir");
-        fs::write(project_dir.join(".envrc"), "use flake ..")
-            .expect("Failed to write .envrc");
+        fs::write(project_dir.join(".envrc"), "use flake ..").expect("Failed to write .envrc");
 
         let source = detect_flake_source(&project_dir);
         match source {
-            Some(FlakeSource::Envrc { flake_dir: dir, output }) => {
+            Some(FlakeSource::Envrc {
+                flake_dir: dir,
+                output,
+            }) => {
                 assert_eq!(dir, flake_dir.canonicalize().unwrap());
                 assert_eq!(output, None);
             }
@@ -421,8 +438,7 @@ mod tests {
         // Create a project with BOTH .envrc AND local flake.nix
         let project_dir = flake_dir.join("proj");
         fs::create_dir(&project_dir).expect("Failed to create project dir");
-        fs::write(project_dir.join(".envrc"), "use flake ..#proj")
-            .expect("Failed to write .envrc");
+        fs::write(project_dir.join(".envrc"), "use flake ..#proj").expect("Failed to write .envrc");
         fs::write(project_dir.join("flake.nix"), "{ outputs = {}; }")
             .expect("Failed to write local flake.nix");
 

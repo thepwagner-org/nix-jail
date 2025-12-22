@@ -455,6 +455,10 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         }
     };
 
+    // Create tmp directory for the job
+    let tmp_dir = workspace_dir.join("tmp");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+
     // Configure execution environment
     let mut env = build_environment(
         proxy.as_ref(),
@@ -785,7 +789,9 @@ fn build_environment(
     let _ = env.insert("USER".to_string(), "sbc-admin".to_string());
     let _ = env.insert("LOGNAME".to_string(), "sbc-admin".to_string());
 
-    let _ = env.insert("TMPDIR".to_string(), "/tmp".to_string());
+    // Temp directory within workspace (writable)
+    let tmp_dir = working_dir.join("tmp");
+    let _ = env.insert("TMPDIR".to_string(), tmp_dir.to_string_lossy().to_string());
 
     // Set minimal locale to avoid locale warnings (sandbox doesn't have full locale data)
     let _ = env.insert("LANG".to_string(), "C".to_string());
@@ -1285,6 +1291,10 @@ pub async fn execute_local(
     .await?;
 
     // Phase 5: Build environment
+    // Create tmp directory for the job
+    let tmp_dir = config.working_dir.join("tmp");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+
     let mut env = build_environment(
         proxy.as_ref(),
         &config.working_dir,

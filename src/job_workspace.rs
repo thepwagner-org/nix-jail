@@ -357,11 +357,8 @@ impl JobWorkspace for CachedJobWorkspace {
 
         // Step 2: Determine cache key and strategy
         let use_sparse = self.use_sparse_checkout(path);
-        let cache_key = Self::compute_cache_key(
-            repo,
-            &commit_sha,
-            if use_sparse { path } else { None },
-        );
+        let cache_key =
+            Self::compute_cache_key(repo, &commit_sha, if use_sparse { path } else { None });
 
         tracing::info!(
             repo = %repo,
@@ -400,9 +397,9 @@ impl JobWorkspace for CachedJobWorkspace {
             WorkspaceBackend::Filesystem { storage } => {
                 // Delete workspace subvolume first (if it exists)
                 if workspace_dir.exists() {
-                    storage
-                        .delete_dir(workspace_dir)
-                        .map_err(|e| WorkspaceError::IoError(std::io::Error::other(e.to_string())))?;
+                    storage.delete_dir(workspace_dir).map_err(|e| {
+                        WorkspaceError::IoError(std::io::Error::other(e.to_string()))
+                    })?;
                 }
 
                 // Then delete the base directory (regular directory, not a subvolume)
