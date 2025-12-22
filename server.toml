@@ -6,4 +6,10 @@ addr = "127.0.0.1:50051"
 state_dir = "/tmp/nix-jail"
 store_strategy = "cached"  # "cached" (persistent) or "fresh" (ephemeral)
 
-# No credentials needed - running with deny-all network policy
+# Git credential for private repository access
+[[credentials]]
+name = "forgejo"
+type = "github"
+source_env = "GIT_TOKEN"
+allowed_host_patterns = ["git\\.pwagner\\.net"]
+header_format = "token {token}"
