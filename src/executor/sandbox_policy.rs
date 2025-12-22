@@ -101,10 +101,10 @@ pub fn generate_profile(
     // No keychain access needed - security wrapper returns pre-fetched credentials
     profile.push('\n');
 
-    // Allow workspace access (read-write)
-    profile.push_str(";; Workspace access (read-write)\n");
+    // Allow workspace access (read-write and execute for build scripts)
+    profile.push_str(";; Workspace access (read-write, execute for cargo build scripts)\n");
     profile.push_str(&format!(
-        "(allow file-read* file-write* (subpath \"{}\"))\n\n",
+        "(allow file-read* file-write* process-exec* (subpath \"{}\"))\n\n",
         workspace_path.display()
     ));
 
