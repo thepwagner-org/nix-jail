@@ -31,6 +31,20 @@ pub enum FlakeSource {
     },
 }
 
+impl std::fmt::Display for FlakeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FlakeSource::Local { flake_dir } => {
+                write!(f, "local flake at {}", flake_dir.display())
+            }
+            FlakeSource::Envrc { flake_dir, output } => match output {
+                Some(out) => write!(f, "{}#{}", flake_dir.display(), out),
+                None => write!(f, "{}", flake_dir.display()),
+            },
+        }
+    }
+}
+
 /// Parse .envrc for a `use flake` directive
 ///
 /// Looks for lines matching `use flake <path>[#output]` and extracts

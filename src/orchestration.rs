@@ -325,18 +325,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
             );
         }
 
-        let flake_desc = match source {
-            workspace::FlakeSource::Local { flake_dir } => {
-                format!("local flake at {}", flake_dir.display())
-            }
-            workspace::FlakeSource::Envrc { flake_dir, output } => {
-                match output {
-                    Some(out) => format!("{}#{}", flake_dir.display(), out),
-                    None => format!("{}", flake_dir.display()),
-                }
-            }
-        };
-        log_sink.info(&job_id, &format!("Computing flake closure from {}", flake_desc));
+        log_sink.info(&job_id, &format!("Computing flake closure from {}", source));
 
         match workspace::compute_flake_closure(source).await {
             Ok(paths) => {
@@ -918,7 +907,6 @@ async fn configure_proxy(
 /// * `cache_dir` - Directory for persistent disk cache (L2). If None, only in-memory cache is used.
 async fn resolve_packages_and_closure(
     job_id: &str,
-    _working_dir: &Path,
     packages: &[String],
     nixpkgs_version: Option<&str>,
     flake_source: Option<&workspace::FlakeSource>,
@@ -935,18 +923,7 @@ async fn resolve_packages_and_closure(
                 ),
             );
         }
-        let flake_desc = match source {
-            workspace::FlakeSource::Local { flake_dir } => {
-                format!("local flake at {}", flake_dir.display())
-            }
-            workspace::FlakeSource::Envrc { flake_dir, output } => {
-                match output {
-                    Some(out) => format!("{}#{}", flake_dir.display(), out),
-                    None => format!("{}", flake_dir.display()),
-                }
-            }
-        };
-        log_sink.info(job_id, &format!("Computing flake closure from {}", flake_desc));
+        log_sink.info(job_id, &format!("Computing flake closure from {}", source));
         workspace::compute_flake_closure(source)
             .await
             .map_err(|e| OrchestrationError::FlakeClosureError(e.to_string()))?
@@ -1244,7 +1221,6 @@ pub async fn execute_local(
     // CLI mode: use disk cache for persistence across process restarts
     let (store_paths, closure) = resolve_packages_and_closure(
         &job_id,
-        &config.working_dir,
         &config.packages,
         config.nixpkgs_version.as_deref(),
         flake_source.as_ref(),
