@@ -484,7 +484,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         &log_sink,
     );
 
-    let command = build_command(is_exec_mode, script);
+    let command = build_command(script);
 
     // Working directory was already resolved by job_workspace.setup() based on path
     let exec_working_dir = workspace_dir.clone();
@@ -838,40 +838,20 @@ fn detect_hashbang(script: &str) -> Option<(String, bool)> {
     Some((interpreter, is_bash))
 }
 
-fn build_command(is_exec_mode: bool, script: String) -> Vec<String> {
-    if is_exec_mode {
-        // Check for hashbang to determine interpreter
-        if let Some((interpreter, is_bash)) = detect_hashbang(&script) {
-            if !is_bash {
-                // Non-bash interpreter: execute with that interpreter
-                tracing::info!(
-                    "detected non-bash interpreter '{}', executing directly",
-                    interpreter
-                );
-                return vec![interpreter, "-c".to_string(), script];
-            }
+fn build_command(script: String) -> Vec<String> {
+    // Check for hashbang to determine interpreter
+    if let Some((interpreter, is_bash)) = detect_hashbang(&script) {
+        if !is_bash {
+            // Non-bash interpreter: execute with that interpreter
+            tracing::info!(
+                "detected non-bash interpreter '{}', executing directly",
+                interpreter
+            );
+            return vec![interpreter, "-c".to_string(), script];
         }
-        // Default to bash (either explicit bash hashbang or no hashbang)
-        vec!["bash".to_string(), "-c".to_string(), script]
-    } else {
-        vec![
-            "bash".to_string(),
-            "-c".to_string(),
-            "echo '=== Proxy Configuration ===' && \
-             echo \"HTTP_PROXY=$HTTP_PROXY\" && \
-             echo \"HTTPS_PROXY=$HTTPS_PROXY\" && \
-             echo \"SSL_CERT_FILE=$SSL_CERT_FILE\" && \
-             echo '=== Testing Direct Access (should fail) ===' && \
-             (curl -s --max-time 1 --noproxy '*' https://httpbin.org/anything 2>&1 || echo 'Direct access blocked (expected)') && \
-             echo '=== Testing HTTPS via Proxy (should succeed) ===' && \
-             curl -s --http1.1 https://httpbin.org/anything 2>&1 && \
-             echo '=== Workspace Files ===' && \
-             for f in *; do echo \"$f\"; done && \
-             echo '=== Test Complete ===' && \
-             exit 0"
-                .to_string(),
-        ]
     }
+    // Default to bash (either explicit bash hashbang or no hashbang)
+    vec!["bash".to_string(), "-c".to_string(), script]
 }
 
 /// Configure proxy for network policy enforcement
