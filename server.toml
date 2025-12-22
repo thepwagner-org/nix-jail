@@ -5,6 +5,7 @@
 addr = "127.0.0.1:50051"
 state_dir = "/tmp/nix-jail"
 store_strategy = "cached"  # "cached" (persistent) or "fresh" (ephemeral)
+otlp_endpoint = "https://tempo.pwagner.net:4317"
 
 # Git credential for private repository access
 [[credentials]]
