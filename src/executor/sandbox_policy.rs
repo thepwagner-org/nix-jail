@@ -185,6 +185,9 @@ pub fn generate_profile(
     profile.push_str("(allow file-read* (subpath \"/Library/Apple\"))\n");
     profile.push_str("(allow file-read* (subpath \"/Library/Preferences\"))\n");
 
+    // Enable basic network socket operations
+    profile.push_str("(system-network)\n");
+
     // Network restrictions - localhost only (for MITM proxy)
     // Note: macOS sandbox profiles don't support port-specific restrictions
     if let Some(port) = proxy_port {
