@@ -199,6 +199,9 @@ pub fn generate_profile(
         profile.push_str(";; All network-outbound operations will be denied by default\n");
     }
 
+    // Allow binding to localhost for test servers (wiremock, etc.)
+    profile.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
+
     profile
 }
 
