@@ -840,6 +840,15 @@ fn build_environment(
     let _ = env.insert("LANG".to_string(), "C".to_string());
     let _ = env.insert("LC_ALL".to_string(), "C".to_string());
 
+    // macOS: Set SDKROOT to avoid xcrun warnings during Rust builds
+    #[cfg(target_os = "macos")]
+    {
+        let sdk_path = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk";
+        if std::path::Path::new(sdk_path).exists() {
+            let _ = env.insert("SDKROOT".to_string(), sdk_path.to_string());
+        }
+    }
+
     env
 }
 
