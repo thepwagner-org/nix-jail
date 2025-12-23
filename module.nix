@@ -141,6 +141,23 @@ in {
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [cfg.package];
 
+    # Create nix-jail user/group for daemon and job execution
+    users.users.nix-jail = {
+      isSystemUser = true;
+      group = "nix-jail";
+      home = cfg.stateDirectory;
+    };
+    users.groups.nix-jail = {};
+
+    # Allow nix-jail user to manage systemd units (for systemd-run)
+    security.polkit.extraConfig = lib.mkAfter ''
+      polkit.addRule(function(action, subject) {
+        if (action.id == "org.freedesktop.systemd1.manage-units" && subject.user == "nix-jail") {
+          return polkit.Result.YES;
+        }
+      });
+    '';
+
     # Allow proxy port from nix-jail network namespaces (vp-* veth interfaces)
     networking.firewall.interfaces."vp-+".allowedTCPPorts = [3128];
 
@@ -158,6 +175,12 @@ in {
           RestartSec = "5s";
           StateDirectory = "nix-jail";
           StateDirectoryMode = "0750";
+          # Run as nix-jail user instead of root
+          User = "nix-jail";
+          Group = "nix-jail";
+          # Capabilities needed for network namespace creation
+          AmbientCapabilities = ["CAP_NET_ADMIN"];
+          CapabilityBoundingSet = ["CAP_NET_ADMIN"];
         }
         // lib.optionalAttrs (cfg.environmentFile != null) {
           EnvironmentFile = cfg.environmentFile;

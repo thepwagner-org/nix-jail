@@ -108,8 +108,10 @@ fn generate_hardening_properties(
         "--property=ProtectProc=invisible".to_string(),
         "--property=ProcSubset=pid".to_string(),
         "--property=PrivateDevices=true".to_string(),
-        // === User and Privilege Controls (6 properties) ===
-        "--property=DynamicUser=true".to_string(),
+        // === User and Privilege Controls (7 properties) ===
+        // Use static nix-jail user instead of DynamicUser for consistent permissions
+        "--property=User=nix-jail".to_string(),
+        "--property=Group=nix-jail".to_string(),
         "--property=PrivateUsers=true".to_string(),
         "--property=NoNewPrivileges=true".to_string(),
         "--property=RestrictSUIDSGID=true".to_string(),
@@ -148,9 +150,8 @@ fn generate_hardening_properties(
     // === Cleanup/Isolation (4 properties) ===
     props.push("--property=RemoveIPC=true".to_string());
     props.push("--property=KeyringMode=private".to_string());
-    // Use permissive umask so DynamicUser can access directories created by daemon (as root)
-    // Safe because workspace is temporary, isolated, and inside chroot with all hardening
-    props.push("--property=UMask=0000".to_string());
+    // Standard umask - nix-jail user owns everything so no need for permissive mode
+    props.push("--property=UMask=0022".to_string());
     props.push("--property=ProtectClock=true".to_string());
 
     // === Root Directory and Bind Mounts ===

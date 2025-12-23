@@ -56,13 +56,8 @@ impl JobWorkspace for StandardJobWorkspace {
         github_token: Option<&str>,
     ) -> Result<PathBuf, WorkspaceError> {
         if repo.is_empty() {
-            // No repo - just ensure workspace dir exists and is writable
+            // No repo - just ensure workspace dir exists
             std::fs::create_dir_all(workspace_dir)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(workspace_dir, std::fs::Permissions::from_mode(0o777))?;
-            }
             return Ok(workspace_dir.to_path_buf());
         }
 
@@ -86,19 +81,6 @@ impl JobWorkspace for StandardJobWorkspace {
             return Err(WorkspaceError::InvalidPath(
                 "git clone did not create src directory".into(),
             ));
-        }
-
-        // Make workspace world-writable for systemd DynamicUser
-        // The daemon runs as root, but jobs run with random UIDs that can't write to root-owned dirs
-        #[cfg(unix)]
-        {
-            let status = std::process::Command::new("chmod")
-                .args(["-R", "777"])
-                .arg(&src_dir)
-                .status();
-            if let Err(e) = status {
-                tracing::warn!(error = %e, "failed to chmod workspace");
-            }
         }
 
         // Resolve the working directory (may be subpath)
@@ -445,14 +427,6 @@ impl CachedJobWorkspace {
                 storage
                     .create_dir(workspace_dir)
                     .map_err(|e| WorkspaceError::IoError(std::io::Error::other(e.to_string())))?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(
-                        workspace_dir,
-                        std::fs::Permissions::from_mode(0o777),
-                    )?;
-                }
                 Ok(workspace_dir.to_path_buf())
             }
             WorkspaceBackend::DockerVolume => {
@@ -571,20 +545,6 @@ impl CachedJobWorkspace {
             crate::cache::snapshot_or_copy(&cached_clone, &target_dir, storage)
                 .await
                 .map_err(|e| WorkspaceError::IoError(std::io::Error::other(e.to_string())))?;
-        }
-
-        // Make workspace world-writable for systemd DynamicUser
-        // The daemon runs as root, but jobs run with random UIDs that can't write to root-owned dirs
-        // Must be recursive because cached snapshots preserve root ownership on subdirs
-        #[cfg(unix)]
-        {
-            let status = std::process::Command::new("chmod")
-                .args(["-R", "777"])
-                .arg(&target_dir)
-                .status();
-            if let Err(e) = status {
-                tracing::warn!(error = %e, "failed to chmod workspace");
-            }
         }
 
         // Resolve working directory (may be subpath)
