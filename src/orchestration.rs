@@ -286,6 +286,54 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         }
     };
 
+    // Discover and copy cache artifacts from flake (e.g., pre-compiled Cargo deps)
+    {
+        let cache_paths = workspace::discover_cache_paths(&workspace_dir)
+            .instrument(tracing::info_span!("discover_cache"))
+            .await;
+
+        if !cache_paths.is_empty() {
+            log_sink.info(
+                &job_id,
+                &format!("Discovered {} cache artifact(s) from flake", cache_paths.len()),
+            );
+
+            for (src, dest) in &cache_paths {
+                let dest_path = workspace_dir.join(dest);
+                log_sink.info(
+                    &job_id,
+                    &format!("Copying cache: {} → {}", src.display(), dest),
+                );
+
+                match workspace::copy_tree_cow(src, &dest_path)
+                    .instrument(tracing::info_span!("copy_cache", src = %src.display(), dest = %dest))
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            src = %src.display(),
+                            dest = %dest_path.display(),
+                            "cache artifact copied"
+                        );
+                    }
+                    Err(e) => {
+                        // Cache copy failure is non-fatal - just log and continue
+                        tracing::warn!(
+                            src = %src.display(),
+                            dest = %dest_path.display(),
+                            error = %e,
+                            "failed to copy cache artifact (continuing without cache)"
+                        );
+                        log_sink.info(
+                            &job_id,
+                            &format!("Warning: Could not copy cache ({}), building from scratch", e),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Detect flake source (local flake.nix or .envrc with use flake)
     let flake_source = workspace::flake::detect_flake_source(&workspace_dir);
 

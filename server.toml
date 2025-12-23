@@ -4,7 +4,7 @@
 [server]
 addr = "127.0.0.1:50051"
 state_dir = "/tmp/nix-jail"
-store_strategy = "cached"  # "cached" (persistent) or "fresh" (ephemeral)
+store_strategy = "bind-mount"  # Use store paths directly (no copy needed for sandbox-exec)
 otlp_endpoint = "https://tempo.pwagner.net:4317"
 
 # Git credential for private repository access

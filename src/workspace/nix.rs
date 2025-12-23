@@ -564,3 +564,73 @@ pub fn build_library_path_env(store_paths: &[PathBuf]) -> String {
         .collect::<Vec<_>>()
         .join(":")
 }
+
+/// Discover cache artifacts from flake outputs
+///
+/// Looks for pre-built dependency caches in the flake's package outputs.
+/// Convention: `packages.<system>.<name>.deps` or `packages.<system>.default.deps`
+///
+/// Returns a map of source store paths to destination paths (relative to workspace).
+/// For Cargo projects, the destination is "target" (where compiled deps live).
+pub async fn discover_cache_paths(workspace: &Path) -> std::collections::HashMap<PathBuf, String> {
+    use std::collections::HashMap;
+
+    let mut caches = HashMap::new();
+
+    // Determine system architecture
+    let system = if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            "aarch64-darwin"
+        } else {
+            "x86_64-darwin"
+        }
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64-linux"
+    } else {
+        "x86_64-linux"
+    };
+
+    // Try to find .deps attribute on default package
+    let eval_expr = format!(".#packages.{}.default.deps.outPath", system);
+
+    tracing::debug!(workspace = %workspace.display(), expr = %eval_expr, "discovering cache artifacts from flake");
+
+    let output = Command::new("nix")
+        .args(["eval", &eval_expr, "--raw"])
+        .current_dir(workspace)
+        .output()
+        .await;
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let path = String::from_utf8_lossy(&output.stdout);
+            let store_path = PathBuf::from(path.trim());
+
+            // Verify the store path exists
+            if store_path.exists() {
+                tracing::info!(
+                    store_path = %store_path.display(),
+                    "discovered Cargo deps cache from flake"
+                );
+                let _ = caches.insert(store_path, "target".to_string());
+            } else {
+                tracing::warn!(
+                    store_path = %store_path.display(),
+                    "deps cache path does not exist"
+                );
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::debug!(
+                stderr = %stderr.lines().next().unwrap_or(""),
+                "no .deps attribute found in flake (this is normal)"
+            );
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "failed to run nix eval (nix not available?)");
+        }
+    }
+
+    caches
+}
