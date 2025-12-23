@@ -62,20 +62,28 @@ impl Executor for SandboxExecutor {
                 .unwrap_or_else(|_| config.root_dir.clone());
 
             // Set up cache paths for sandbox profile (if caching enabled)
+            // IMPORTANT: Canonicalize paths to handle /tmp -> /private/tmp symlink on macOS
             let cache_paths = if config.cache_enabled {
+                let cargo_home = config.cargo_home.as_ref().and_then(|p| {
+                    // Ensure directory exists before canonicalizing
+                    if let Err(e) = std::fs::create_dir_all(p) {
+                        tracing::warn!(path = %p.display(), error = %e, "failed to create cargo home dir");
+                    }
+                    p.canonicalize().ok()
+                });
                 let target_dir = match (&config.target_cache_dir, &config.repo_hash) {
                     (Some(base), Some(hash)) => {
                         let dir = base.join(&hash[..12.min(hash.len())]);
-                        // Ensure the target cache directory exists
+                        // Ensure the target cache directory exists before canonicalizing
                         if let Err(e) = std::fs::create_dir_all(&dir) {
                             tracing::warn!(path = %dir.display(), error = %e, "failed to create target cache dir");
                         }
-                        Some(dir)
+                        dir.canonicalize().ok()
                     }
                     _ => None,
                 };
                 Some(super::sandbox_policy::CachePaths {
-                    cargo_home: config.cargo_home.clone(),
+                    cargo_home,
                     target_dir,
                 })
             } else {
@@ -97,7 +105,10 @@ impl Executor for SandboxExecutor {
                     let _ = env.insert("CARGO_HOME".to_string(), cargo_home.display().to_string());
                 }
                 if let Some(ref target_dir) = cache.target_dir {
-                    let _ = env.insert("CARGO_TARGET_DIR".to_string(), target_dir.display().to_string());
+                    let _ = env.insert(
+                        "CARGO_TARGET_DIR".to_string(),
+                        target_dir.display().to_string(),
+                    );
                 }
             }
 

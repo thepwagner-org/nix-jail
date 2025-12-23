@@ -240,7 +240,8 @@ fn add_filesystem_mounts(cmd: &mut Command, config: &ExecutionConfig) {
             let _ = cmd.arg("-v").arg("nix-jail-cargo:/cargo");
 
             // Per-repo target cache volume (keyed by first 12 chars of repo hash)
-            let target_volume = format!("nix-jail-target-{}", &repo_hash[..12.min(repo_hash.len())]);
+            let target_volume =
+                format!("nix-jail-target-{}", &repo_hash[..12.min(repo_hash.len())]);
             let _ = cmd.arg("-v").arg(format!("{}:/target", target_volume));
 
             tracing::debug!(

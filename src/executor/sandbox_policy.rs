@@ -157,10 +157,10 @@ pub fn generate_profile_with_cache(
         ));
     }
 
-    // Allow cache directory access (read-write for Cargo registry and build artifacts)
+    // Allow cache directory access (read-write for Cargo registry, read-write-exec for target)
     if let Some(cache) = cache_paths {
         if cache.cargo_home.is_some() || cache.target_dir.is_some() {
-            profile.push_str(";; Cargo cache directories (read-write)\n");
+            profile.push_str(";; Cargo cache directories\n");
         }
         if let Some(cargo_home) = &cache.cargo_home {
             profile.push_str(&format!(
@@ -169,8 +169,9 @@ pub fn generate_profile_with_cache(
             ));
         }
         if let Some(target_dir) = &cache.target_dir {
+            // Target directory needs process-exec* for build scripts
             profile.push_str(&format!(
-                "(allow file-read* file-write* (subpath \"{}\"))\n",
+                "(allow file-read* file-write* process-exec* (subpath \"{}\"))\n",
                 target_dir.display()
             ));
         }
