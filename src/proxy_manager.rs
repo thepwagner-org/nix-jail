@@ -119,7 +119,7 @@ impl ProxyManager {
         let proxy_bin = current_exe
             .parent()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No parent dir"))?
-            .join("proxy");
+            .join("nixjail-proxy");
 
         let (stdout_tx, stdout_rx) = mpsc::channel::<String>(128);
         let (stderr_tx, stderr_rx) = mpsc::channel::<String>(128);
@@ -305,7 +305,7 @@ mod tests {
         let proxy_bin = current_exe
             .parent()
             .expect("failed to get exe parent dir")
-            .join("proxy");
+            .join("nixjail-proxy");
 
         if !proxy_bin.exists() {
             // Skip test if proxy binary isn't built
