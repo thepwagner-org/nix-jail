@@ -72,6 +72,15 @@
       header_format = "${cred.headerFormat}"
       dummy_token = "${cred.dummyToken}"
     '') (lib.attrValues cfg.credentials)}
+    ${lib.optionalString (cfg.gitCredential != null) ''
+      [[credentials]]
+      name = "git"
+      type = "generic"
+      source_env = "${cfg.gitCredential.sourceEnv}"
+      allowed_host_patterns = [${lib.concatMapStringsSep ", " (p: ''"${p}"'') cfg.gitCredential.allowedHostPatterns}]
+      header_format = "token {token}"
+      dummy_token = "DUMMY_GIT_TOKEN"
+    ''}
   '';
 in {
   options.services.nix-jail = {
@@ -99,6 +108,24 @@ in {
       type = lib.types.attrsOf (lib.types.submodule credentialOpts);
       default = {};
       description = "Credential configurations";
+    };
+
+    gitCredential = lib.mkOption {
+      type = lib.types.nullOr (lib.types.submodule {
+        options = {
+          sourceEnv = lib.mkOption {
+            type = lib.types.str;
+            default = "GIT_TOKEN";
+            description = "Environment variable containing the git token";
+          };
+          allowedHostPatterns = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            description = "Regex patterns for allowed git hosts (e.g., git\\.example\\.com)";
+          };
+        };
+      });
+      default = null;
+      description = "Git credential for repository access (shorthand for common git auth pattern)";
     };
 
     environmentFile = lib.mkOption {
