@@ -573,11 +573,18 @@ impl CachedJobWorkspace {
                 .map_err(|e| WorkspaceError::IoError(std::io::Error::other(e.to_string())))?;
         }
 
-        // Make workspace writable
+        // Make workspace world-writable for systemd DynamicUser
+        // The daemon runs as root, but jobs run with random UIDs that can't write to root-owned dirs
+        // Must be recursive because cached snapshots preserve root ownership on subdirs
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o777))?;
+            let status = std::process::Command::new("chmod")
+                .args(["-R", "777"])
+                .arg(&target_dir)
+                .status();
+            if let Err(e) = status {
+                tracing::warn!(error = %e, "failed to chmod workspace");
+            }
         }
 
         // Resolve working directory (may be subpath)
