@@ -88,6 +88,19 @@ impl JobWorkspace for StandardJobWorkspace {
             ));
         }
 
+        // Make workspace world-writable for systemd DynamicUser
+        // The daemon runs as root, but jobs run with random UIDs that can't write to root-owned dirs
+        #[cfg(unix)]
+        {
+            let status = std::process::Command::new("chmod")
+                .args(["-R", "777"])
+                .arg(&src_dir)
+                .status();
+            if let Err(e) = status {
+                tracing::warn!(error = %e, "failed to chmod workspace");
+            }
+        }
+
         // Resolve the working directory (may be subpath)
         let working_dir = if let Some(subpath) = path {
             if !subpath.is_empty() && subpath != "." {
