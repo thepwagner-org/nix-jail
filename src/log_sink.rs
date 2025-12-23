@@ -82,11 +82,12 @@ impl LogSink for StorageLogSink {
                 nanos: 0,
             }),
             source: source as i32,
+            exit_code: None,
         }));
     }
 
     fn done(&self, job_id: &str, exit_code: i32) {
-        let msg = format!("[DONE] Job exited with code: {}\n", exit_code);
+        let msg = format!("[DONE] exit_code={}\n", exit_code);
         self.log(job_id, LogSource::System, &msg);
     }
 }
@@ -132,7 +133,7 @@ impl LogSink for StdioLogSink {
 
     fn done(&self, _job_id: &str, exit_code: i32) {
         if self.show_prefix {
-            let msg = format!("[DONE] Job exited with code: {}\n", exit_code);
+            let msg = format!("[DONE] exit_code={}\n", exit_code);
             let _ = std::io::stdout().write_all(msg.as_bytes());
         }
     }

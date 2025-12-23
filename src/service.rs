@@ -317,6 +317,7 @@ impl JailService for JailServiceImpl {
                                                     nanos: 0,
                                                 }),
                                                 source: log.source,
+                                                exit_code: None,
                                             };
 
                                             if tx.send(Ok(entry)).await.is_err() {

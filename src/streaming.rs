@@ -83,6 +83,7 @@ pub async fn stream_logs(
                 nanos: 0,
             }),
             source: source as i32,
+            exit_code: None,
         };
 
         // Broadcast to all clients (ignore errors - clients may have disconnected)

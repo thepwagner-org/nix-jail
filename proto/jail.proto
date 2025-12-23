@@ -167,6 +167,9 @@ message LogEntry {
 
   // Source of this log entry
   LogSource source = 3;
+
+  // Exit code (only set on final message when source=System)
+  optional int32 exit_code = 4;
 }
 
 // Request to list jobs with optional filtering and pagination

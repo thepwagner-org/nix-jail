@@ -153,6 +153,7 @@ pub async fn serve_stored_logs(
                             nanos: 0,
                         }),
                         source: log.source,
+                        exit_code: None,
                     };
 
                     if tx.send(Ok(entry)).await.is_err() {
@@ -704,7 +705,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         JobStatus::Failed
     };
 
-    let msg = format!("[DONE] Job exited with code: {}\n", exit_code);
+    let msg = format!("[DONE] exit_code={}\n", exit_code);
     let _ = storage.append_log(
         &job_id,
         &StorageLogEntry {
@@ -724,6 +725,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
             nanos: 0,
         }),
         source: LogSource::System as i32,
+        exit_code: Some(exit_code),
     }));
 
     // Handle PR creation if push is enabled
