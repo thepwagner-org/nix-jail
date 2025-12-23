@@ -180,14 +180,12 @@ in {
           RestartSec = "5s";
           StateDirectory = "nix-jail";
           StateDirectoryMode = "0750";
-          # Run as nix-jail user instead of root
-          User = "nix-jail";
-          Group = "nix-jail";
-          # Capabilities needed for network namespace creation
-          # CAP_NET_ADMIN: create/configure network namespaces
-          # CAP_SYS_ADMIN: mount bind for /var/run/netns/<ns>
-          AmbientCapabilities = ["CAP_NET_ADMIN" "CAP_SYS_ADMIN"];
-          CapabilityBoundingSet = ["CAP_NET_ADMIN" "CAP_SYS_ADMIN"];
+          # TODO: Running as root for now - network namespace setup fails with nix-jail user
+          # even with CAP_NET_ADMIN + CAP_SYS_ADMIN. Need to investigate further.
+          # User = "nix-jail";
+          # Group = "nix-jail";
+          # AmbientCapabilities = ["CAP_NET_ADMIN" "CAP_SYS_ADMIN"];
+          # CapabilityBoundingSet = ["CAP_NET_ADMIN" "CAP_SYS_ADMIN"];
         }
         // lib.optionalAttrs (cfg.environmentFile != null) {
           EnvironmentFile = cfg.environmentFile;
