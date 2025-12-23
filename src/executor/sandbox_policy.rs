@@ -201,6 +201,7 @@ pub fn generate_profile(
 
     // Allow binding to localhost for test servers (wiremock, etc.)
     profile.push_str("(allow network-bind)\n");
+    profile.push_str("(allow network-inbound)\n");
 
     profile
 }
