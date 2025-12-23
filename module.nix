@@ -55,6 +55,9 @@
     };
   };
 
+  # Escape backslashes for TOML strings
+  escapeToml = s: builtins.replaceStrings ["\\"] ["\\\\"] s;
+
   configFile = pkgs.writeText "nix-jail.toml" ''
     [server]
     addr = "${cfg.addr}"
@@ -68,8 +71,8 @@
       ${lib.optionalString (cred.keychainService != null) ''keychain_service = "${cred.keychainService}"''}
       ${lib.optionalString (cred.filePath != null) ''file_path = "${cred.filePath}"''}
       ${lib.optionalString (cred.sourceEnv != null) ''source_env = "${cred.sourceEnv}"''}
-      allowed_host_patterns = [${lib.concatMapStringsSep ", " (p: ''"${p}"'') cred.allowedHostPatterns}]
-      header_format = "${cred.headerFormat}"
+      allowed_host_patterns = [${lib.concatMapStringsSep ", " (p: ''"${escapeToml p}"'') cred.allowedHostPatterns}]
+      header_format = "${escapeToml cred.headerFormat}"
       dummy_token = "${cred.dummyToken}"
     '') (lib.attrValues cfg.credentials)}
     ${lib.optionalString (cfg.gitCredential != null) ''
@@ -77,7 +80,7 @@
       name = "git"
       type = "generic"
       source_env = "${cfg.gitCredential.sourceEnv}"
-      allowed_host_patterns = [${lib.concatMapStringsSep ", " (p: ''"${p}"'') cfg.gitCredential.allowedHostPatterns}]
+      allowed_host_patterns = [${lib.concatMapStringsSep ", " (p: ''"${escapeToml p}"'') cfg.gitCredential.allowedHostPatterns}]
       header_format = "token {token}"
       dummy_token = "DUMMY_GIT_TOKEN"
     ''}
