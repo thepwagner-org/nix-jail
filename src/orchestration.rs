@@ -456,9 +456,14 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         }
     };
 
-    // Create tmp directory for the job
+    // Create tmp directory for the job (must be world-writable for DynamicUser)
     let tmp_dir = workspace_dir.join("tmp");
     let _ = std::fs::create_dir_all(&tmp_dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o777));
+    }
 
     // Configure execution environment
     let mut env = build_environment(
@@ -1343,9 +1348,14 @@ pub async fn execute_local(
     .await?;
 
     // Phase 5: Build environment
-    // Create tmp directory for the job
+    // Create tmp directory for the job (must be world-writable for DynamicUser)
     let tmp_dir = config.working_dir.join("tmp");
     let _ = std::fs::create_dir_all(&tmp_dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o777));
+    }
 
     let mut env = build_environment(
         proxy.as_ref(),
