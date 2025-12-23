@@ -495,6 +495,12 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         if !lib_path.is_empty() {
             let _ = env.insert("LIBRARY_PATH".to_string(), lib_path);
         }
+
+        // Set PKG_CONFIG_PATH for pkg-config to find .pc files (e.g., openssl.pc)
+        let pkg_config_path = workspace::build_pkg_config_path_env(&store_paths);
+        if !pkg_config_path.is_empty() {
+            let _ = env.insert("PKG_CONFIG_PATH".to_string(), pkg_config_path);
+        }
     }
 
     // Configure credentials (Claude Code, GitHub token)
@@ -1380,6 +1386,12 @@ pub async fn execute_local(
         let lib_path = workspace::build_library_path_env(&store_paths);
         if !lib_path.is_empty() {
             let _ = env.insert("LIBRARY_PATH".to_string(), lib_path);
+        }
+
+        // Set PKG_CONFIG_PATH for pkg-config to find .pc files (e.g., openssl.pc)
+        let pkg_config_path = workspace::build_pkg_config_path_env(&store_paths);
+        if !pkg_config_path.is_empty() {
+            let _ = env.insert("PKG_CONFIG_PATH".to_string(), pkg_config_path);
         }
     }
 

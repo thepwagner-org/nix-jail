@@ -564,3 +564,19 @@ pub fn build_library_path_env(store_paths: &[PathBuf]) -> String {
         .collect::<Vec<_>>()
         .join(":")
 }
+
+/// Build PKG_CONFIG_PATH from store paths (for pkg-config to find .pc files)
+pub fn build_pkg_config_path_env(store_paths: &[PathBuf]) -> String {
+    store_paths
+        .iter()
+        .filter_map(|p| {
+            let pkgconfig = p.join("lib/pkgconfig");
+            if pkgconfig.exists() {
+                Some(pkgconfig.display().to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(":")
+}
