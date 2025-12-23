@@ -158,6 +158,11 @@ in {
       });
     '';
 
+    # Create /var/run/netns with nix-jail group write access for network namespaces
+    systemd.tmpfiles.rules = [
+      "d /var/run/netns 0775 root nix-jail -"
+    ];
+
     # Allow proxy port from nix-jail network namespaces (vp-* veth interfaces)
     networking.firewall.interfaces."vp-+".allowedTCPPorts = [3128];
 
