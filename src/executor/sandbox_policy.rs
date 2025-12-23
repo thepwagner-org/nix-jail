@@ -120,6 +120,11 @@ pub fn generate_profile_with_cache(
     profile.push_str("(allow file-read-metadata (literal \"/usr/bin\"))\n");
     profile.push_str("(allow file-read-data (literal \"/usr/bin\"))\n");
 
+    // xcrun for SDK lookup (needed by rustc linker)
+    profile.push_str("(allow file-read* (literal \"/usr/bin/xcrun\"))\n");
+    profile.push_str("(allow process-exec* (literal \"/usr/bin/xcrun\"))\n");
+    profile.push_str("(allow file-read* (literal \"/private/var/db/xcode_select_link\"))\n");
+
     // No keychain access needed - security wrapper returns pre-fetched credentials
     profile.push('\n');
 
@@ -228,6 +233,7 @@ pub fn generate_profile_with_cache(
     profile.push_str("(allow file-read* (subpath \"/System/Library\"))\n");
     profile.push_str("(allow file-read* (subpath \"/System/Volumes/Preboot/Cryptexes\"))\n");
     profile.push_str("(allow file-read* (subpath \"/Library/Apple\"))\n");
+    profile.push_str("(allow file-read* (subpath \"/Library/Developer\"))\n"); // CommandLineTools SDK for xcrun
     profile.push_str("(allow file-read* (subpath \"/Library/Preferences\"))\n");
 
     // Network restrictions - localhost only (for MITM proxy)
