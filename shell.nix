@@ -7,6 +7,5 @@ pkgs.mkShell {
     protobuf
     pkg-config
     perl
-    claude-code
   ];
 }
