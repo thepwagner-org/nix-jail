@@ -688,7 +688,7 @@ impl Executor for SystemdExecutor {
             // Normalize workspace-relative paths to chroot paths
             let normalized_value = if matches!(
                 key.as_str(),
-                "HOME" | "SSL_CERT_FILE" | "NODE_EXTRA_CA_CERTS" | "REQUESTS_CA_BUNDLE"
+                "HOME" | "SSL_CERT_FILE" | "NODE_EXTRA_CA_CERTS" | "REQUESTS_CA_BUNDLE" | "TMPDIR"
             ) {
                 // Convert host workspace paths to chroot-relative paths
                 let path = PathBuf::from(value);
