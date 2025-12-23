@@ -1,10 +1,10 @@
 //! Pull request creation using GitHub API
 //!
 //! This module provides functions to create pull requests on GitHub
-//! using the octocrab library.
+//! using direct HTTP requests.
 
 use super::WorkspaceError;
-use octocrab::Octocrab;
+use serde::{Deserialize, Serialize};
 
 /// Parse a GitHub URL into (owner, repo) components
 ///
@@ -38,6 +38,19 @@ fn parse_github_url(url: &str) -> Result<(String, String), WorkspaceError> {
     )))
 }
 
+#[derive(Serialize)]
+struct CreatePullRequest {
+    title: String,
+    head: String,
+    base: String,
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct PullRequestResponse {
+    html_url: String,
+}
+
 /// Create a pull request on GitHub
 ///
 /// # Arguments
@@ -67,17 +80,6 @@ pub async fn create_pull_request(
         "creating pull request"
     );
 
-    // Initialize octocrab with token
-    let octocrab = Octocrab::builder()
-        .personal_token(github_token.to_string())
-        .build()
-        .map_err(|e| {
-            WorkspaceError::IoError(std::io::Error::other(format!(
-                "Failed to build octocrab client: {}",
-                e
-            )))
-        })?;
-
     // Generate title from first commit
     let title = if commits.is_empty() {
         "Auto-PR: Changes from nix-jail".to_string()
@@ -101,31 +103,51 @@ pub async fn create_pull_request(
         commit_list
     );
 
-    // Create PR
-    let pr = octocrab
-        .pulls(&owner, &repo)
-        .create(title, head_branch, base_branch)
-        .body(body)
+    let request_body = CreatePullRequest {
+        title,
+        head: head_branch.to_string(),
+        base: base_branch.to_string(),
+        body,
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "https://api.github.com/repos/{}/{}/pulls",
+            owner, repo
+        ))
+        .header("Authorization", format!("Bearer {}", github_token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "nix-jail")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&request_body)
         .send()
         .await
         .map_err(|e| {
             WorkspaceError::IoError(std::io::Error::other(format!(
-                "Failed to create pull request: {}",
+                "Failed to send pull request: {}",
                 e
             )))
         })?;
 
-    let pr_url = pr
-        .html_url
-        .ok_or_else(|| {
-            WorkspaceError::IoError(std::io::Error::other(
-                "Pull request created but no HTML URL returned",
-            ))
-        })?
-        .to_string();
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(WorkspaceError::IoError(std::io::Error::other(format!(
+            "GitHub API error {}: {}",
+            status, body
+        ))));
+    }
 
-    tracing::info!(pr_url = %pr_url, "Pull request created successfully");
-    Ok(pr_url)
+    let pr: PullRequestResponse = response.json().await.map_err(|e| {
+        WorkspaceError::IoError(std::io::Error::other(format!(
+            "Failed to parse pull request response: {}",
+            e
+        )))
+    })?;
+
+    tracing::info!(pr_url = %pr.html_url, "Pull request created successfully");
+    Ok(pr.html_url)
 }
 
 #[cfg(test)]

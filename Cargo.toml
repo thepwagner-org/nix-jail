@@ -79,8 +79,7 @@ nix = { version = "0.30", features = ["signal", "term"] }
 moka = { version = "0.12", features = ["future", "sync"] }
 tokio-retry = "0.3"
 git2 = { version = "0.20.2", features = ["https", "vendored-openssl", "vendored-libgit2"] }
-octocrab = "0.48"
-hyper-tls = "0.6"  # Required for octocrab build script (even if unused)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 thiserror = "2.0"
 portable-pty = "0.9"
 
