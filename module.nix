@@ -141,6 +141,9 @@ in {
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [cfg.package];
 
+    # Allow proxy port from nix-jail network namespaces (vp-* veth interfaces)
+    networking.firewall.interfaces."vp-+".allowedTCPPorts = [3128];
+
     systemd.services.nixjaild = {
       description = "nix-jail sandbox daemon";
       wantedBy = ["multi-user.target"];
