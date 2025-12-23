@@ -9,12 +9,22 @@
 
 use std::path::{Path, PathBuf};
 
+/// Cache directories configuration for sandbox profile
+#[derive(Debug, Default)]
+pub struct CachePaths {
+    /// CARGO_HOME directory (shared registry/git deps)
+    pub cargo_home: Option<PathBuf>,
+    /// CARGO_TARGET_DIR directory (per-repo build artifacts)
+    pub target_dir: Option<PathBuf>,
+}
+
 /// Generate a Sandbox Profile Language (SBPL) profile for macOS sandbox-exec
 ///
 /// Creates a profile that restricts filesystem access to:
 /// - The Nix store paths in the derivation closure (read-only)
 /// - The workspace directory (read-write)
 /// - The job root directory (for CA cert access when using proxy)
+/// - Cache directories for Cargo (read-write, if configured)
 /// - Essential macOS system resources (metadata, sysctls)
 /// - Network access only to the specified proxy port on localhost (if proxy_port is Some)
 ///
@@ -23,11 +33,23 @@ use std::path::{Path, PathBuf};
 /// - Explicitly silences expected denials to reduce log noise
 /// - Grants minimal permissions required for Nix builds
 /// - When proxy_port is None, network access is completely blocked
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn generate_profile(
     closure_paths: &[PathBuf],
     workspace_path: &Path,
     root_dir: &Path,
     proxy_port: Option<u16>,
+) -> String {
+    generate_profile_with_cache(closure_paths, workspace_path, root_dir, proxy_port, None)
+}
+
+/// Generate sandbox profile with optional cache directories
+pub fn generate_profile_with_cache(
+    closure_paths: &[PathBuf],
+    workspace_path: &Path,
+    root_dir: &Path,
+    proxy_port: Option<u16>,
+    cache_paths: Option<&CachePaths>,
 ) -> String {
     let mut profile = String::from("(version 1)\n");
     profile.push_str("(deny default)\n\n");
@@ -133,6 +155,28 @@ pub fn generate_profile(
             "(allow file-read* (subpath \"{}\"))\n\n",
             root_dir.display()
         ));
+    }
+
+    // Allow cache directory access (read-write for Cargo registry and build artifacts)
+    if let Some(cache) = cache_paths {
+        if cache.cargo_home.is_some() || cache.target_dir.is_some() {
+            profile.push_str(";; Cargo cache directories (read-write)\n");
+        }
+        if let Some(cargo_home) = &cache.cargo_home {
+            profile.push_str(&format!(
+                "(allow file-read* file-write* (subpath \"{}\"))\n",
+                cargo_home.display()
+            ));
+        }
+        if let Some(target_dir) = &cache.target_dir {
+            profile.push_str(&format!(
+                "(allow file-read* file-write* (subpath \"{}\"))\n",
+                target_dir.display()
+            ));
+        }
+        if cache.cargo_home.is_some() || cache.target_dir.is_some() {
+            profile.push('\n');
+        }
     }
 
     // Essential macOS permissions

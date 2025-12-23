@@ -286,54 +286,6 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         }
     };
 
-    // Discover and copy cache artifacts from flake (e.g., pre-compiled Cargo deps)
-    {
-        let cache_paths = workspace::discover_cache_paths(&workspace_dir)
-            .instrument(tracing::info_span!("discover_cache"))
-            .await;
-
-        if !cache_paths.is_empty() {
-            log_sink.info(
-                &job_id,
-                &format!("Discovered {} cache artifact(s) from flake", cache_paths.len()),
-            );
-
-            for (src, dest) in &cache_paths {
-                let dest_path = workspace_dir.join(dest);
-                log_sink.info(
-                    &job_id,
-                    &format!("Copying cache: {} → {}", src.display(), dest),
-                );
-
-                match workspace::copy_tree_cow(src, &dest_path)
-                    .instrument(tracing::info_span!("copy_cache", src = %src.display(), dest = %dest))
-                    .await
-                {
-                    Ok(()) => {
-                        tracing::info!(
-                            src = %src.display(),
-                            dest = %dest_path.display(),
-                            "cache artifact copied"
-                        );
-                    }
-                    Err(e) => {
-                        // Cache copy failure is non-fatal - just log and continue
-                        tracing::warn!(
-                            src = %src.display(),
-                            dest = %dest_path.display(),
-                            error = %e,
-                            "failed to copy cache artifact (continuing without cache)"
-                        );
-                        log_sink.info(
-                            &job_id,
-                            &format!("Warning: Could not copy cache ({}), building from scratch", e),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     // Detect flake source (local flake.nix or .envrc with use flake)
     let flake_source = workspace::flake::detect_flake_source(&workspace_dir);
 
@@ -576,6 +528,13 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         }
     };
 
+    // Compute repo hash for cache isolation
+    let repo_hash = if !repo.is_empty() {
+        Some(hash_repo(&repo))
+    } else {
+        None
+    };
+
     let exec_config = ExecutionConfig {
         job_id: job_id.clone(),
         command,
@@ -589,6 +548,11 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         hardening_profile,
         interactive,
         pty_size: None, // Server mode uses WebSocket for terminal size
+        // Cache configuration
+        repo_hash,
+        cache_enabled: config.cache.enabled,
+        cargo_home: config.cache.cargo_home.clone(),
+        target_cache_dir: config.cache.target_cache_dir.clone(),
     };
 
     // Execute job using platform-specific executor (created earlier)
@@ -813,6 +777,16 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
 }
 
 // Helper functions
+
+/// Compute a SHA256 hash of a repo URL for cache isolation
+fn hash_repo(repo: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(repo.as_bytes());
+    let result = hasher.finalize();
+    // Return first 12 characters of hex digest
+    format!("{:x}", result)[..12].to_string()
+}
 
 fn build_environment(
     proxy: Option<&ProxyManager>,
@@ -1410,6 +1384,7 @@ pub async fn execute_local(
     );
 
     // Phase 6: Execute
+    // Note: Local execution doesn't have repo context, so no cache isolation
     let exec_config = ExecutionConfig {
         job_id: job_id.clone(),
         command: config.command,
@@ -1423,6 +1398,11 @@ pub async fn execute_local(
         hardening_profile: config.hardening_profile,
         interactive: config.interactive,
         pty_size: config.pty_size,
+        // Cache disabled for local execution (no repo context)
+        repo_hash: None,
+        cache_enabled: false,
+        cargo_home: None,
+        target_cache_dir: None,
     };
 
     let handle = async {

@@ -60,12 +60,46 @@ impl Executor for SandboxExecutor {
                 .root_dir
                 .canonicalize()
                 .unwrap_or_else(|_| config.root_dir.clone());
-            let profile = super::sandbox_policy::generate_profile(
+
+            // Set up cache paths for sandbox profile (if caching enabled)
+            let cache_paths = if config.cache_enabled {
+                let target_dir = match (&config.target_cache_dir, &config.repo_hash) {
+                    (Some(base), Some(hash)) => {
+                        let dir = base.join(&hash[..12.min(hash.len())]);
+                        // Ensure the target cache directory exists
+                        if let Err(e) = std::fs::create_dir_all(&dir) {
+                            tracing::warn!(path = %dir.display(), error = %e, "failed to create target cache dir");
+                        }
+                        Some(dir)
+                    }
+                    _ => None,
+                };
+                Some(super::sandbox_policy::CachePaths {
+                    cargo_home: config.cargo_home.clone(),
+                    target_dir,
+                })
+            } else {
+                None
+            };
+
+            let profile = super::sandbox_policy::generate_profile_with_cache(
                 closure,
                 &canonical_workspace,
                 &canonical_root,
                 config.proxy_port,
+                cache_paths.as_ref(),
             );
+
+            // Build environment with cache variables
+            let mut env = config.env.clone();
+            if let Some(ref cache) = cache_paths {
+                if let Some(ref cargo_home) = cache.cargo_home {
+                    let _ = env.insert("CARGO_HOME".to_string(), cargo_home.display().to_string());
+                }
+                if let Some(ref target_dir) = cache.target_dir {
+                    let _ = env.insert("CARGO_TARGET_DIR".to_string(), target_dir.display().to_string());
+                }
+            }
 
             // Debug: log profile content
             tracing::debug!(job_id = %config.job_id, "Generated sandbox profile:\n{}", profile);
@@ -97,7 +131,7 @@ impl Executor for SandboxExecutor {
                 .args(&resolved_command)
                 .current_dir(&config.working_dir)
                 .env_clear()
-                .envs(&config.env)
+                .envs(&env)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true)

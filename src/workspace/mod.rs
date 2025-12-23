@@ -1,6 +1,5 @@
 pub mod cache;
 pub mod config;
-pub mod copy;
 pub mod flake;
 pub mod git;
 pub mod git_refs;
@@ -12,7 +11,6 @@ pub mod pr;
 // Re-export everything from submodules for backward compatibility
 pub use self::cache::*;
 pub use self::config::*;
-pub use self::copy::*;
 pub use self::flake::*;
 pub use self::git::*;
 pub use self::git_refs::*;

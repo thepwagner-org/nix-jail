@@ -7,6 +7,12 @@ state_dir = "/tmp/nix-jail"
 store_strategy = "bind-mount"  # Use store paths directly (no copy needed for sandbox-exec)
 otlp_endpoint = "https://tempo.pwagner.net:4317"
 
+# Cargo build caching (Swatinem/rust-cache pattern)
+[cache]
+enabled = true
+cargo_home = "/tmp/nix-jail/cargo"          # Shared registry + git deps
+target_cache_dir = "/tmp/nix-jail/targets"  # Per-repo build artifacts
+
 # Git credential for private repository access
 [[credentials]]
 name = "forgejo"

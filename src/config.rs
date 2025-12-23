@@ -20,6 +20,8 @@ pub struct ServerConfig {
     /// Path to existing monorepo clone for sparse checkout support
     /// If set, uses this as the source for workspace clones instead of fetching fresh
     pub monorepo_path: Option<PathBuf>,
+    /// Cargo/build cache configuration
+    pub cache: CacheConfig,
 }
 
 /// Type of credential for determining setup requirements
@@ -76,6 +78,31 @@ pub enum CredentialSource {
     File { file_path: String },
 }
 
+/// Configuration for Cargo/build caching
+///
+/// Enables persistent caching of Cargo dependencies and build artifacts.
+/// Works differently depending on the executor:
+/// - Docker: Uses named Docker volumes for isolation and performance
+/// - macOS sandbox/systemd: Uses host paths with appropriate permissions
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CacheConfig {
+    /// Enable Cargo caching (default: true)
+    #[serde(default = "default_cache_enabled")]
+    pub enabled: bool,
+
+    /// Host path for CARGO_HOME (macOS sandbox, systemd executors only)
+    /// Docker uses named volumes instead (nix-jail-cargo)
+    pub cargo_home: Option<PathBuf>,
+
+    /// Host path base for per-repo target caches (macOS sandbox, systemd executors only)
+    /// Docker uses named volumes instead (nix-jail-target-{repo_hash})
+    pub target_cache_dir: Option<PathBuf>,
+}
+
+fn default_cache_enabled() -> bool {
+    true
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         let state_dir = PathBuf::from("/var/lib/nix-jail");
@@ -89,6 +116,7 @@ impl Default for ServerConfig {
             store_strategy: StoreStrategy::default(),
             otlp_endpoint: None,
             monorepo_path: None,
+            cache: CacheConfig::default(),
         }
     }
 }
@@ -219,6 +247,8 @@ struct ServerConfigFile {
     server: ServerSection,
     #[serde(default)]
     credentials: Vec<Credential>,
+    #[serde(default)]
+    cache: CacheConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,6 +328,7 @@ impl ServerConfig {
             store_strategy,
             otlp_endpoint: config.server.otlp_endpoint,
             monorepo_path: config.server.monorepo_path.map(PathBuf::from),
+            cache: config.cache,
         })
     }
 

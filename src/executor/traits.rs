@@ -119,6 +119,18 @@ pub struct ExecutionConfig {
     pub interactive: bool,
     /// Terminal size for PTY mode (rows, cols)
     pub pty_size: Option<(u16, u16)>,
+
+    // Cache configuration
+    /// Hash of repo URL for cache isolation (first 12 chars of SHA256)
+    pub repo_hash: Option<String>,
+    /// Whether Cargo caching is enabled
+    pub cache_enabled: bool,
+    /// Host path for CARGO_HOME (macOS sandbox, systemd only)
+    /// Docker uses named volumes instead
+    pub cargo_home: Option<PathBuf>,
+    /// Host path for per-repo target cache (macOS sandbox, systemd only)
+    /// Docker uses named volumes instead
+    pub target_cache_dir: Option<PathBuf>,
 }
 
 /// I/O handle for job execution

@@ -232,6 +232,24 @@ fn add_filesystem_mounts(cmd: &mut Command, config: &ExecutionConfig) {
             ca_cert_path.display()
         ));
     }
+
+    // Cargo cache volumes (Docker uses named volumes for performance)
+    if config.cache_enabled {
+        if let Some(ref repo_hash) = config.repo_hash {
+            // Shared CARGO_HOME volume (registry, git deps)
+            let _ = cmd.arg("-v").arg("nix-jail-cargo:/cargo");
+
+            // Per-repo target cache volume (keyed by first 12 chars of repo hash)
+            let target_volume = format!("nix-jail-target-{}", &repo_hash[..12.min(repo_hash.len())]);
+            let _ = cmd.arg("-v").arg(format!("{}:/target", target_volume));
+
+            tracing::debug!(
+                cargo_volume = "nix-jail-cargo",
+                target_volume = %target_volume,
+                "configured cargo cache volumes"
+            );
+        }
+    }
 }
 
 /// Resolve command paths from the Nix closure
@@ -326,6 +344,12 @@ impl Executor for DockerExecutor {
         // Environment variables
         // Set TERM=dumb to prevent ANSI escape codes
         let _ = cmd.arg("-e").arg("TERM=dumb");
+
+        // Cargo cache environment variables (if cache volumes are mounted)
+        if config.cache_enabled && config.repo_hash.is_some() {
+            let _ = cmd.arg("-e").arg("CARGO_HOME=/cargo");
+            let _ = cmd.arg("-e").arg("CARGO_TARGET_DIR=/target");
+        }
 
         for (key, value) in &config.env {
             let _ = cmd.arg("-e").arg(format!("{}={}", key, value));
