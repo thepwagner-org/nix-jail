@@ -123,7 +123,7 @@ pub fn init_tracing(
         tracing::warn!(error = %error, "failed to initialize opentelemetry, using console only");
     } else if let Some(endpoint) = otlp_endpoint {
         if provider.is_some() {
-            tracing::info!(endpoint = %endpoint, "opentelemetry export enabled");
+            tracing::debug!(endpoint = %endpoint, "opentelemetry export enabled");
         }
     }
 

@@ -179,8 +179,10 @@ in {
           User = "nix-jail";
           Group = "nix-jail";
           # Capabilities needed for network namespace creation
-          AmbientCapabilities = ["CAP_NET_ADMIN"];
-          CapabilityBoundingSet = ["CAP_NET_ADMIN"];
+          # CAP_NET_ADMIN: create/configure network namespaces
+          # CAP_SYS_ADMIN: mount bind for /var/run/netns/<ns>
+          AmbientCapabilities = ["CAP_NET_ADMIN" "CAP_SYS_ADMIN"];
+          CapabilityBoundingSet = ["CAP_NET_ADMIN" "CAP_SYS_ADMIN"];
         }
         // lib.optionalAttrs (cfg.environmentFile != null) {
           EnvironmentFile = cfg.environmentFile;
