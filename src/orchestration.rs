@@ -739,8 +739,8 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
     // internally by each executor implementation when the job exits.
 
     // Read proxy stats from file (written by proxy on shutdown)
-    let stats_path = ProxyManager::ca_cert_host_path(&job_dir.root)
-        .with_file_name("proxy-stats.json");
+    let stats_path =
+        ProxyManager::ca_cert_host_path(&job_dir.root).with_file_name("proxy-stats.json");
     if let Ok(contents) = std::fs::read_to_string(&stats_path) {
         if let Ok(stats) = serde_json::from_str::<ProxyStatsSummary>(&contents) {
             let approved_total: u64 = stats.approved.iter().map(|(_, c)| c).sum();
@@ -1631,8 +1631,8 @@ pub async fn execute_local(
     }
 
     // Read proxy stats from file (written by proxy on shutdown)
-    let stats_path = ProxyManager::ca_cert_host_path(&job_dir.root)
-        .with_file_name("proxy-stats.json");
+    let stats_path =
+        ProxyManager::ca_cert_host_path(&job_dir.root).with_file_name("proxy-stats.json");
     if let Ok(contents) = std::fs::read_to_string(&stats_path) {
         if let Ok(stats) = serde_json::from_str::<ProxyStatsSummary>(&contents) {
             let approved_total: u64 = stats.approved.iter().map(|(_, c)| c).sum();

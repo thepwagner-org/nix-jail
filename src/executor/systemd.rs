@@ -1039,6 +1039,10 @@ mod tests {
             hardening_profile: HardeningProfile::Default,
             interactive: false,
             pty_size: None,
+            repo_hash: None,
+            cache_enabled: false,
+            cargo_home: None,
+            target_cache_dir: None,
         };
 
         let props = generate_hardening_properties(
@@ -1150,6 +1154,10 @@ mod tests {
             hardening_profile: HardeningProfile::Default,
             interactive: false,
             pty_size: None,
+            repo_hash: None,
+            cache_enabled: false,
+            cargo_home: None,
+            target_cache_dir: None,
         };
 
         let props = generate_hardening_properties(
@@ -1359,6 +1367,10 @@ mod tests {
             hardening_profile: HardeningProfile::Default,
             interactive: false,
             pty_size: None,
+            repo_hash: None,
+            cache_enabled: false,
+            cargo_home: None,
+            target_cache_dir: None,
         };
 
         let props_default = generate_hardening_properties(
@@ -1388,6 +1400,10 @@ mod tests {
             hardening_profile: HardeningProfile::JitRuntime,
             interactive: false,
             pty_size: None,
+            repo_hash: None,
+            cache_enabled: false,
+            cargo_home: None,
+            target_cache_dir: None,
         };
 
         let props_jit = generate_hardening_properties(
@@ -1449,6 +1465,10 @@ mod tests {
             hardening_profile: HardeningProfile::Default,
             interactive: false,
             pty_size: None,
+            repo_hash: None,
+            cache_enabled: false,
+            cargo_home: None,
+            target_cache_dir: None,
         };
 
         let executor = SystemdExecutor::new();
