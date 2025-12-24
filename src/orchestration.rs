@@ -437,6 +437,12 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
     };
     let _ = cache_hit; // Silence unused warning, info logged above
 
+    // Create FHS-compatible symlinks (/bin/sh, /usr/bin/env) for scripts with shebangs
+    if let Err(e) = crate::executor::exec::create_fhs_symlinks(&job_dir.root, &closure) {
+        log_sink.error(&job_id, &format!("Failed to create FHS symlinks: {}", e));
+        // Non-fatal: continue execution, scripts might still work
+    }
+
     // Phase 2: Start proxy now that root exists (proxy writes cert to root/etc/ssl/certs/)
     let mut proxy = match start_proxy_if_configured(
         &job_id,
@@ -1396,6 +1402,12 @@ pub async fn execute_local(
         }
     };
     log_sink.info(&job_id, &msg);
+
+    // Create FHS-compatible symlinks (/bin/sh, /usr/bin/env) for scripts with shebangs
+    if let Err(e) = crate::executor::exec::create_fhs_symlinks(&job_dir.root, &closure) {
+        log_sink.error(&job_id, &format!("Failed to create FHS symlinks: {}", e));
+        // Non-fatal: continue execution, scripts might still work
+    }
 
     // Phase 4: Start proxy if configured
     let mut proxy = start_proxy_if_configured(

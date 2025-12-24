@@ -8,7 +8,7 @@
 //! Use `create_executor()` to get the platform default, or `create_executor_with_type()`
 //! for explicit backend selection.
 
-mod exec;
+pub mod exec;
 mod traits;
 mod types;
 
