@@ -7,5 +7,6 @@ pkgs.mkShell {
     protobuf
     pkg-config
     perl
+    openssl
   ];
 }
