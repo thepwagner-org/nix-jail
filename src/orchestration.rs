@@ -20,6 +20,7 @@ use crate::jail::{LogEntry, LogSource, NetworkPolicy};
 use crate::job_dir::JobDirectory;
 use crate::job_workspace::JobWorkspace;
 use crate::log_sink::{format_info, LogSink, StorageLogSink};
+use crate::proxy::ProxyStatsSummary;
 use crate::proxy_manager::ProxyManager;
 use crate::root::JobRoot;
 use crate::storage::{JobMetadata, JobStatus, JobStorage, LogEntry as StorageLogEntry};
@@ -736,6 +737,23 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
 
     // Note: Executor cleanup (sandbox profile, network namespace, etc.) is handled
     // internally by each executor implementation when the job exits.
+
+    // Read proxy stats from file (written by proxy on shutdown)
+    let stats_path = ProxyManager::ca_cert_host_path(&job_dir.root)
+        .with_file_name("proxy-stats.json");
+    if let Ok(contents) = std::fs::read_to_string(&stats_path) {
+        if let Ok(stats) = serde_json::from_str::<ProxyStatsSummary>(&contents) {
+            let approved_total: u64 = stats.approved.iter().map(|(_, c)| c).sum();
+            let denied_total: u64 = stats.denied.iter().map(|(_, c)| c).sum();
+            log_sink.info(
+                &job_id,
+                &format!(
+                    "Proxy stats: {} approved, {} denied",
+                    approved_total, denied_total
+                ),
+            );
+        }
+    }
 
     let final_status = if exit_code == 0 {
         JobStatus::Completed
@@ -1610,6 +1628,23 @@ pub async fn execute_local(
         let _ = tokio::join!(stdout_task, stderr_task, pout, perr);
     } else {
         let _ = tokio::join!(stdout_task, stderr_task);
+    }
+
+    // Read proxy stats from file (written by proxy on shutdown)
+    let stats_path = ProxyManager::ca_cert_host_path(&job_dir.root)
+        .with_file_name("proxy-stats.json");
+    if let Ok(contents) = std::fs::read_to_string(&stats_path) {
+        if let Ok(stats) = serde_json::from_str::<ProxyStatsSummary>(&contents) {
+            let approved_total: u64 = stats.approved.iter().map(|(_, c)| c).sum();
+            let denied_total: u64 = stats.denied.iter().map(|(_, c)| c).sum();
+            log_sink.info(
+                &job_id,
+                &format!(
+                    "Proxy stats: {} approved, {} denied",
+                    approved_total, denied_total
+                ),
+            );
+        }
     }
 
     log_sink.done(&job_id, exit_code);
