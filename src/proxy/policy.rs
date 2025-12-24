@@ -484,6 +484,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_host_match_with_credential() {
         let policy = NetworkPolicy {
             rules: vec![NetworkRule {
@@ -516,6 +517,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_host_match_with_path() {
         let policy = NetworkPolicy {
             rules: vec![NetworkRule {
@@ -549,6 +551,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_host_no_match() {
         let policy = NetworkPolicy {
             rules: vec![NetworkRule {
@@ -575,6 +578,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_first_match_wins() {
         let policy = NetworkPolicy {
             rules: vec![
@@ -641,6 +645,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_default_deny() {
         let policy = NetworkPolicy { rules: vec![] };
 
@@ -657,6 +662,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_allow_all_with_catchall_rule() {
         // Allow-all now requires an explicit catch-all rule
         let policy = NetworkPolicy {
@@ -693,6 +699,7 @@ mod tests {
     // Multi-rule interaction tests
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_multiple_credentials_different_paths() {
         let policy = NetworkPolicy {
             rules: vec![
@@ -757,6 +764,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_overlapping_host_patterns() {
         let policy = NetworkPolicy {
             rules: vec![
@@ -810,6 +818,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_deny_before_allow() {
         // Test that deny rules can block even if later rules would allow
         let policy = NetworkPolicy {
@@ -862,6 +871,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_allow_without_credential() {
         // Test that allow rules can work without credentials
         let policy = NetworkPolicy {
@@ -894,6 +904,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_mixed_ip_and_host_rules() {
         // Test interaction between IP-based and hostname-based rules
         let policy = NetworkPolicy {
@@ -963,6 +974,7 @@ mod tests {
     // Path matching edge case tests
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_path_none_vs_empty() {
         let policy = NetworkPolicy {
             rules: vec![NetworkRule {
@@ -1003,6 +1015,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_path_root_slash() {
         let policy = NetworkPolicy {
             rules: vec![NetworkRule {
@@ -1043,6 +1056,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_path_trailing_slash() {
         let policy = NetworkPolicy {
             rules: vec![NetworkRule {
@@ -1076,6 +1090,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_path_double_slash() {
         // Test that paths with double slashes are handled as-is (no normalization)
         let policy = NetworkPolicy {
@@ -1110,6 +1125,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_path_with_query_string() {
         let policy = NetworkPolicy {
             rules: vec![NetworkRule {
@@ -1143,6 +1159,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_path_with_fragment() {
         // Test paths with fragments (anchors)
         let policy = NetworkPolicy {
@@ -1177,6 +1194,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_path_case_sensitive() {
         // Paths are case-sensitive by default
         let policy = NetworkPolicy {
@@ -1211,6 +1229,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires DNS resolution
     async fn test_policy_path_special_chars() {
         // Test path with URL-encoded or special characters
         let policy = NetworkPolicy {
