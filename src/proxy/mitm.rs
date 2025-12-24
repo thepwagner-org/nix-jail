@@ -170,11 +170,20 @@ pub async fn start_server(
             // Handle SIGTERM
             _ = sigterm.recv() => {
                 tracing::debug!("received sigterm, shutting down proxy");
+                // Write stats to file for orchestrator to read after job completes
+                let stats_path = ca_cert_path.with_file_name("proxy-stats.json");
+                if let Err(e) = state.stats.write_to_file(&stats_path) {
+                    tracing::warn!("failed to write proxy stats: {}", e);
+                }
                 return Ok(());
             }
             // Handle SIGINT (Ctrl+C)
             _ = sigint.recv() => {
                 tracing::debug!("received sigint, shutting down proxy");
+                let stats_path = ca_cert_path.with_file_name("proxy-stats.json");
+                if let Err(e) = state.stats.write_to_file(&stats_path) {
+                    tracing::warn!("failed to write proxy stats: {}", e);
+                }
                 return Ok(());
             }
             // Accept new connections

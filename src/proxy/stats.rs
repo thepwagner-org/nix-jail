@@ -1,5 +1,14 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
+
+/// Serializable proxy statistics for file output
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyStatsSummary {
+    pub approved: Vec<(String, u64)>,
+    pub denied: Vec<(String, u64)>,
+}
 
 /// Thread-safe statistics tracking for proxy requests
 #[derive(Debug, Default)]
@@ -35,28 +44,29 @@ impl ProxyStats {
         is_first
     }
 
-    /// Log summary statistics as a structured log message.
-    /// This should be called on shutdown (SIGTERM/SIGINT).
-    pub fn log_summary(&self) {
-        // Safety: mutex poisoning should panic - indicates another thread panicked
+    /// Get summary statistics as a serializable struct
+    pub fn summary(&self) -> ProxyStatsSummary {
         #[allow(clippy::expect_used)]
         let approved = self.approved.lock().expect("operation failed");
         #[allow(clippy::expect_used)]
         let denied = self.denied.lock().expect("operation failed");
 
-        // Convert to sorted Vec for consistent output
-        let mut approved_vec: Vec<_> = approved.iter().collect();
-        approved_vec.sort_by(|a, b| b.1.cmp(a.1)); // Sort by count descending
+        let mut approved_vec: Vec<_> = approved.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        approved_vec.sort_by(|a, b| b.1.cmp(&a.1));
 
-        let mut denied_vec: Vec<_> = denied.iter().collect();
-        denied_vec.sort_by(|a, b| b.1.cmp(a.1)); // Sort by count descending
+        let mut denied_vec: Vec<_> = denied.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        denied_vec.sort_by(|a, b| b.1.cmp(&a.1));
 
-        tracing::info!(
-            approved_total = approved.len(),
-            denied_total = denied.len(),
-            approved = ?approved_vec,
-            denied = ?denied_vec,
-            "Proxy shutdown statistics"
-        );
+        ProxyStatsSummary {
+            approved: approved_vec,
+            denied: denied_vec,
+        }
+    }
+
+    /// Write stats to a JSON file for the orchestrator to read after job completes
+    pub fn write_to_file(&self, path: &Path) -> std::io::Result<()> {
+        let summary = self.summary();
+        let json = serde_json::to_string(&summary)?;
+        std::fs::write(path, json)
     }
 }

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 pub use certs::CertificateAuthority;
 pub use policy::{CompiledPolicy, PolicyDecision};
-pub use stats::ProxyStats;
+pub use stats::{ProxyStats, ProxyStatsSummary};
 
 use crate::config::Credential;
 use crate::jail::NetworkPolicy;
