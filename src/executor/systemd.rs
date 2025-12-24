@@ -216,6 +216,21 @@ fn generate_hardening_properties(
                 target_cache.display()
             ));
         }
+
+        if let Some(ref pnpm_store) = config.pnpm_store {
+            // Bind-mount shared pnpm store
+            if let Err(e) = std::fs::create_dir_all(pnpm_store) {
+                tracing::warn!(path = %pnpm_store.display(), error = %e, "failed to create pnpm store");
+            }
+            // Chown to nix-jail (daemon runs as root, job runs as nix-jail)
+            let _ = std::process::Command::new("chown")
+                .args(["-R", "nix-jail:nix-jail", &pnpm_store.to_string_lossy()])
+                .output();
+            props.push(format!(
+                "--property=BindPaths={}:/pnpm-store",
+                pnpm_store.display()
+            ));
+        }
     }
 
     props
@@ -809,6 +824,10 @@ impl Executor for SystemdExecutor {
             if config.target_cache_dir.is_some() && config.repo_hash.is_some() {
                 let _ = cmd.arg("--setenv").arg("CARGO_TARGET_DIR=/target");
             }
+            if config.pnpm_store.is_some() {
+                let _ = cmd.arg("--setenv").arg("PNPM_HOME=/pnpm-store");
+                let _ = cmd.arg("--setenv").arg("PNPM_STORE_DIR=/pnpm-store/store");
+            }
         }
 
         // Note: HTTP_PROXY and HTTPS_PROXY are already set correctly by build_environment
@@ -1130,6 +1149,7 @@ mod tests {
             cache_enabled: false,
             cargo_home: None,
             target_cache_dir: None,
+            pnpm_store: None,
         };
 
         let props = generate_hardening_properties(
@@ -1245,6 +1265,7 @@ mod tests {
             cache_enabled: false,
             cargo_home: None,
             target_cache_dir: None,
+            pnpm_store: None,
         };
 
         let props = generate_hardening_properties(
@@ -1459,6 +1480,7 @@ mod tests {
             cache_enabled: false,
             cargo_home: None,
             target_cache_dir: None,
+            pnpm_store: None,
         };
 
         let props_default = generate_hardening_properties(
@@ -1492,6 +1514,7 @@ mod tests {
             cache_enabled: false,
             cargo_home: None,
             target_cache_dir: None,
+            pnpm_store: None,
         };
 
         let props_jit = generate_hardening_properties(
@@ -1557,6 +1580,7 @@ mod tests {
             cache_enabled: false,
             cargo_home: None,
             target_cache_dir: None,
+            pnpm_store: None,
         };
 
         let executor = SystemdExecutor::new();

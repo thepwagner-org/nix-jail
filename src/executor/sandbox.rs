@@ -82,9 +82,16 @@ impl Executor for SandboxExecutor {
                     }
                     _ => None,
                 };
+                let pnpm_store = config.pnpm_store.as_ref().and_then(|p| {
+                    if let Err(e) = std::fs::create_dir_all(p) {
+                        tracing::warn!(path = %p.display(), error = %e, "failed to create pnpm store dir");
+                    }
+                    p.canonicalize().ok()
+                });
                 Some(super::sandbox_policy::CachePaths {
                     cargo_home,
                     target_dir,
+                    pnpm_store,
                 })
             } else {
                 None
@@ -108,6 +115,13 @@ impl Executor for SandboxExecutor {
                     let _ = env.insert(
                         "CARGO_TARGET_DIR".to_string(),
                         target_dir.display().to_string(),
+                    );
+                }
+                if let Some(ref pnpm_store) = cache.pnpm_store {
+                    let _ = env.insert("PNPM_HOME".to_string(), pnpm_store.display().to_string());
+                    let _ = env.insert(
+                        "PNPM_STORE_DIR".to_string(),
+                        format!("{}/store", pnpm_store.display()),
                     );
                 }
             }

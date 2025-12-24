@@ -111,6 +111,7 @@ impl TestConfigBuilder {
             cache_enabled: false,
             cargo_home: None,
             target_cache_dir: None,
+            pnpm_store: None,
         }
     }
 }

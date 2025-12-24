@@ -593,6 +593,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         cache_enabled: config.cache.enabled,
         cargo_home: config.cache.cargo_home.clone(),
         target_cache_dir: config.cache.target_cache_dir.clone(),
+        pnpm_store: config.cache.pnpm_store.clone(),
     };
 
     // Execute job using platform-specific executor (created earlier)
@@ -1495,6 +1496,7 @@ pub async fn execute_local(
         cache_enabled: false,
         cargo_home: None,
         target_cache_dir: None,
+        pnpm_store: None,
     };
 
     let handle = async {

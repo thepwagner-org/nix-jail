@@ -16,6 +16,8 @@ pub struct CachePaths {
     pub cargo_home: Option<PathBuf>,
     /// CARGO_TARGET_DIR directory (per-repo build artifacts)
     pub target_dir: Option<PathBuf>,
+    /// PNPM store directory (shared pnpm packages)
+    pub pnpm_store: Option<PathBuf>,
 }
 
 /// Generate a Sandbox Profile Language (SBPL) profile for macOS sandbox-exec
@@ -182,6 +184,13 @@ pub fn generate_profile_with_cache(
         }
         if cache.cargo_home.is_some() || cache.target_dir.is_some() {
             profile.push('\n');
+        }
+        if let Some(pnpm_store) = &cache.pnpm_store {
+            profile.push_str(";; pnpm store directory\n");
+            profile.push_str(&format!(
+                "(allow file-read* file-write* (subpath \"{}\"))\n\n",
+                pnpm_store.display()
+            ));
         }
     }
 

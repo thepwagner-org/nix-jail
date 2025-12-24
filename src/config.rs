@@ -97,6 +97,10 @@ pub struct CacheConfig {
     /// Host path base for per-repo target caches (macOS sandbox, systemd executors only)
     /// Docker uses named volumes instead (nix-jail-target-{repo_hash})
     pub target_cache_dir: Option<PathBuf>,
+
+    /// Host path for pnpm store (macOS sandbox, systemd executors only)
+    /// Docker uses named volumes instead (nix-jail-pnpm)
+    pub pnpm_store: Option<PathBuf>,
 }
 
 fn default_cache_enabled() -> bool {

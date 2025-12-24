@@ -131,6 +131,9 @@ pub struct ExecutionConfig {
     /// Host path for per-repo target cache (macOS sandbox, systemd only)
     /// Docker uses named volumes instead
     pub target_cache_dir: Option<PathBuf>,
+    /// Host path for pnpm store (macOS sandbox, systemd only)
+    /// Docker uses named volumes instead
+    pub pnpm_store: Option<PathBuf>,
 }
 
 /// I/O handle for job execution

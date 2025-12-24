@@ -88,6 +88,7 @@
     enabled = ${lib.boolToString cfg.cache.enable}
     ${lib.optionalString (cfg.cache.cargoHome != null) ''cargo_home = "${cfg.cache.cargoHome}"''}
     ${lib.optionalString (cfg.cache.targetCacheDir != null) ''target_cache_dir = "${cfg.cache.targetCacheDir}"''}
+    ${lib.optionalString (cfg.cache.pnpmStore != null) ''pnpm_store = "${cfg.cache.pnpmStore}"''}
   '';
 in {
   options.services.nix-jail = {
@@ -157,6 +158,11 @@ in {
         default = "/var/lib/nix-jail/target";
         description = "Base directory for per-repo target caches";
       };
+      pnpmStore = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = "/var/lib/nix-jail/pnpm";
+        description = "Shared pnpm store directory";
+      };
     };
   };
 
@@ -183,10 +189,12 @@ in {
     # Create directories with proper permissions
     systemd.tmpfiles.rules = [
       "d /var/run/netns 0775 root nix-jail -"
-    ] ++ lib.optionals cfg.cache.enable [
+    ] ++ lib.optionals cfg.cache.enable ([
       "d ${cfg.cache.cargoHome} 0755 nix-jail nix-jail -"
       "d ${cfg.cache.targetCacheDir} 0755 nix-jail nix-jail -"
-    ];
+    ] ++ lib.optionals (cfg.cache.pnpmStore != null) [
+      "d ${cfg.cache.pnpmStore} 0755 nix-jail nix-jail -"
+    ]);
 
     # Allow proxy port from nix-jail network namespaces (vp-* veth interfaces)
     networking.firewall.interfaces."vp-+".allowedTCPPorts = [3128];
