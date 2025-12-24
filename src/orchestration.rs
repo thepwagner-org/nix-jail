@@ -582,10 +582,12 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         None
     };
 
-    // Resolve cache mounts
-    // TODO: Once forgejo-nix-ci sends cache requests, use resolve_caches() here
-    // For now, return empty (no default caches - clients must specify what they need)
-    let cache_mounts = build_default_cache_mounts(&config, repo_hash.as_deref());
+    // Resolve cache mounts from client request (or empty if none specified)
+    let cache_mounts = if job.caches.is_empty() {
+        build_default_cache_mounts(&config, repo_hash.as_deref())
+    } else {
+        resolve_caches(&job.caches, &config, repo_hash.as_deref())
+    };
 
     let exec_config = ExecutionConfig {
         job_id: job_id.clone(),

@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::jail::LogSource;
-use crate::jail::NetworkPolicy;
+use crate::jail::{CacheRequest, NetworkPolicy};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -67,6 +67,9 @@ pub struct JobMetadata {
     pub hardening_profile: Option<String>,
     #[serde(default)]
     pub push: bool,
+    /// Cache mount requests from the client
+    #[serde(default)]
+    pub caches: Vec<CacheRequest>,
     pub status: JobStatus,
     pub created_at: SystemTime,
     pub completed_at: Option<SystemTime>,
@@ -319,6 +322,7 @@ impl JobStorage {
                     git_ref,
                     hardening_profile,
                     push,
+                    caches: vec![], // Legacy jobs don't have cache requests
                     status: JobStatus::from_string(&status_str)?,
                     created_at: SystemTime::UNIX_EPOCH
                         + std::time::Duration::from_secs(created_at_secs as u64),
@@ -542,6 +546,7 @@ impl JobStorage {
             git_ref,
             hardening_profile,
             push,
+            caches: vec![], // Legacy jobs don't have cache requests
             status,
             created_at,
             completed_at,
@@ -794,6 +799,7 @@ mod tests {
             git_ref: None,
             hardening_profile: None,
             push: false,
+            caches: vec![],
             status: JobStatus::Pending,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -830,6 +836,7 @@ mod tests {
             git_ref: None,
             hardening_profile: None,
             push: false,
+            caches: vec![],
             status: JobStatus::Pending,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -862,6 +869,7 @@ mod tests {
             git_ref: None,
             hardening_profile: None,
             push: false,
+            caches: vec![],
             status: JobStatus::Running,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -908,6 +916,7 @@ mod tests {
             git_ref: None,
             hardening_profile: None,
             push: false,
+            caches: vec![],
             status: JobStatus::Running,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -953,6 +962,7 @@ mod tests {
             git_ref: None,
             hardening_profile: None,
             push: false,
+            caches: vec![],
             status: JobStatus::Pending,
             created_at: SystemTime::now(),
             completed_at: None,

@@ -166,6 +166,7 @@ impl JailService for JailServiceImpl {
             git_ref: req.git_ref.clone(),
             hardening_profile: req.hardening_profile.clone(),
             push: req.push.unwrap_or(false),
+            caches: req.caches.clone(),
             status: JobStatus::Running,
             created_at: SystemTime::now(),
             completed_at: None,
