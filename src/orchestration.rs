@@ -502,14 +502,34 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         // Set LIBRARY_PATH for linkers (rustc/cc) that don't use NIX_LDFLAGS
         let lib_path = workspace::build_library_path_env(&store_paths);
         if !lib_path.is_empty() {
-            let _ = env.insert("LIBRARY_PATH".to_string(), lib_path);
+            let _ = env.insert("LIBRARY_PATH".to_string(), lib_path.clone());
         }
 
         // Set PKG_CONFIG_PATH for pkg-config to find .pc files (e.g., openssl.pc)
         let pkg_config_path = workspace::build_pkg_config_path_env(&store_paths);
         if !pkg_config_path.is_empty() {
-            let _ = env.insert("PKG_CONFIG_PATH".to_string(), pkg_config_path);
+            let _ = env.insert("PKG_CONFIG_PATH".to_string(), pkg_config_path.clone());
         }
+
+        // Log env vars for debugging
+        log_sink.info(
+            &job_id,
+            &format!(
+                "env: PKG_CONFIG_PATH={} paths, LIBRARY_PATH={} paths",
+                pkg_config_path.split(':').filter(|s| !s.is_empty()).count(),
+                lib_path.split(':').filter(|s| !s.is_empty()).count()
+            ),
+        );
+    } else {
+        // Log when env vars are NOT set
+        log_sink.info(
+            &job_id,
+            &format!(
+                "env: skipped (store_paths={}, docker_volume={})",
+                store_paths.len(),
+                matches!(store_setup, crate::root::StoreSetup::DockerVolume { .. })
+            ),
+        );
     }
 
     // Configure credentials (Claude Code, GitHub token)
