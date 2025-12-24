@@ -49,6 +49,9 @@ pub use docker::DockerExecutor;
 #[cfg(target_os = "linux")]
 pub use systemd::SystemdExecutor;
 
+#[cfg(target_os = "linux")]
+pub use systemd::cleanup_stale_network_namespaces;
+
 /// Available executor backends
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExecutorType {

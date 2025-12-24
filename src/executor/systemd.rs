@@ -491,6 +491,76 @@ pub async fn cleanup_network_namespace(job_id: &str) -> Result<(), ExecutorError
     Ok(())
 }
 
+/// Cleans up all stale nix-jail network namespaces from previous daemon runs.
+///
+/// When the daemon restarts, orphaned network namespaces from previous jobs remain
+/// but the in-memory subnet allocator resets to zero. This causes IP conflicts
+/// when new jobs get the same 10.0.0.1/30 subnet as orphaned namespaces.
+///
+/// Call this once at daemon startup before accepting any jobs.
+pub async fn cleanup_stale_network_namespaces() {
+    // List all network namespaces
+    let output = match Command::new("ip")
+        .args(["netns", "list"])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to list network namespaces");
+            return;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut cleaned = 0;
+
+    for line in stdout.lines() {
+        // Format: "nix-jail-JOBID (id: N)" or just "nix-jail-JOBID"
+        let netns_name = match line.split_whitespace().next() {
+            Some(name) if name.starts_with("nix-jail-") => name,
+            _ => continue,
+        };
+
+        // Extract job suffix for veth name
+        let job_id = netns_name.strip_prefix("nix-jail-").unwrap_or("");
+        let job_suffix = if job_id.len() > 8 {
+            &job_id[job_id.len() - 8..]
+        } else {
+            job_id
+        };
+        let veth_proxy = format!("vp-{}", job_suffix);
+
+        // Delete the host-side veth first (if it exists)
+        let _ = Command::new("ip")
+            .args(["link", "delete", &veth_proxy])
+            .status()
+            .await;
+
+        // Delete the namespace (also deletes the job-side veth)
+        match Command::new("ip")
+            .args(["netns", "delete", netns_name])
+            .status()
+            .await
+        {
+            Ok(status) if status.success() => {
+                cleaned += 1;
+                tracing::debug!(netns = netns_name, "deleted stale namespace");
+            }
+            Ok(_) => {
+                tracing::warn!(netns = netns_name, "failed to delete stale namespace");
+            }
+            Err(e) => {
+                tracing::warn!(netns = netns_name, error = %e, "failed to delete stale namespace");
+            }
+        }
+    }
+
+    if cleaned > 0 {
+        tracing::info!(count = cleaned, "cleaned up stale network namespaces");
+    }
+}
+
 /// Executes a command in a systemd-isolated sandbox.
 ///
 /// This is the Linux equivalent of the macOS sandbox-exec executor.

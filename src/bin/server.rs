@@ -45,6 +45,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(database = ?db_path, "initializing storage");
 
+    // Clean up stale network namespaces from previous daemon runs
+    // This prevents IP conflicts when the daemon restarts
+    #[cfg(target_os = "linux")]
+    nix_jail::executor::cleanup_stale_network_namespaces().await;
+
     // Create session registry for interactive sessions
     let session_registry = Arc::new(SessionRegistry::new());
 
