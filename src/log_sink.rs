@@ -5,6 +5,7 @@
 //! - StorageLogSink: persists logs to SQLite and broadcasts to gRPC clients
 //! - StdioLogSink: prints directly to stdout/stderr for local execution
 
+use chrono::{DateTime, Utc};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -13,6 +14,12 @@ use tonic::Status;
 
 use crate::jail::{LogEntry, LogSource};
 use crate::storage::{JobStorage, LogEntry as StorageLogEntry};
+
+/// Format a timestamp in the same style as tracing (RFC 3339 with microseconds)
+fn format_timestamp() -> String {
+    let now: DateTime<Utc> = Utc::now();
+    now.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+}
 
 /// A sink for job execution logs
 ///
@@ -24,14 +31,22 @@ pub trait LogSink: Send + Sync {
     /// Signal that job execution is complete
     fn done(&self, job_id: &str, exit_code: i32);
 
-    /// Log an info message (prefixed with [INFO])
+    /// Log an info message with timestamp (matches tracing format)
     fn info(&self, job_id: &str, message: &str) {
-        self.log(job_id, LogSource::System, &format!("[INFO] {}\n", message));
+        self.log(
+            job_id,
+            LogSource::System,
+            &format!("{}  INFO nix_jail: {}\n", format_timestamp(), message),
+        );
     }
 
-    /// Log an error message (prefixed with [ERROR])
+    /// Log an error message with timestamp (matches tracing format)
     fn error(&self, job_id: &str, message: &str) {
-        self.log(job_id, LogSource::System, &format!("[ERROR] {}\n", message));
+        self.log(
+            job_id,
+            LogSource::System,
+            &format!("{} ERROR nix_jail: {}\n", format_timestamp(), message),
+        );
     }
 }
 
@@ -87,7 +102,11 @@ impl LogSink for StorageLogSink {
     }
 
     fn done(&self, job_id: &str, exit_code: i32) {
-        let msg = format!("[DONE] exit_code={}\n", exit_code);
+        let msg = format!(
+            "{}  INFO nix_jail: job completed exit_code={}\n",
+            format_timestamp(),
+            exit_code
+        );
         self.log(job_id, LogSource::System, &msg);
     }
 }
@@ -133,7 +152,11 @@ impl LogSink for StdioLogSink {
 
     fn done(&self, _job_id: &str, exit_code: i32) {
         if self.show_prefix {
-            let msg = format!("[DONE] exit_code={}\n", exit_code);
+            let msg = format!(
+                "{}  INFO nix_jail: job completed exit_code={}\n",
+                format_timestamp(),
+                exit_code
+            );
             let _ = std::io::stdout().write_all(msg.as_bytes());
         }
     }
