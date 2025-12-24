@@ -15,10 +15,28 @@ use tonic::Status;
 use crate::jail::{LogEntry, LogSource};
 use crate::storage::{JobStorage, LogEntry as StorageLogEntry};
 
-/// Format a timestamp in the same style as tracing (RFC 3339 with microseconds)
-fn format_timestamp() -> String {
+// ANSI color codes matching tracing-subscriber
+const ANSI_DIM: &str = "\x1b[2m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_RESET: &str = "\x1b[0m";
+
+/// Format a log line matching tracing-subscriber's format with colors
+fn format_info(message: &str) -> String {
     let now: DateTime<Utc> = Utc::now();
-    now.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+    let ts = now.format("%Y-%m-%dT%H:%M:%S%.6fZ");
+    format!(
+        "{ANSI_DIM}{ts}{ANSI_RESET} {ANSI_GREEN} INFO{ANSI_RESET} {ANSI_DIM}nix_jail:{ANSI_RESET} {message}\n"
+    )
+}
+
+/// Format an error log line matching tracing-subscriber's format with colors
+fn format_error(message: &str) -> String {
+    let now: DateTime<Utc> = Utc::now();
+    let ts = now.format("%Y-%m-%dT%H:%M:%S%.6fZ");
+    format!(
+        "{ANSI_DIM}{ts}{ANSI_RESET} {ANSI_RED}ERROR{ANSI_RESET} {ANSI_DIM}nix_jail:{ANSI_RESET} {message}\n"
+    )
 }
 
 /// A sink for job execution logs
@@ -31,22 +49,14 @@ pub trait LogSink: Send + Sync {
     /// Signal that job execution is complete
     fn done(&self, job_id: &str, exit_code: i32);
 
-    /// Log an info message with timestamp (matches tracing format)
+    /// Log an info message with timestamp and colors (matches tracing format)
     fn info(&self, job_id: &str, message: &str) {
-        self.log(
-            job_id,
-            LogSource::System,
-            &format!("{}  INFO nix_jail: {}\n", format_timestamp(), message),
-        );
+        self.log(job_id, LogSource::System, &format_info(message));
     }
 
-    /// Log an error message with timestamp (matches tracing format)
+    /// Log an error message with timestamp and colors (matches tracing format)
     fn error(&self, job_id: &str, message: &str) {
-        self.log(
-            job_id,
-            LogSource::System,
-            &format!("{} ERROR nix_jail: {}\n", format_timestamp(), message),
-        );
+        self.log(job_id, LogSource::System, &format_error(message));
     }
 }
 
@@ -102,12 +112,11 @@ impl LogSink for StorageLogSink {
     }
 
     fn done(&self, job_id: &str, exit_code: i32) {
-        let msg = format!(
-            "{}  INFO nix_jail: job completed exit_code={}\n",
-            format_timestamp(),
-            exit_code
+        self.log(
+            job_id,
+            LogSource::System,
+            &format_info(&format!("job completed exit_code={}", exit_code)),
         );
-        self.log(job_id, LogSource::System, &msg);
     }
 }
 
@@ -152,11 +161,7 @@ impl LogSink for StdioLogSink {
 
     fn done(&self, _job_id: &str, exit_code: i32) {
         if self.show_prefix {
-            let msg = format!(
-                "{}  INFO nix_jail: job completed exit_code={}\n",
-                format_timestamp(),
-                exit_code
-            );
+            let msg = format_info(&format!("job completed exit_code={}", exit_code));
             let _ = std::io::stdout().write_all(msg.as_bytes());
         }
     }
