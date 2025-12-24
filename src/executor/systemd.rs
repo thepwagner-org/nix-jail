@@ -138,12 +138,11 @@ fn generate_hardening_properties(
     // create a new empty namespace, overriding NetworkNamespacePath.
     props.push("--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6".to_string());
 
-    // === Resource Limits (5 properties) ===
+    // === Resource Limits (4 properties) ===
     let timeout_secs = config.timeout.as_secs();
     props.push(format!("--property=RuntimeMaxSec={}", timeout_secs));
     // Default resource limits - can be made configurable later
-    props.push("--property=CPUQuota=200%".to_string()); // 2 CPUs worth
-    props.push("--property=MemoryMax=2G".to_string());
+    props.push("--property=MemoryMax=4G".to_string());
     props.push("--property=TasksMax=100".to_string());
     props.push("--property=LimitNOFILE=1024".to_string());
 
@@ -500,11 +499,7 @@ pub async fn cleanup_network_namespace(job_id: &str) -> Result<(), ExecutorError
 /// Call this once at daemon startup before accepting any jobs.
 pub async fn cleanup_stale_network_namespaces() {
     // List all network namespaces
-    let output = match Command::new("ip")
-        .args(["netns", "list"])
-        .output()
-        .await
-    {
+    let output = match Command::new("ip").args(["netns", "list"]).output().await {
         Ok(o) => o,
         Err(e) => {
             tracing::warn!(error = %e, "failed to list network namespaces");

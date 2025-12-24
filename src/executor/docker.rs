@@ -142,11 +142,8 @@ fn add_security_options(cmd: &mut Command, _profile: &HardeningProfile) {
 
 /// Adds resource limits to the docker command
 fn add_resource_limits(cmd: &mut Command, config: &ExecutionConfig) {
-    // CPU limit (2 CPUs worth, matches systemd CPUQuota=200%)
-    let _ = cmd.arg("--cpus=2");
-
-    // Memory limit (matches systemd MemoryMax=2G)
-    let _ = cmd.arg("--memory=2g");
+    // Memory limit (matches systemd MemoryMax=4G)
+    let _ = cmd.arg("--memory=4g");
 
     // PID limit (matches systemd TasksMax=100)
     let _ = cmd.arg("--pids-limit=100");

@@ -6,7 +6,7 @@
 
 Platform-specific executors provide defense-in-depth isolation:
 - **SandboxExecutor** (macOS) - Apple sandbox-exec with SBPL profiles
-- **SystemdExecutor** (Linux) - systemd transient units with 33 hardening properties
+- **SystemdExecutor** (Linux) - systemd transient units with 32 hardening properties
 
 See [TESTING.md](TESTING.md) for usage examples and testing workflows.
 
@@ -164,13 +164,13 @@ systemd-run --unit=nix-jail-{job_id} --scope --user \
   /bin/bash /workspace/script.sh
 ```
 
-**Defense-in-Depth:** 33 hardening properties provide five layers of defense - filesystem isolation, user/privilege controls, syscall filtering, memory/execution controls, and network isolation. See [Appendix C](#c-linux-hardening-reference) for the complete property reference.
+**Defense-in-Depth:** 32 hardening properties provide five layers of defense - filesystem isolation, user/privilege controls, syscall filtering, memory/execution controls, and network isolation. See [Appendix C](#c-linux-hardening-reference) for the complete property reference.
 
 **Hardening Profiles:**
 
-The default security posture includes all 33 hardening properties. However, hardening profiles allow explicit, documented weakening for specific workload requirements:
+The default security posture includes all 32 hardening properties. However, hardening profiles allow explicit, documented weakening for specific workload requirements:
 
-- **Default Profile** (33 properties): Maximum security for general workloads. Includes `MemoryDenyWriteExecute=true` which prevents W^X violations and **blocks JIT compilation** - this is intentional for maximum security.
+- **Default Profile** (32 properties): Maximum security for general workloads. Includes `MemoryDenyWriteExecute=true` which prevents W^X violations and **blocks JIT compilation** - this is intentional for maximum security.
 
 - **JIT Runtime Profile** (32 properties): Removes `MemoryDenyWriteExecute=true` to enable legitimate JIT compilation required by runtimes like Node.js V8, Python PyPy, Java/JVM, and WebAssembly engines. All other 32 hardening properties remain active. Use ONLY when running JIT-based runtimes (Node.js, Python with JIT, Java, etc.). Users must explicitly request via `--hardening-profile jit-runtime`.
 
@@ -208,7 +208,7 @@ docker run --rm \
 - `--security-opt=no-new-privileges`: Prevent privilege escalation
 - `--read-only`: Immutable root filesystem
 - `--tmpfs=/tmp:noexec,nosuid,size=64m`: Private temp with execute/setuid disabled
-- Resource limits: 2 CPUs, 2GB RAM, 100 PIDs, 1024 file descriptors (matches systemd defaults)
+- Resource limits: 4GB RAM, 100 PIDs, 1024 file descriptors (no CPU limit)
 
 **Network:** Custom Docker bridge network "nix-jail" routes all traffic through the proxy at 172.17.0.1:3128.
 
@@ -345,7 +345,7 @@ nix-jail supports three executor backends. The table compares these to external 
 
 **nix-jail backends (built-in):** systemd (Linux default), Docker (cross-platform), sandbox-exec (macOS default).
 
-**Why systemd on Linux:** Nix package closures typically contain 10-100+ packages. systemd's RootDirectory property handles this with a single chroot, comprehensive hardening (33 properties), and built-in resource limits. Present on 99% of modern Linux distributions.
+**Why systemd on Linux:** Nix package closures typically contain 10-100+ packages. systemd's RootDirectory property handles this with a single chroot, comprehensive hardening (32 properties), and built-in resource limits. Present on 99% of modern Linux distributions.
 
 **Why Docker:** Cross-platform support (Linux, macOS with Docker Desktop, WSL2). Useful for non-systemd Linux (Alpine, Gentoo) or unified tooling across platforms.
 
@@ -453,7 +453,7 @@ message IpPattern {
 
 ### C. Linux Hardening Reference
 
-The SystemdExecutor applies 33 hardening properties across seven categories:
+The SystemdExecutor applies 32 hardening properties across seven categories:
 
 | Category | Properties | Purpose |
 |----------|-----------|---------|
@@ -462,14 +462,14 @@ The SystemdExecutor applies 33 hardening properties across seven categories:
 | **Syscall Filtering** (4) | SystemCallFilter=@system-service, SystemCallErrorNumber=EPERM, SystemCallArchitectures=native, RestrictNamespaces=true | Allowlist safe syscalls, block dangerous operations |
 | **Memory/Execution** (3) | MemoryDenyWriteExecute, LockPersonality, RestrictRealtime | Prevent W^X violations and memory exploits |
 | **Network Isolation** (1) | RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 | Isolate network access to proxy-only communication |
-| **Resource Limits** (5) | RuntimeMaxSec, CPUQuota=200%, MemoryMax=2G, TasksMax=100, LimitNOFILE=1024 | Prevent resource exhaustion attacks |
+| **Resource Limits** (4) | RuntimeMaxSec, MemoryMax=4G, TasksMax=100, LimitNOFILE=1024 | Prevent resource exhaustion attacks |
 | **Cleanup/Isolation** (4) | RemoveIPC, KeyringMode=private, UMask=0000, ProtectClock | Clean up resources and isolate kernel interfaces (permissive umask safe due to chroot isolation) |
 
 **Note:** `PrivateNetwork=true` was replaced with `NetworkNamespacePath` to enable network namespace integration with the veth pair topology.
 
 **Hardening Profiles:**
 
-- **Default**: All 33 properties enabled
+- **Default**: All 32 properties enabled
 - **JIT Runtime**: Removes `MemoryDenyWriteExecute` for JIT compilation support (Node.js, PyPy, JVM)
 
 ### D. External References
