@@ -7,6 +7,6 @@ pkgs.mkShell {
     protobuf
     pkg-config
     perl
-    openssl
+    openssl.dev  # .dev includes headers + pkg-config
   ];
 }
