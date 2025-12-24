@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize rustls crypto provider for MITM TLS connections
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    tracing::info!("loading proxy config from: {}", args.config.display());
+    tracing::debug!("loading proxy config from: {}", args.config.display());
     let config = ProxyConfig::from_file(&args.config)?;
 
     tracing::debug!("starting nix-jail mitm proxy");

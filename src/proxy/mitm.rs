@@ -150,13 +150,13 @@ pub async fn start_server(
     ca_cert_pem: String,
 ) -> Result<(), BoxError> {
     let listener = TcpListener::bind(&listen_addr).await?;
-    tracing::info!("proxy listening on {}", listen_addr);
+    tracing::debug!("proxy listening on {}", listen_addr);
 
     // Write CA cert AFTER bind - this is the readiness signal for proxy_manager
     std::fs::write(&ca_cert_path, &ca_cert_pem)?;
-    tracing::info!("saved ca certificate to {}", ca_cert_path.display());
+    tracing::debug!("saved ca certificate to {}", ca_cert_path.display());
 
-    tracing::info!(
+    tracing::debug!(
         "network policy enabled with {} rules",
         state.policy.rules.len()
     );
@@ -169,13 +169,13 @@ pub async fn start_server(
         tokio::select! {
             // Handle SIGTERM
             _ = sigterm.recv() => {
-                tracing::info!("received sigterm, shutting down proxy");
+                tracing::debug!("received sigterm, shutting down proxy");
                 state.stats.log_summary();
                 return Ok(());
             }
             // Handle SIGINT (Ctrl+C)
             _ = sigint.recv() => {
-                tracing::info!("received sigint, shutting down proxy");
+                tracing::debug!("received sigint, shutting down proxy");
                 state.stats.log_summary();
                 return Ok(());
             }
