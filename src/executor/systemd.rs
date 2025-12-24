@@ -207,6 +207,10 @@ fn generate_hardening_properties(
             if let Err(e) = std::fs::create_dir_all(&target_cache) {
                 tracing::warn!(path = %target_cache.display(), error = %e, "failed to create target cache");
             }
+            // Chown to nix-jail (daemon runs as root, job runs as nix-jail)
+            let _ = std::process::Command::new("chown")
+                .args(["-R", "nix-jail:nix-jail", &target_cache.to_string_lossy()])
+                .output();
             props.push(format!(
                 "--property=BindPaths={}:/target",
                 target_cache.display()
