@@ -213,17 +213,24 @@ impl WorkspaceStorage for BtrfsStorage {
     fn snapshot_or_copy_sync(&self, src: &Path, dest: &Path) -> Result<(), StorageError> {
         debug!(src = %src.display(), dest = %dest.display(), "creating btrfs snapshot");
 
-        // CRITICAL: dest must NOT exist, otherwise btrfs creates snapshot INSIDE it
+        // Clean up existing destination - btrfs snapshot requires dest to not exist
         if dest.exists() {
-            warn!(dest = %dest.display(), "snapshot destination already exists - this will cause incorrect snapshot placement!");
-            // List what's in dest to help debug
-            if let Ok(entries) = std::fs::read_dir(dest) {
-                let names: Vec<_> = entries
-                    .filter_map(|e| e.ok())
-                    .take(5)
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .collect();
-                warn!(dest = %dest.display(), entries = ?names, "existing contents at dest");
+            debug!(dest = %dest.display(), "removing existing destination before snapshot");
+            // Try btrfs subvolume delete first (in case it's a subvolume from previous run)
+            let output = Command::new("btrfs")
+                .args(["subvolume", "delete"])
+                .arg(dest)
+                .output();
+
+            match output {
+                Ok(o) if o.status.success() => {
+                    debug!(dest = %dest.display(), "deleted existing subvolume");
+                }
+                _ => {
+                    // Not a subvolume or delete failed - use rm -rf
+                    debug!(dest = %dest.display(), "removing existing directory with rm -rf");
+                    std::fs::remove_dir_all(dest)?;
+                }
             }
         }
 
