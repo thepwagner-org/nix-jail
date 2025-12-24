@@ -511,6 +511,9 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
             let _ = env.insert("PKG_CONFIG_PATH".to_string(), pkg_config_path.clone());
         }
 
+        // Prevent openssl-sys from vendoring OpenSSL - use system OpenSSL via pkg-config
+        let _ = env.insert("OPENSSL_NO_VENDOR".to_string(), "1".to_string());
+
         // Log env vars for debugging
         log_sink.info(
             &job_id,
@@ -1431,6 +1434,9 @@ pub async fn execute_local(
         if !pkg_config_path.is_empty() {
             let _ = env.insert("PKG_CONFIG_PATH".to_string(), pkg_config_path);
         }
+
+        // Prevent openssl-sys from vendoring OpenSSL - use system OpenSSL via pkg-config
+        let _ = env.insert("OPENSSL_NO_VENDOR".to_string(), "1".to_string());
     }
 
     // Configure credentials
