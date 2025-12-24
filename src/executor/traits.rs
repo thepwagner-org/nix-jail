@@ -212,6 +212,18 @@ pub trait Executor: Send + Sync {
     async fn cleanup_root(&self, _root_dir: &std::path::Path) -> Result<(), ExecutorError> {
         Ok(())
     }
+
+    /// Clean up job workspace directory with executor-specific privileges
+    ///
+    /// Default implementation returns Ok (cleanup handled by JobWorkspace).
+    /// Executors that need privilege escalation (e.g., SystemdExecutor via polkit)
+    /// can override this to run cleanup with elevated permissions.
+    async fn cleanup_workspace(
+        &self,
+        _workspace_dir: &std::path::Path,
+    ) -> Result<(), ExecutorError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

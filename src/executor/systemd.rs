@@ -968,12 +968,38 @@ impl Executor for SystemdExecutor {
         // Use systemd-run to delete with same privileges as job execution
         // This handles the case where polkit granted us permission to run units
         // but the files created are owned by root
-        let status = Command::new("systemd-run")
+        //
+        // Try btrfs subvolume delete first (required for btrfs subvolumes),
+        // fall back to rm -rf for regular directories
+        let btrfs_status = Command::new("systemd-run")
             .args([
                 "--quiet",
                 "--wait",
                 "--pipe",
-                "--collect", // Auto-cleanup unit after completion
+                "--collect",
+                "--",
+                "btrfs",
+                "subvolume",
+                "delete",
+            ])
+            .arg(root_dir)
+            .status()
+            .await
+            .map_err(|e| ExecutorError::SpawnFailed(format!("cleanup: {}", e)))?;
+
+        if btrfs_status.success() {
+            tracing::debug!(root_dir = %root_dir.display(), "btrfs subvolume cleanup completed");
+            return Ok(());
+        }
+
+        // Not a btrfs subvolume or btrfs command failed, try rm -rf
+        tracing::debug!(root_dir = %root_dir.display(), "btrfs delete failed, trying rm -rf");
+        let rm_status = Command::new("systemd-run")
+            .args([
+                "--quiet",
+                "--wait",
+                "--pipe",
+                "--collect",
                 "--",
                 "rm",
                 "-rf",
@@ -983,13 +1009,74 @@ impl Executor for SystemdExecutor {
             .await
             .map_err(|e| ExecutorError::SpawnFailed(format!("cleanup: {}", e)))?;
 
-        if status.success() {
-            tracing::debug!(root_dir = %root_dir.display(), "cleanup completed");
+        if rm_status.success() {
+            tracing::debug!(root_dir = %root_dir.display(), "rm -rf cleanup completed");
             Ok(())
         } else {
             Err(ExecutorError::SpawnFailed(format!(
                 "cleanup failed with exit code: {:?}",
-                status.code()
+                rm_status.code()
+            )))
+        }
+    }
+
+    async fn cleanup_workspace(
+        &self,
+        workspace_dir: &std::path::Path,
+    ) -> Result<(), ExecutorError> {
+        if !workspace_dir.exists() {
+            return Ok(());
+        }
+
+        tracing::debug!(workspace_dir = %workspace_dir.display(), "cleaning up workspace via systemd-run");
+
+        // Try btrfs subvolume delete first (required for btrfs subvolumes),
+        // fall back to rm -rf for regular directories
+        let btrfs_status = Command::new("systemd-run")
+            .args([
+                "--quiet",
+                "--wait",
+                "--pipe",
+                "--collect",
+                "--",
+                "btrfs",
+                "subvolume",
+                "delete",
+            ])
+            .arg(workspace_dir)
+            .status()
+            .await
+            .map_err(|e| ExecutorError::SpawnFailed(format!("cleanup: {}", e)))?;
+
+        if btrfs_status.success() {
+            tracing::debug!(workspace_dir = %workspace_dir.display(), "btrfs subvolume cleanup completed");
+            return Ok(());
+        }
+
+        // Not a btrfs subvolume or btrfs command failed, try rm -rf
+        tracing::debug!(workspace_dir = %workspace_dir.display(), "btrfs delete failed, trying rm -rf");
+        let rm_status = Command::new("systemd-run")
+            .args([
+                "--quiet",
+                "--wait",
+                "--pipe",
+                "--collect",
+                "--",
+                "rm",
+                "-rf",
+            ])
+            .arg(workspace_dir)
+            .status()
+            .await
+            .map_err(|e| ExecutorError::SpawnFailed(format!("cleanup: {}", e)))?;
+
+        if rm_status.success() {
+            tracing::debug!(workspace_dir = %workspace_dir.display(), "rm -rf cleanup completed");
+            Ok(())
+        } else {
+            Err(ExecutorError::SpawnFailed(format!(
+                "cleanup failed with exit code: {:?}",
+                rm_status.code()
             )))
         }
     }

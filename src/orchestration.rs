@@ -818,7 +818,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
     registry.remove(&job_id).await;
 
     // Cleanup root directory and workspace
-    // Try executor-specific cleanup first (handles privilege escalation on Linux)
+    // Try executor-specific cleanup first (handles privilege escalation and btrfs on Linux)
     if let Err(e) = executor
         .cleanup_root(&job_dir.root)
         .instrument(tracing::info_span!("cleanup_root"))
@@ -829,8 +829,15 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
             tracing::warn!(error = %e, "failed to cleanup root directory");
         }
     }
-    if let Err(e) = job_workspace.cleanup(&job_dir.workspace) {
-        tracing::warn!(error = %e, "failed to cleanup workspace");
+    if let Err(e) = executor
+        .cleanup_workspace(&job_dir.workspace)
+        .instrument(tracing::info_span!("cleanup_workspace"))
+        .await
+    {
+        tracing::warn!(error = %e, "executor workspace cleanup failed, trying direct cleanup");
+        if let Err(e) = job_workspace.cleanup(&job_dir.workspace) {
+            tracing::warn!(error = %e, "failed to cleanup workspace");
+        }
     }
 }
 
