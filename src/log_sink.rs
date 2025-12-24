@@ -22,7 +22,7 @@ const ANSI_RED: &str = "\x1b[31m";
 const ANSI_RESET: &str = "\x1b[0m";
 
 /// Format a log line matching tracing-subscriber's format with colors
-fn format_info(message: &str) -> String {
+pub fn format_info(message: &str) -> String {
     let now: DateTime<Utc> = Utc::now();
     let ts = now.format("%Y-%m-%dT%H:%M:%S%.6fZ");
     format!(

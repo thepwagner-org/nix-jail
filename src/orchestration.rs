@@ -19,7 +19,7 @@ use crate::executor::{ExecutionConfig, Executor, HardeningProfile};
 use crate::jail::{LogEntry, LogSource, NetworkPolicy};
 use crate::job_dir::JobDirectory;
 use crate::job_workspace::JobWorkspace;
-use crate::log_sink::{LogSink, StorageLogSink};
+use crate::log_sink::{format_info, LogSink, StorageLogSink};
 use crate::proxy_manager::ProxyManager;
 use crate::root::JobRoot;
 use crate::storage::{JobMetadata, JobStatus, JobStorage, LogEntry as StorageLogEntry};
@@ -743,7 +743,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         JobStatus::Failed
     };
 
-    let msg = format!("[DONE] exit_code={}\n", exit_code);
+    let msg = format_info(&format!("job completed exit_code={}", exit_code));
     let _ = storage.append_log(
         &job_id,
         &StorageLogEntry {
