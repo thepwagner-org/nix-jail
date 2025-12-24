@@ -1158,7 +1158,8 @@ mod tests {
         let user_props = props
             .iter()
             .filter(|p| {
-                p.contains("DynamicUser")
+                p.contains("User=")
+                    || p.contains("Group=")
                     || p.contains("PrivateUsers")
                     || p.contains("NoNewPrivileges")
                     || p.contains("RestrictSUIDSGID")
@@ -1190,7 +1191,6 @@ mod tests {
             .iter()
             .filter(|p| {
                 p.contains("RuntimeMaxSec")
-                    || p.contains("CPUQuota")
                     || p.contains("MemoryMax")
                     || p.contains("TasksMax")
                     || p.contains("LimitNOFILE")
@@ -1207,13 +1207,13 @@ mod tests {
             })
             .count();
 
-        // Verify all 33 hardening properties + 2 mount properties
+        // Verify all 32 hardening properties + 2 mount properties
         assert_eq!(filesystem_props, 10, "Should have 10 filesystem properties");
-        assert_eq!(user_props, 6, "Should have 6 user/privilege properties");
+        assert_eq!(user_props, 7, "Should have 7 user/privilege properties");
         assert_eq!(syscall_props, 4, "Should have 4 syscall properties");
         assert_eq!(memory_props, 3, "Should have 3 memory/exec properties");
         assert_eq!(network_props, 1, "Should have 1 network property");
-        assert_eq!(resource_props, 5, "Should have 5 resource limit properties");
+        assert_eq!(resource_props, 4, "Should have 4 resource limit properties");
         assert_eq!(cleanup_props, 4, "Should have 4 cleanup properties");
 
         // Check mount properties
@@ -1259,8 +1259,9 @@ mod tests {
         assert!(props.contains(&"--property=ProtectSystem=strict".to_string()));
         assert!(props.contains(&"--property=ProtectHome=true".to_string()));
         assert!(props.contains(&"--property=NoNewPrivileges=true".to_string()));
-        // Note: PrivateNetwork=true removed - we use NetworkNamespacePath instead
-        assert!(props.contains(&"--property=DynamicUser=true".to_string()));
+        // Note: Using static nix-jail user instead of DynamicUser for consistent permissions
+        assert!(props.contains(&"--property=User=nix-jail".to_string()));
+        assert!(props.contains(&"--property=Group=nix-jail".to_string()));
 
         // Verify timeout is set correctly
         assert!(props.contains(&"--property=RuntimeMaxSec=120".to_string()));
