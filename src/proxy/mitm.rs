@@ -170,13 +170,11 @@ pub async fn start_server(
             // Handle SIGTERM
             _ = sigterm.recv() => {
                 tracing::debug!("received sigterm, shutting down proxy");
-                state.stats.log_summary();
                 return Ok(());
             }
             // Handle SIGINT (Ctrl+C)
             _ = sigint.recv() => {
                 tracing::debug!("received sigint, shutting down proxy");
-                state.stats.log_summary();
                 return Ok(());
             }
             // Accept new connections
