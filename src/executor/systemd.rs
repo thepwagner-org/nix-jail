@@ -186,6 +186,34 @@ fn generate_hardening_properties(
         }
     }
 
+    // Cargo caching bind-mounts (shared CARGO_HOME and per-repo target cache)
+    if config.cache_enabled {
+        if let Some(ref cargo_home) = config.cargo_home {
+            // Bind-mount shared CARGO_HOME for registry/deps
+            // Create host directory if needed (daemon runs as root)
+            if let Err(e) = std::fs::create_dir_all(cargo_home) {
+                tracing::warn!(path = %cargo_home.display(), error = %e, "failed to create cargo home");
+            }
+            props.push(format!(
+                "--property=BindPaths={}:/cargo",
+                cargo_home.display()
+            ));
+        }
+
+        if let (Some(ref base), Some(ref repo_hash)) = (&config.target_cache_dir, &config.repo_hash)
+        {
+            // Per-repo target cache (keyed by first 12 chars of repo hash)
+            let target_cache = base.join(&repo_hash[..12.min(repo_hash.len())]);
+            if let Err(e) = std::fs::create_dir_all(&target_cache) {
+                tracing::warn!(path = %target_cache.display(), error = %e, "failed to create target cache");
+            }
+            props.push(format!(
+                "--property=BindPaths={}:/target",
+                target_cache.display()
+            ));
+        }
+    }
+
     props
 }
 
@@ -767,6 +795,16 @@ impl Executor for SystemdExecutor {
             let _ = cmd
                 .arg("--setenv")
                 .arg(format!("{}={}", key, normalized_value));
+        }
+
+        // Cargo cache environment variables (paths inside chroot)
+        if config.cache_enabled {
+            if config.cargo_home.is_some() {
+                let _ = cmd.arg("--setenv").arg("CARGO_HOME=/cargo");
+            }
+            if config.target_cache_dir.is_some() && config.repo_hash.is_some() {
+                let _ = cmd.arg("--setenv").arg("CARGO_TARGET_DIR=/target");
+            }
         }
 
         // Note: HTTP_PROXY and HTTPS_PROXY are already set correctly by build_environment

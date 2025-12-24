@@ -84,6 +84,10 @@
       header_format = "token {token}"
       dummy_token = "DUMMY_GIT_TOKEN"
     ''}
+    [cache]
+    enabled = ${lib.boolToString cfg.cache.enable}
+    ${lib.optionalString (cfg.cache.cargoHome != null) ''cargo_home = "${cfg.cache.cargoHome}"''}
+    ${lib.optionalString (cfg.cache.targetCacheDir != null) ''target_cache_dir = "${cfg.cache.targetCacheDir}"''}
   '';
 in {
   options.services.nix-jail = {
@@ -136,6 +140,24 @@ in {
       default = null;
       description = "Environment file for secrets (e.g., from sops-nix)";
     };
+
+    cache = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Enable cargo/build caching";
+      };
+      cargoHome = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = "/var/lib/nix-jail/cargo";
+        description = "Shared CARGO_HOME directory for registry and git deps";
+      };
+      targetCacheDir = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = "/var/lib/nix-jail/target";
+        description = "Base directory for per-repo target caches";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -158,9 +180,12 @@ in {
       });
     '';
 
-    # Create /var/run/netns with nix-jail group write access for network namespaces
+    # Create directories with proper permissions
     systemd.tmpfiles.rules = [
       "d /var/run/netns 0775 root nix-jail -"
+    ] ++ lib.optionals cfg.cache.enable [
+      "d ${cfg.cache.cargoHome} 0755 nix-jail nix-jail -"
+      "d ${cfg.cache.targetCacheDir} 0755 nix-jail nix-jail -"
     ];
 
     # Allow proxy port from nix-jail network namespaces (vp-* veth interfaces)
