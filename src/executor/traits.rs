@@ -92,6 +92,28 @@ impl std::str::FromStr for HardeningProfile {
     }
 }
 
+/// A resolved cache mount for execution
+///
+/// This is the result of resolving a client's CacheRequest against
+/// the server's bucket configuration. Contains all information needed
+/// for the executor to set up the mount.
+#[derive(Debug, Clone)]
+pub struct ResolvedCacheMount {
+    /// Host path to mount (may include key-based subdirectory)
+    pub host_path: PathBuf,
+
+    /// Mount point inside the sandbox (e.g., "/cargo", "/target")
+    pub mount_path: String,
+
+    /// Environment variable to set (e.g., "CARGO_HOME")
+    /// If set, the env var will be set to mount_path
+    pub env_var: Option<String>,
+
+    /// Docker volume name (for Docker executor)
+    /// If set, Docker will use this named volume instead of host_path
+    pub docker_volume: Option<String>,
+}
+
 /// Configuration for job execution (platform-agnostic)
 #[derive(Debug, Clone)]
 pub struct ExecutionConfig {
@@ -120,20 +142,9 @@ pub struct ExecutionConfig {
     /// Terminal size for PTY mode (rows, cols)
     pub pty_size: Option<(u16, u16)>,
 
-    // Cache configuration
-    /// Hash of repo URL for cache isolation (first 12 chars of SHA256)
-    pub repo_hash: Option<String>,
-    /// Whether Cargo caching is enabled
-    pub cache_enabled: bool,
-    /// Host path for CARGO_HOME (macOS sandbox, systemd only)
-    /// Docker uses named volumes instead
-    pub cargo_home: Option<PathBuf>,
-    /// Host path for per-repo target cache (macOS sandbox, systemd only)
-    /// Docker uses named volumes instead
-    pub target_cache_dir: Option<PathBuf>,
-    /// Host path for pnpm store (macOS sandbox, systemd only)
-    /// Docker uses named volumes instead
-    pub pnpm_store: Option<PathBuf>,
+    /// Resolved cache mounts for this job
+    /// These are ready to be bind-mounted by the executor
+    pub cache_mounts: Vec<ResolvedCacheMount>,
 }
 
 /// I/O handle for job execution

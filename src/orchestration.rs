@@ -14,8 +14,9 @@ use tokio::sync::{broadcast, mpsc};
 use tonic::Status;
 use tracing::Instrument;
 
-use crate::config::{Credential, CredentialType};
-use crate::executor::{ExecutionConfig, Executor, HardeningProfile};
+use crate::config::{Credential, CredentialType, ServerConfig};
+use crate::executor::{ExecutionConfig, Executor, HardeningProfile, ResolvedCacheMount};
+use crate::jail::{CacheRequest, CacheScope};
 use crate::jail::{LogEntry, LogSource, NetworkPolicy};
 use crate::job_dir::JobDirectory;
 use crate::job_workspace::JobWorkspace;
@@ -581,6 +582,11 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         None
     };
 
+    // Resolve cache mounts
+    // TODO: Once forgejo-nix-ci sends cache requests, use resolve_caches() here
+    // For now, return empty (no default caches - clients must specify what they need)
+    let cache_mounts = build_default_cache_mounts(&config, repo_hash.as_deref());
+
     let exec_config = ExecutionConfig {
         job_id: job_id.clone(),
         command,
@@ -594,12 +600,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         hardening_profile,
         interactive,
         pty_size: None, // Server mode uses WebSocket for terminal size
-        // Cache configuration
-        repo_hash,
-        cache_enabled: config.cache.enabled,
-        cargo_home: config.cache.cargo_home.clone(),
-        target_cache_dir: config.cache.target_cache_dir.clone(),
-        pnpm_store: config.cache.pnpm_store.clone(),
+        cache_mounts,
     };
 
     // Execute job using platform-specific executor (created earlier)
@@ -858,6 +859,131 @@ fn hash_repo(repo: &str) -> String {
     let result = hasher.finalize();
     // Return first 12 characters of hex digest
     format!("{:x}", result)[..12].to_string()
+}
+
+/// Validate that a bucket name is safe for use as a path component
+/// Only alphanumeric characters, hyphens, and underscores are allowed
+fn is_valid_bucket_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Resolve cache requests into mount configurations
+///
+/// The server doesn't define buckets - it accepts any valid bucket name
+/// and creates directories dynamically under {cache_dir}/{bucket}/
+fn resolve_caches(
+    requests: &[CacheRequest],
+    config: &ServerConfig,
+    repo_hash: Option<&str>,
+) -> Vec<ResolvedCacheMount> {
+    if !config.cache.enabled {
+        return vec![];
+    }
+
+    let cache_dir = config.cache_dir();
+    let mut mounts = Vec::new();
+
+    for request in requests {
+        // Validate bucket name
+        if !is_valid_bucket_name(&request.bucket) {
+            tracing::warn!(bucket = %request.bucket, "invalid cache bucket name (must be alphanumeric with hyphens/underscores)");
+            continue;
+        }
+
+        // Validate key
+        if !is_valid_bucket_name(&request.key) {
+            tracing::warn!(key = %request.key, "invalid cache key (must be alphanumeric with hyphens/underscores)");
+            continue;
+        }
+
+        // Build host path: {cache_dir}/{bucket}/{scope}/{key}
+        let bucket_dir = cache_dir.join(&request.bucket);
+        let host_path = match CacheScope::try_from(request.scope).unwrap_or(CacheScope::Shared) {
+            CacheScope::PerRepo => {
+                if let Some(hash) = repo_hash {
+                    find_cache_with_fallbacks(
+                        &bucket_dir.join(hash).join(&request.key),
+                        &request.fallback_keys,
+                        &bucket_dir.join(hash),
+                    )
+                } else {
+                    tracing::warn!(bucket = %request.bucket, "per-repo cache without repo context");
+                    continue;
+                }
+            }
+            CacheScope::Shared => find_cache_with_fallbacks(
+                &bucket_dir.join(&request.key),
+                &request.fallback_keys,
+                &bucket_dir,
+            ),
+        };
+
+        // Use mount_path from request (required)
+        let mount_path = if request.mount_path.is_empty() {
+            format!("/{}", request.bucket)
+        } else {
+            request.mount_path.clone()
+        };
+
+        mounts.push(ResolvedCacheMount {
+            host_path,
+            mount_path,
+            env_var: request.env_var.clone(),
+            docker_volume: None, // Docker volume naming handled by client
+        });
+    }
+
+    mounts
+}
+
+/// Try primary path, then fallbacks in order, returning first existing path or primary
+fn find_cache_with_fallbacks(
+    primary: &Path,
+    fallback_keys: &[String],
+    base_path: &Path,
+) -> PathBuf {
+    if primary.exists() {
+        return primary.to_path_buf();
+    }
+
+    for fallback_key in fallback_keys {
+        if !is_valid_bucket_name(fallback_key) {
+            continue;
+        }
+        let fallback_path = base_path.join(fallback_key);
+        if fallback_path.exists() {
+            tracing::debug!(
+                primary = %primary.display(),
+                fallback = %fallback_path.display(),
+                "using fallback cache"
+            );
+            return fallback_path;
+        }
+    }
+
+    // No cache hit, return primary (will be created)
+    primary.to_path_buf()
+}
+
+/// Build default cache mounts (empty - clients must specify cache requests)
+///
+/// For backward compatibility during migration, this returns empty.
+/// Once forgejo-nix-ci sends cache requests, caching will work.
+fn build_default_cache_mounts(
+    config: &ServerConfig,
+    _repo_hash: Option<&str>,
+) -> Vec<ResolvedCacheMount> {
+    if !config.cache.enabled {
+        return vec![];
+    }
+
+    // No default caches - clients must specify what they need
+    // This is the new model where all ecosystem knowledge is in forgejo-nix-ci
+    vec![]
 }
 
 fn build_environment(
@@ -1489,7 +1615,7 @@ pub async fn execute_local(
     );
 
     // Phase 6: Execute
-    // Note: Local execution doesn't have repo context, so no cache isolation
+    // Note: Local execution doesn't have repo context, so no cache mounts
     let exec_config = ExecutionConfig {
         job_id: job_id.clone(),
         command: config.command,
@@ -1503,12 +1629,7 @@ pub async fn execute_local(
         hardening_profile: config.hardening_profile,
         interactive: config.interactive,
         pty_size: config.pty_size,
-        // Cache disabled for local execution (no repo context)
-        repo_hash: None,
-        cache_enabled: false,
-        cargo_home: None,
-        target_cache_dir: None,
-        pnpm_store: None,
+        cache_mounts: vec![], // No caching for local execution
     };
 
     let handle = async {

@@ -9,16 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// Cache directories configuration for sandbox profile
-#[derive(Debug, Default)]
-pub struct CachePaths {
-    /// CARGO_HOME directory (shared registry/git deps)
-    pub cargo_home: Option<PathBuf>,
-    /// CARGO_TARGET_DIR directory (per-repo build artifacts)
-    pub target_dir: Option<PathBuf>,
-    /// PNPM store directory (shared pnpm packages)
-    pub pnpm_store: Option<PathBuf>,
-}
+use super::traits::ResolvedCacheMount;
 
 /// Generate a Sandbox Profile Language (SBPL) profile for macOS sandbox-exec
 ///
@@ -26,7 +17,7 @@ pub struct CachePaths {
 /// - The Nix store paths in the derivation closure (read-only)
 /// - The workspace directory (read-write)
 /// - The job root directory (for CA cert access when using proxy)
-/// - Cache directories for Cargo (read-write, if configured)
+/// - Cache directories (read-write, if configured)
 /// - Essential macOS system resources (metadata, sysctls)
 /// - Network access only to the specified proxy port on localhost (if proxy_port is Some)
 ///
@@ -42,16 +33,16 @@ pub fn generate_profile(
     root_dir: &Path,
     proxy_port: Option<u16>,
 ) -> String {
-    generate_profile_with_cache(closure_paths, workspace_path, root_dir, proxy_port, None)
+    generate_profile_with_cache(closure_paths, workspace_path, root_dir, proxy_port, &[])
 }
 
-/// Generate sandbox profile with optional cache directories
+/// Generate sandbox profile with cache directories
 pub fn generate_profile_with_cache(
     closure_paths: &[PathBuf],
     workspace_path: &Path,
     root_dir: &Path,
     proxy_port: Option<u16>,
-    cache_paths: Option<&CachePaths>,
+    cache_mounts: &[ResolvedCacheMount],
 ) -> String {
     let mut profile = String::from("(version 1)\n");
     profile.push_str("(deny default)\n\n");
@@ -164,34 +155,26 @@ pub fn generate_profile_with_cache(
         ));
     }
 
-    // Allow cache directory access (read-write for Cargo registry, read-write-exec for target)
-    if let Some(cache) = cache_paths {
-        if cache.cargo_home.is_some() || cache.target_dir.is_some() {
-            profile.push_str(";; Cargo cache directories\n");
+    // Allow cache directory access (read-write, plus exec for build artifacts)
+    if !cache_mounts.is_empty() {
+        profile.push_str(";; Cache directories\n");
+        for mount in cache_mounts {
+            // Target directories need process-exec* for build scripts (Cargo build.rs, etc.)
+            // We detect this by checking if the mount path contains "target"
+            let needs_exec = mount.mount_path.contains("target");
+            if needs_exec {
+                profile.push_str(&format!(
+                    "(allow file-read* file-write* process-exec* (subpath \"{}\"))\n",
+                    mount.host_path.display()
+                ));
+            } else {
+                profile.push_str(&format!(
+                    "(allow file-read* file-write* (subpath \"{}\"))\n",
+                    mount.host_path.display()
+                ));
+            }
         }
-        if let Some(cargo_home) = &cache.cargo_home {
-            profile.push_str(&format!(
-                "(allow file-read* file-write* (subpath \"{}\"))\n",
-                cargo_home.display()
-            ));
-        }
-        if let Some(target_dir) = &cache.target_dir {
-            // Target directory needs process-exec* for build scripts
-            profile.push_str(&format!(
-                "(allow file-read* file-write* process-exec* (subpath \"{}\"))\n",
-                target_dir.display()
-            ));
-        }
-        if cache.cargo_home.is_some() || cache.target_dir.is_some() {
-            profile.push('\n');
-        }
-        if let Some(pnpm_store) = &cache.pnpm_store {
-            profile.push_str(";; pnpm store directory\n");
-            profile.push_str(&format!(
-                "(allow file-read* file-write* (subpath \"{}\"))\n\n",
-                pnpm_store.display()
-            ));
-        }
+        profile.push('\n');
     }
 
     // Essential macOS permissions

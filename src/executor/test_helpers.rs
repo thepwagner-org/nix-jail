@@ -106,12 +106,7 @@ impl TestConfigBuilder {
             hardening_profile: self.hardening_profile,
             interactive: self.interactive,
             pty_size: self.pty_size,
-            // Cache disabled by default in tests
-            repo_hash: None,
-            cache_enabled: false,
-            cargo_home: None,
-            target_cache_dir: None,
-            pnpm_store: None,
+            cache_mounts: vec![], // No caching in tests by default
         }
     }
 }

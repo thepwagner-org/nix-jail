@@ -62,6 +62,12 @@ message JobRequest {
   // for bidirectional terminal communication. The job will wait for a
   // client to connect before starting execution.
   optional bool interactive = 10;
+
+  // Cache mounts for this job (optional)
+  // If empty, server defaults are used based on the cache bucket configuration.
+  // Each cache request specifies a bucket name (must match server config),
+  // a key for cache lookup, and mount/env configuration.
+  repeated CacheRequest caches = 11;
 }
 
 // Network policy controlling allowed/denied hosts and credential usage
@@ -113,6 +119,37 @@ enum NetworkAction {
 
   // Deny the network request
   NETWORK_ACTION_DENY = 1;
+}
+
+// Cache scope determines isolation level
+enum CacheScope {
+  // Shared across all repositories (e.g., cargo registry, pnpm store)
+  CACHE_SCOPE_SHARED = 0;
+
+  // Namespaced per repository (e.g., target directory, node_modules)
+  CACHE_SCOPE_PER_REPO = 1;
+}
+
+// Request for a cache mount
+message CacheRequest {
+  // Name of the cache bucket (must match server config)
+  string bucket = 1;
+
+  // Primary cache key (e.g., "lock-a1b2c3d4" for lockfile hash)
+  string key = 2;
+
+  // Fallback keys to try if primary doesn't exist (in order)
+  repeated string fallback_keys = 3;
+
+  // Scope of the cache (shared or per-repo)
+  CacheScope scope = 4;
+
+  // Mount path inside the sandbox (e.g., "/cargo", "/target")
+  string mount_path = 5;
+
+  // Environment variable to set (e.g., "CARGO_HOME")
+  // If set, the env var will be set to the mount_path value
+  optional string env_var = 6;
 }
 
 // Response containing the job ID

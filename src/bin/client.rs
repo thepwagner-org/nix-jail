@@ -526,6 +526,7 @@ async fn exec_job(
         hardening_profile,
         push: Some(push),
         interactive: None, // Not interactive for exec mode
+        caches: vec![],    // Use server defaults
     });
 
     let job_id = {

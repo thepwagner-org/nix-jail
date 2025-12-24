@@ -86,9 +86,6 @@
     ''}
     [cache]
     enabled = ${lib.boolToString cfg.cache.enable}
-    ${lib.optionalString (cfg.cache.cargoHome != null) ''cargo_home = "${cfg.cache.cargoHome}"''}
-    ${lib.optionalString (cfg.cache.targetCacheDir != null) ''target_cache_dir = "${cfg.cache.targetCacheDir}"''}
-    ${lib.optionalString (cfg.cache.pnpmStore != null) ''pnpm_store = "${cfg.cache.pnpmStore}"''}
   '';
 in {
   options.services.nix-jail = {
@@ -146,22 +143,11 @@ in {
       enable = lib.mkOption {
         type = lib.types.bool;
         default = true;
-        description = "Enable cargo/build caching";
-      };
-      cargoHome = lib.mkOption {
-        type = lib.types.nullOr lib.types.path;
-        default = "/var/lib/nix-jail/cargo";
-        description = "Shared CARGO_HOME directory for registry and git deps";
-      };
-      targetCacheDir = lib.mkOption {
-        type = lib.types.nullOr lib.types.path;
-        default = "/var/lib/nix-jail/target";
-        description = "Base directory for per-repo target caches";
-      };
-      pnpmStore = lib.mkOption {
-        type = lib.types.nullOr lib.types.path;
-        default = "/var/lib/nix-jail/pnpm";
-        description = "Shared pnpm store directory";
+        description = ''
+          Enable caching. When enabled, clients can request cache mounts by bucket name.
+          Cache directories are created dynamically under {stateDirectory}/cache/{bucket}/
+          Bucket names are validated to be alphanumeric with hyphens/underscores.
+        '';
       };
     };
   };
@@ -189,12 +175,10 @@ in {
     # Create directories with proper permissions
     systemd.tmpfiles.rules = [
       "d /var/run/netns 0775 root nix-jail -"
-    ] ++ lib.optionals cfg.cache.enable ([
-      "d ${cfg.cache.cargoHome} 0755 nix-jail nix-jail -"
-      "d ${cfg.cache.targetCacheDir} 0755 nix-jail nix-jail -"
-    ] ++ lib.optionals (cfg.cache.pnpmStore != null) [
-      "d ${cfg.cache.pnpmStore} 0755 nix-jail nix-jail -"
-    ]);
+    ] ++ lib.optionals cfg.cache.enable [
+      # Base cache directory - buckets are created dynamically by the daemon
+      "d ${cfg.stateDirectory}/cache 0755 root root -"
+    ];
 
     # Allow proxy port from nix-jail network namespaces (vp-* veth interfaces)
     networking.firewall.interfaces."vp-+".allowedTCPPorts = [3128];

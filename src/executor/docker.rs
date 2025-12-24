@@ -230,22 +230,19 @@ fn add_filesystem_mounts(cmd: &mut Command, config: &ExecutionConfig) {
         ));
     }
 
-    // Cargo cache volumes (Docker uses named volumes for performance)
-    if config.cache_enabled {
-        if let Some(ref repo_hash) = config.repo_hash {
-            // Shared CARGO_HOME volume (registry, git deps)
-            let _ = cmd.arg("-v").arg("nix-jail-cargo:/cargo");
-
-            // Per-repo target cache volume (keyed by first 12 chars of repo hash)
-            let target_volume =
-                format!("nix-jail-target-{}", &repo_hash[..12.min(repo_hash.len())]);
-            let _ = cmd.arg("-v").arg(format!("{}:/target", target_volume));
-
-            tracing::debug!(
-                cargo_volume = "nix-jail-cargo",
-                target_volume = %target_volume,
-                "configured cargo cache volumes"
-            );
+    // Cache volumes from resolved cache mounts
+    for mount in &config.cache_mounts {
+        // For Docker, prefer named volumes if configured, else bind-mount host path
+        if let Some(ref volume_name) = mount.docker_volume {
+            let _ = cmd
+                .arg("-v")
+                .arg(format!("{}:{}", volume_name, mount.mount_path));
+        } else {
+            let _ = cmd.arg("-v").arg(format!(
+                "{}:{}",
+                mount.host_path.display(),
+                mount.mount_path
+            ));
         }
     }
 }
@@ -343,10 +340,13 @@ impl Executor for DockerExecutor {
         // Set TERM=dumb to prevent ANSI escape codes
         let _ = cmd.arg("-e").arg("TERM=dumb");
 
-        // Cargo cache environment variables (if cache volumes are mounted)
-        if config.cache_enabled && config.repo_hash.is_some() {
-            let _ = cmd.arg("-e").arg("CARGO_HOME=/cargo");
-            let _ = cmd.arg("-e").arg("CARGO_TARGET_DIR=/target");
+        // Cache environment variables from resolved cache mounts
+        for mount in &config.cache_mounts {
+            if let Some(ref env_var) = mount.env_var {
+                let _ = cmd
+                    .arg("-e")
+                    .arg(format!("{}={}", env_var, mount.mount_path));
+            }
         }
 
         for (key, value) in &config.env {

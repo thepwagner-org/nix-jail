@@ -31,6 +31,7 @@ pub mod systemd;
 // Re-export main types
 pub use traits::{
     ExecutionConfig, ExecutionHandle, Executor, ExecutorError, HardeningProfile, IoHandle,
+    ResolvedCacheMount,
 };
 
 // Re-export types module for backward compatibility

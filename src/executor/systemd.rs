@@ -186,51 +186,25 @@ fn generate_hardening_properties(
         }
     }
 
-    // Cargo caching bind-mounts (shared CARGO_HOME and per-repo target cache)
-    if config.cache_enabled {
-        if let Some(ref cargo_home) = config.cargo_home {
-            // Bind-mount shared CARGO_HOME for registry/deps
-            // Create host directory if needed (daemon runs as root)
-            if let Err(e) = std::fs::create_dir_all(cargo_home) {
-                tracing::warn!(path = %cargo_home.display(), error = %e, "failed to create cargo home");
-            }
-            props.push(format!(
-                "--property=BindPaths={}:/cargo",
-                cargo_home.display()
-            ));
+    // Cache bind-mounts from resolved cache mounts
+    for mount in &config.cache_mounts {
+        // Create host directory if needed (daemon runs as root)
+        if let Err(e) = std::fs::create_dir_all(&mount.host_path) {
+            tracing::warn!(path = %mount.host_path.display(), error = %e, "failed to create cache dir");
         }
-
-        if let (Some(ref base), Some(ref repo_hash)) = (&config.target_cache_dir, &config.repo_hash)
-        {
-            // Per-repo target cache (keyed by first 12 chars of repo hash)
-            let target_cache = base.join(&repo_hash[..12.min(repo_hash.len())]);
-            if let Err(e) = std::fs::create_dir_all(&target_cache) {
-                tracing::warn!(path = %target_cache.display(), error = %e, "failed to create target cache");
-            }
-            // Chown to nix-jail (daemon runs as root, job runs as nix-jail)
-            let _ = std::process::Command::new("chown")
-                .args(["-R", "nix-jail:nix-jail", &target_cache.to_string_lossy()])
-                .output();
-            props.push(format!(
-                "--property=BindPaths={}:/target",
-                target_cache.display()
-            ));
-        }
-
-        if let Some(ref pnpm_store) = config.pnpm_store {
-            // Bind-mount shared pnpm store
-            if let Err(e) = std::fs::create_dir_all(pnpm_store) {
-                tracing::warn!(path = %pnpm_store.display(), error = %e, "failed to create pnpm store");
-            }
-            // Chown to nix-jail (daemon runs as root, job runs as nix-jail)
-            let _ = std::process::Command::new("chown")
-                .args(["-R", "nix-jail:nix-jail", &pnpm_store.to_string_lossy()])
-                .output();
-            props.push(format!(
-                "--property=BindPaths={}:/pnpm-store",
-                pnpm_store.display()
-            ));
-        }
+        // Chown to nix-jail (daemon runs as root, job runs as nix-jail)
+        let _ = std::process::Command::new("chown")
+            .args([
+                "-R",
+                "nix-jail:nix-jail",
+                &mount.host_path.to_string_lossy(),
+            ])
+            .output();
+        props.push(format!(
+            "--property=BindPaths={}:{}",
+            mount.host_path.display(),
+            mount.mount_path
+        ));
     }
 
     props
@@ -816,17 +790,12 @@ impl Executor for SystemdExecutor {
                 .arg(format!("{}={}", key, normalized_value));
         }
 
-        // Cargo cache environment variables (paths inside chroot)
-        if config.cache_enabled {
-            if config.cargo_home.is_some() {
-                let _ = cmd.arg("--setenv").arg("CARGO_HOME=/cargo");
-            }
-            if config.target_cache_dir.is_some() && config.repo_hash.is_some() {
-                let _ = cmd.arg("--setenv").arg("CARGO_TARGET_DIR=/target");
-            }
-            if config.pnpm_store.is_some() {
-                let _ = cmd.arg("--setenv").arg("PNPM_HOME=/pnpm-store");
-                let _ = cmd.arg("--setenv").arg("PNPM_STORE_DIR=/pnpm-store/store");
+        // Cache environment variables from resolved cache mounts
+        for mount in &config.cache_mounts {
+            if let Some(ref env_var) = mount.env_var {
+                let _ = cmd
+                    .arg("--setenv")
+                    .arg(format!("{}={}", env_var, mount.mount_path));
             }
         }
 
@@ -1145,11 +1114,7 @@ mod tests {
             hardening_profile: HardeningProfile::Default,
             interactive: false,
             pty_size: None,
-            repo_hash: None,
-            cache_enabled: false,
-            cargo_home: None,
-            target_cache_dir: None,
-            pnpm_store: None,
+            cache_mounts: vec![],
         };
 
         let props = generate_hardening_properties(
@@ -1261,11 +1226,7 @@ mod tests {
             hardening_profile: HardeningProfile::Default,
             interactive: false,
             pty_size: None,
-            repo_hash: None,
-            cache_enabled: false,
-            cargo_home: None,
-            target_cache_dir: None,
-            pnpm_store: None,
+            cache_mounts: vec![],
         };
 
         let props = generate_hardening_properties(
@@ -1476,11 +1437,7 @@ mod tests {
             hardening_profile: HardeningProfile::Default,
             interactive: false,
             pty_size: None,
-            repo_hash: None,
-            cache_enabled: false,
-            cargo_home: None,
-            target_cache_dir: None,
-            pnpm_store: None,
+            cache_mounts: vec![],
         };
 
         let props_default = generate_hardening_properties(
@@ -1510,11 +1467,7 @@ mod tests {
             hardening_profile: HardeningProfile::JitRuntime,
             interactive: false,
             pty_size: None,
-            repo_hash: None,
-            cache_enabled: false,
-            cargo_home: None,
-            target_cache_dir: None,
-            pnpm_store: None,
+            cache_mounts: vec![],
         };
 
         let props_jit = generate_hardening_properties(
@@ -1576,11 +1529,7 @@ mod tests {
             hardening_profile: HardeningProfile::Default,
             interactive: false,
             pty_size: None,
-            repo_hash: None,
-            cache_enabled: false,
-            cargo_home: None,
-            target_cache_dir: None,
-            pnpm_store: None,
+            cache_mounts: vec![],
         };
 
         let executor = SystemdExecutor::new();

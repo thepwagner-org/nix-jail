@@ -61,68 +61,40 @@ impl Executor for SandboxExecutor {
                 .canonicalize()
                 .unwrap_or_else(|_| config.root_dir.clone());
 
-            // Set up cache paths for sandbox profile (if caching enabled)
-            // IMPORTANT: Canonicalize paths to handle /tmp -> /private/tmp symlink on macOS
-            let cache_paths = if config.cache_enabled {
-                let cargo_home = config.cargo_home.as_ref().and_then(|p| {
+            // Canonicalize cache mount paths (handle /tmp -> /private/tmp symlink on macOS)
+            let canonical_cache_mounts: Vec<super::traits::ResolvedCacheMount> = config
+                .cache_mounts
+                .iter()
+                .filter_map(|mount| {
                     // Ensure directory exists before canonicalizing
-                    if let Err(e) = std::fs::create_dir_all(p) {
-                        tracing::warn!(path = %p.display(), error = %e, "failed to create cargo home dir");
+                    if let Err(e) = std::fs::create_dir_all(&mount.host_path) {
+                        tracing::warn!(path = %mount.host_path.display(), error = %e, "failed to create cache dir");
                     }
-                    p.canonicalize().ok()
-                });
-                let target_dir = match (&config.target_cache_dir, &config.repo_hash) {
-                    (Some(base), Some(hash)) => {
-                        let dir = base.join(&hash[..12.min(hash.len())]);
-                        // Ensure the target cache directory exists before canonicalizing
-                        if let Err(e) = std::fs::create_dir_all(&dir) {
-                            tracing::warn!(path = %dir.display(), error = %e, "failed to create target cache dir");
+                    mount.host_path.canonicalize().ok().map(|canonical_path| {
+                        super::traits::ResolvedCacheMount {
+                            host_path: canonical_path,
+                            mount_path: mount.mount_path.clone(),
+                            env_var: mount.env_var.clone(),
+                            docker_volume: mount.docker_volume.clone(),
                         }
-                        dir.canonicalize().ok()
-                    }
-                    _ => None,
-                };
-                let pnpm_store = config.pnpm_store.as_ref().and_then(|p| {
-                    if let Err(e) = std::fs::create_dir_all(p) {
-                        tracing::warn!(path = %p.display(), error = %e, "failed to create pnpm store dir");
-                    }
-                    p.canonicalize().ok()
-                });
-                Some(super::sandbox_policy::CachePaths {
-                    cargo_home,
-                    target_dir,
-                    pnpm_store,
+                    })
                 })
-            } else {
-                None
-            };
+                .collect();
 
             let profile = super::sandbox_policy::generate_profile_with_cache(
                 closure,
                 &canonical_workspace,
                 &canonical_root,
                 config.proxy_port,
-                cache_paths.as_ref(),
+                &canonical_cache_mounts,
             );
 
             // Build environment with cache variables
             let mut env = config.env.clone();
-            if let Some(ref cache) = cache_paths {
-                if let Some(ref cargo_home) = cache.cargo_home {
-                    let _ = env.insert("CARGO_HOME".to_string(), cargo_home.display().to_string());
-                }
-                if let Some(ref target_dir) = cache.target_dir {
-                    let _ = env.insert(
-                        "CARGO_TARGET_DIR".to_string(),
-                        target_dir.display().to_string(),
-                    );
-                }
-                if let Some(ref pnpm_store) = cache.pnpm_store {
-                    let _ = env.insert("PNPM_HOME".to_string(), pnpm_store.display().to_string());
-                    let _ = env.insert(
-                        "PNPM_STORE_DIR".to_string(),
-                        format!("{}/store", pnpm_store.display()),
-                    );
+            for mount in &canonical_cache_mounts {
+                if let Some(ref env_var) = mount.env_var {
+                    // On macOS, use the host path (not mount_path) since there's no chroot
+                    let _ = env.insert(env_var.clone(), mount.host_path.display().to_string());
                 }
             }
 
