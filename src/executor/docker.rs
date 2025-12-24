@@ -512,9 +512,18 @@ impl Executor for DockerExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
-    /// Helper to check if Docker is available
+    /// Check if Docker socket exists (faster than running docker version)
+    fn docker_socket_exists() -> bool {
+        Path::new("/var/run/docker.sock").exists()
+    }
+
+    /// Helper to check if Docker is available (socket + daemon running)
     async fn docker_available() -> bool {
+        if !docker_socket_exists() {
+            return false;
+        }
         Command::new("docker")
             .args(["version"])
             .stdout(Stdio::null())
@@ -640,5 +649,74 @@ mod tests {
         let gateway_ip = gateway.unwrap();
         assert!(!gateway_ip.is_empty(), "gateway IP should not be empty");
         tracing::debug!(gateway = %gateway_ip, "docker network gateway");
+    }
+
+    // ========== Execution tests using generic test suite ==========
+    // These tests require Docker to be running
+
+    use crate::executor::executor_tests;
+
+    #[tokio::test]
+    async fn test_docker_success_execution() {
+        if !docker_available().await {
+            return;
+        }
+        executor_tests::test_success_execution(&DockerExecutor::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_docker_stderr_capture() {
+        if !docker_available().await {
+            return;
+        }
+        executor_tests::test_stderr_capture(&DockerExecutor::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_docker_non_zero_exit() {
+        if !docker_available().await {
+            return;
+        }
+        executor_tests::test_non_zero_exit(&DockerExecutor::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_docker_timeout_handling() {
+        if !docker_available().await {
+            return;
+        }
+        executor_tests::test_timeout_handling(&DockerExecutor::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_docker_multiline_output() {
+        if !docker_available().await {
+            return;
+        }
+        executor_tests::test_multiline_output(&DockerExecutor::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_docker_working_directory() {
+        if !docker_available().await {
+            return;
+        }
+        executor_tests::test_working_directory(&DockerExecutor::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_docker_environment_variables() {
+        if !docker_available().await {
+            return;
+        }
+        executor_tests::test_environment_variables(&DockerExecutor::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_docker_empty_command_error_generic() {
+        if !docker_available().await {
+            return;
+        }
+        executor_tests::test_empty_command_error(&DockerExecutor::new()).await;
     }
 }
