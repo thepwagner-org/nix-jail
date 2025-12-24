@@ -460,6 +460,15 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
     let tmp_dir = workspace_dir.join("tmp");
     let _ = std::fs::create_dir_all(&tmp_dir);
 
+    // Chown job directory to nix-jail so jobs can write to it
+    // (daemon runs as root, jobs run as nix-jail user)
+    if let Err(e) = std::process::Command::new("chown")
+        .args(["-R", "nix-jail:nix-jail", &job_dir.base.to_string_lossy()])
+        .output()
+    {
+        tracing::warn!(job_id = %job_id, error = %e, "failed to chown job directory");
+    }
+
     // Configure execution environment
     let mut env = build_environment(
         proxy.as_ref(),
@@ -1352,6 +1361,15 @@ pub async fn execute_local(
     // Create tmp directory for the job
     let tmp_dir = config.working_dir.join("tmp");
     let _ = std::fs::create_dir_all(&tmp_dir);
+
+    // Chown job directory to nix-jail so jobs can write to it
+    // (daemon runs as root, jobs run as nix-jail user)
+    if let Err(e) = std::process::Command::new("chown")
+        .args(["-R", "nix-jail:nix-jail", &job_dir.base.to_string_lossy()])
+        .output()
+    {
+        tracing::warn!(job_id = %job_id, error = %e, "failed to chown job directory");
+    }
 
     let mut env = build_environment(
         proxy.as_ref(),
