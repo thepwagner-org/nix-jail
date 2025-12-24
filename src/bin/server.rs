@@ -45,6 +45,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(database = ?db_path, "initializing storage");
 
+    // Clean up orphaned job directories from previous daemon runs
+    // This handles btrfs subvolumes that weren't properly deleted due to crashes
+    nix_jail::job_dir::cleanup_orphaned_jobs(&config.state_dir);
+
     // Clean up stale network namespaces from previous daemon runs
     // This prevents IP conflicts when the daemon restarts
     #[cfg(target_os = "linux")]

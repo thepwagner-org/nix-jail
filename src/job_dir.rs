@@ -4,6 +4,7 @@
 //! The orchestrator is responsible for setup and cleanup - this is just a container.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 // Re-export from root for convenience
 pub use crate::root::{get_job_root, JobRoot, RootError, StoreSetup, StoreStrategy};
@@ -52,6 +53,84 @@ impl JobDirectory {
             workspace,
             root,
         })
+    }
+}
+
+/// Clean up orphaned job directories from previous daemon runs
+///
+/// Scans {state_dir}/jobs/ and removes any remaining job directories,
+/// properly handling btrfs subvolumes. Call this at daemon startup to
+/// garbage collect jobs that weren't cleaned up due to crashes.
+pub fn cleanup_orphaned_jobs(state_dir: &Path) {
+    let jobs_dir = state_dir.join("jobs");
+    if !jobs_dir.exists() {
+        return;
+    }
+
+    let entries = match std::fs::read_dir(&jobs_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read jobs directory");
+            return;
+        }
+    };
+
+    let mut cleaned = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let job_id = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Try to delete workspace subvolume
+        let workspace = path.join("workspace");
+        if workspace.exists() {
+            delete_btrfs_subvolume(&workspace);
+        }
+
+        // Try to delete root subvolume
+        let root = path.join("root");
+        if root.exists() {
+            delete_btrfs_subvolume(&root);
+        }
+
+        // Remove the job directory itself
+        if let Err(e) = std::fs::remove_dir_all(&path) {
+            tracing::warn!(job_id, error = %e, "failed to remove orphaned job directory");
+        } else {
+            cleaned += 1;
+            tracing::debug!(job_id, "cleaned up orphaned job directory");
+        }
+    }
+
+    if cleaned > 0 {
+        tracing::info!(count = cleaned, "cleaned up orphaned job directories");
+    }
+}
+
+/// Delete a path, trying btrfs subvolume delete first
+fn delete_btrfs_subvolume(path: &Path) {
+    // Try btrfs subvolume delete first
+    let output = Command::new("btrfs")
+        .args(["subvolume", "delete"])
+        .arg(path)
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            tracing::debug!(path = %path.display(), "deleted btrfs subvolume");
+        }
+        _ => {
+            // Not a subvolume or btrfs not available, try rm -rf
+            if let Err(e) = std::fs::remove_dir_all(path) {
+                tracing::warn!(path = %path.display(), error = %e, "failed to delete directory");
+            }
+        }
     }
 }
 
