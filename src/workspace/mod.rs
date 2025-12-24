@@ -50,6 +50,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore] // Requires Nix to be installed
     async fn test_find_coreutils_derivation() {
         let derivation = nix::find_coreutils_derivation()
             .await
