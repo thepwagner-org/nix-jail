@@ -35,7 +35,10 @@ impl RepoMirror {
     /// the remote requires authentication not available via token.
     /// The repo_url parameter is ignored since we use the existing local repo.
     pub fn sync(&self, _repo_url: &str, token: Option<&str>) -> Result<PathBuf, WorkspaceError> {
-        if !self.local_repo.exists() || !self.local_repo.join(".git").exists() {
+        // Check for either a regular repo (.git subdir) or a bare repo (HEAD file directly)
+        let is_regular_repo = self.local_repo.join(".git").exists();
+        let is_bare_repo = self.local_repo.join("HEAD").exists();
+        if !self.local_repo.exists() || (!is_regular_repo && !is_bare_repo) {
             return Err(WorkspaceError::InvalidPath(format!(
                 "local repository does not exist: {}",
                 self.local_repo.display()
