@@ -522,10 +522,9 @@ impl CachedJobWorkspace {
                 // Move to cache
                 std::fs::rename(&temp_clone, &cached_clone)?;
             } else {
-                // Full clone
-                storage
-                    .create_dir(&temp_clone)
-                    .map_err(|e| WorkspaceError::IoError(std::io::Error::other(e.to_string())))?;
+                // Full clone - use regular directory (not subvolume) for temp
+                // so we can rename out of it without cross-device errors
+                std::fs::create_dir_all(&temp_clone)?;
 
                 git::clone_repository(repo, &temp_clone, Some(commit_sha), github_token)?;
 
@@ -538,7 +537,7 @@ impl CachedJobWorkspace {
 
                 // Move cloned src to cache location
                 std::fs::rename(&cloned_src, &cached_clone)?;
-                let _ = storage.delete_dir(&temp_clone);
+                let _ = std::fs::remove_dir_all(&temp_clone);
             }
 
             // Snapshot from cache to workspace
