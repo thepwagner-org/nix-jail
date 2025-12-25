@@ -522,8 +522,8 @@ impl CachedJobWorkspace {
                 // Move to cache
                 std::fs::rename(&temp_clone, &cached_clone)?;
             } else {
-                // Full clone - use regular directory (not subvolume) for temp
-                // so we can rename out of it without cross-device errors
+                // Full clone - use regular directory for temp (so we can work with it),
+                // then copy into a btrfs subvolume for the cache entry
                 std::fs::create_dir_all(&temp_clone)?;
 
                 git::clone_repository(repo, &temp_clone, Some(commit_sha), github_token)?;
@@ -535,8 +535,27 @@ impl CachedJobWorkspace {
                     ));
                 }
 
-                // Move cloned src to cache location
-                std::fs::rename(&cloned_src, &cached_clone)?;
+                // Create cache entry as btrfs subvolume and copy contents into it
+                storage
+                    .create_dir(&cached_clone)
+                    .map_err(|e| WorkspaceError::IoError(std::io::Error::other(e.to_string())))?;
+
+                // Copy contents (not the directory itself) into the subvolume
+                // Using cp with /. suffix copies contents rather than creating a subdirectory
+                let cloned_src_contents = format!("{}/.", cloned_src.display());
+                let output = std::process::Command::new("cp")
+                    .args(["-a", "--reflink=auto", &cloned_src_contents])
+                    .arg(&cached_clone)
+                    .output()
+                    .map_err(WorkspaceError::IoError)?;
+
+                if !output.status.success() {
+                    return Err(WorkspaceError::IoError(std::io::Error::other(format!(
+                        "failed to copy clone to cache: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ))));
+                }
+
                 let _ = std::fs::remove_dir_all(&temp_clone);
             }
 
