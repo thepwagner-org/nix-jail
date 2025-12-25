@@ -190,7 +190,8 @@ pub fn service(
     tracing::info!(strategy = ?job_root, "initialized job root");
 
     // Create job workspace based on cache availability
-    let job_workspace = job_workspace::get_job_workspace(Some(cache_manager.clone()));
+    let job_workspace =
+        job_workspace::get_job_workspace(Some(cache_manager.clone()), config.monorepo_path.clone());
     tracing::info!(strategy = ?job_workspace, "initialized job workspace");
 
     let registry = job_registry::JobRegistry::new();

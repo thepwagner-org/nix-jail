@@ -636,9 +636,22 @@ impl CachedJobWorkspace {
 ///
 /// If cache_manager is provided, uses CachedJobWorkspace for efficient operations.
 /// Otherwise uses StandardJobWorkspace.
-pub fn get_job_workspace(cache_manager: Option<CacheManager>) -> Arc<dyn JobWorkspace> {
+///
+/// If monorepo_path is provided, enables sparse checkout support using the local
+/// repository as a mirror for ref resolution and object fetching.
+pub fn get_job_workspace(
+    cache_manager: Option<CacheManager>,
+    monorepo_path: Option<std::path::PathBuf>,
+) -> Arc<dyn JobWorkspace> {
     match cache_manager {
-        Some(cm) => Arc::new(CachedJobWorkspace::new(cm)),
+        Some(cm) => {
+            let workspace = CachedJobWorkspace::new(cm);
+            let workspace = match monorepo_path {
+                Some(path) => workspace.with_mirror(path),
+                None => workspace,
+            };
+            Arc::new(workspace)
+        }
         None => Arc::new(StandardJobWorkspace::new()),
     }
 }

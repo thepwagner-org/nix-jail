@@ -63,6 +63,7 @@
     addr = "${cfg.addr}"
     state_dir = "${cfg.stateDirectory}"
     db_path = "nix-jail.db"
+    ${lib.optionalString (cfg.monorepoPath != null) ''monorepo_path = "${cfg.monorepoPath}"''}
 
     ${lib.concatMapStringsSep "\n" (cred: ''
       [[credentials]]
@@ -149,6 +150,16 @@ in {
           Bucket names are validated to be alphanumeric with hyphens/underscores.
         '';
       };
+    };
+
+    monorepoPath = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Path to a local bare clone of the monorepo for sparse checkout support.
+        When set, jobs only check out the specific project path, not the entire repo.
+        This improves security by preventing data leakage between projects.
+      '';
     };
   };
 
