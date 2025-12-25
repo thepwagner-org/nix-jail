@@ -195,6 +195,7 @@ in {
           ExecStart = "${cfg.package}/bin/nixjaild -c ${configFile}";
           Restart = "on-failure";
           RestartSec = "5s";
+          TimeoutStopSec = "10s";
           StateDirectory = "nix-jail";
           StateDirectoryMode = "0750";
           # TODO: Running as root for now - network namespace setup fails with nix-jail user
