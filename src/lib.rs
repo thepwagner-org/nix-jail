@@ -1,4 +1,4 @@
-// nix-jail: sandboxed nix execution environment
+// nix-jail: sandboxed nix execution environment with sparse checkout support
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::{
