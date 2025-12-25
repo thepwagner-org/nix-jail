@@ -173,6 +173,22 @@ pub struct BtrfsStorage;
 
 impl WorkspaceStorage for BtrfsStorage {
     fn create_dir(&self, path: &Path) -> Result<(), StorageError> {
+        // Clean up any existing directory (from a crashed job)
+        if path.exists() {
+            debug!(path = %path.display(), "removing stale directory before subvolume create");
+            // Try btrfs subvolume delete first (in case it's a subvolume)
+            let is_subvolume = Command::new("btrfs")
+                .args(["subvolume", "delete"])
+                .arg(path)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !is_subvolume {
+                // Not a subvolume, try regular rm
+                std::fs::remove_dir_all(path)?;
+            }
+        }
+
         debug!(path = %path.display(), "creating btrfs subvolume");
         let output = Command::new("btrfs")
             .args(["subvolume", "create"])
