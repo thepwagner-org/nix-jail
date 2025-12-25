@@ -198,7 +198,7 @@ in {
       description = "nix-jail sandbox daemon";
       wantedBy = ["multi-user.target"];
       after = ["network.target"];
-      path = [pkgs.nix pkgs.iproute2 pkgs.btrfs-progs];
+      path = [pkgs.nix pkgs.git pkgs.iproute2 pkgs.btrfs-progs];
 
       serviceConfig =
         {
