@@ -33,8 +33,8 @@ impl RepoMirror {
     ///
     /// Optionally fetches all refs from the remote. Fetch can fail if
     /// the remote requires authentication not available via token.
-    /// The repo_url parameter is ignored since we use the existing local repo.
-    pub fn sync(&self, _repo_url: &str, token: Option<&str>) -> Result<PathBuf, WorkspaceError> {
+    /// Uses repo_url to set/update the origin remote before fetching.
+    pub fn sync(&self, repo_url: &str, token: Option<&str>) -> Result<PathBuf, WorkspaceError> {
         // Check for either a regular repo (.git subdir) or a bare repo (HEAD file directly)
         let is_regular_repo = self.local_repo.join(".git").exists();
         let is_bare_repo = self.local_repo.join("HEAD").exists();
@@ -52,7 +52,7 @@ impl RepoMirror {
 
         // Try to fetch, but don't fail if auth isn't available
         // (the local repo may already have the commits we need)
-        if let Err(e) = self.fetch_repo(&self.local_repo, token) {
+        if let Err(e) = self.fetch_repo(&self.local_repo, repo_url, token) {
             tracing::warn!(
                 error = %e,
                 "fetch failed, continuing with existing local refs"
@@ -63,10 +63,23 @@ impl RepoMirror {
     }
 
     /// Fetch all refs from the remote
-    fn fetch_repo(&self, repo_path: &Path, token: Option<&str>) -> Result<(), WorkspaceError> {
+    fn fetch_repo(
+        &self,
+        repo_path: &Path,
+        repo_url: &str,
+        token: Option<&str>,
+    ) -> Result<(), WorkspaceError> {
         let repo = Repository::open(repo_path).map_err(|e| {
             WorkspaceError::IoError(std::io::Error::other(format!(
                 "failed to open repository: {}",
+                e
+            )))
+        })?;
+
+        // Set origin URL to the job's repo URL (in case it was set incorrectly)
+        repo.remote_set_url("origin", repo_url).map_err(|e| {
+            WorkspaceError::IoError(std::io::Error::other(format!(
+                "failed to set origin url: {}",
                 e
             )))
         })?;
