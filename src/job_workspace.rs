@@ -506,10 +506,13 @@ impl CachedJobWorkspace {
                 })?;
                 let mirror_path = mirror.sync(repo, github_token)?;
 
-                let sparse_paths: Vec<&str> = path
+                // Include both the project path and nix/ for flake support
+                // (root flake.nix often imports nix/lib.nix)
+                let mut sparse_paths: Vec<&str> = path
                     .filter(|p| !p.is_empty() && *p != ".")
                     .into_iter()
                     .collect();
+                sparse_paths.push("nix");
 
                 git::sparse_checkout_from_mirror(
                     repo,
