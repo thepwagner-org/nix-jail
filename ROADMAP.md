@@ -262,3 +262,4 @@ Explicitly out of scope to keep the project focused:
 
 - [SANDBOX.md](SANDBOX.md) - Current implementation (what exists today)
 - [CLAUDE.md](CLAUDE.md) - Development guidelines, security rules, and design decisions
+
