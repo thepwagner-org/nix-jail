@@ -113,14 +113,15 @@ impl JailService for JailServiceImpl {
         &self,
         request: Request<JobRequest>,
     ) -> Result<Response<JobResponse>, Status> {
-        // Extract parent trace context from client and create span
+        // Extract parent trace context from client and create instrumented span
         let parent_context = extract_trace_context(&request);
         let span = tracing::info_span!("grpc.submit_job");
         let _ = span.set_parent(parent_context);
-        let _guard = span.enter();
 
         let req = request.into_inner();
+        let this = self.clone();
 
+        async move {
         // Validation
         validation::validate_script(&req.script)?;
         if !req.repo.is_empty() {
@@ -132,7 +133,7 @@ impl JailService for JailServiceImpl {
             }
         }
         if let Some(ref policy) = req.network_policy {
-            validation::validate_network_policy(policy, &self.config.credentials)?;
+            validation::validate_network_policy(policy, &this.config.credentials)?;
             tracing::debug!("validated network policy with {} rules", policy.rules.len());
         }
         if let Some(ref nixpkgs_version) = req.nixpkgs_version {
@@ -171,18 +172,18 @@ impl JailService for JailServiceImpl {
             created_at: SystemTime::now(),
             completed_at: None,
         };
-        self.storage
+        this.storage
             .save_job(&job_metadata)
             .map_err(|e| Status::internal(format!("Failed to save job: {}", e)))?;
 
         // Start job execution in background
         let job_for_exec = job_metadata.clone();
-        let storage_for_exec = self.storage.clone();
-        let config_for_exec = self.config.clone();
-        let registry_for_exec = self.registry.clone();
-        let executor_for_exec = self.executor.clone();
-        let job_root_for_exec = self.job_root.clone();
-        let job_workspace_for_exec = self.job_workspace.clone();
+        let storage_for_exec = this.storage.clone();
+        let config_for_exec = this.config.clone();
+        let registry_for_exec = this.registry.clone();
+        let executor_for_exec = this.executor.clone();
+        let job_root_for_exec = this.job_root.clone();
+        let job_workspace_for_exec = this.job_workspace.clone();
 
         // Create broadcast channel for this job
         let (log_tx, _) = tokio::sync::broadcast::channel(1000);
@@ -191,11 +192,11 @@ impl JailService for JailServiceImpl {
         // Generate WebSocket URL and register session if interactive
         let (websocket_url, session_registry_for_exec) = if interactive {
             // Register session for token validation (channels added by executor)
-            let token = self.session_registry.register(job_id.clone()).await;
+            let token = this.session_registry.register(job_id.clone()).await;
 
             // Calculate WebSocket URL (gRPC port + 1)
-            let ws_port = self.config.addr.port() + 1;
-            let ws_host = self.config.addr.ip();
+            let ws_port = this.config.addr.port() + 1;
+            let ws_host = this.config.addr.ip();
             let url = format!(
                 "ws://{}:{}/session/{}?token={}",
                 ws_host,
@@ -210,13 +211,13 @@ impl JailService for JailServiceImpl {
                 "created interactive session"
             );
 
-            (Some(url), Some(self.session_registry.clone()))
+            (Some(url), Some(this.session_registry.clone()))
         } else {
             (None, None)
         };
 
         // Spawn execution task with trace context propagated
-        let exec_span = tracing::info_span!(parent: &span, "execute_job", job_id = %job_id);
+        let exec_span = tracing::info_span!(parent: tracing::Span::current(), "execute_job", job_id = %job_id);
         let task_handle = tokio::spawn(
             async move {
                 orchestration::execute_job(
@@ -247,13 +248,14 @@ impl JailService for JailServiceImpl {
             log_tx,
             task_handle,
         };
-        let mut jobs = self.registry.jobs.write().await;
+        let mut jobs = this.registry.jobs.write().await;
         let _ = jobs.insert(job_id.clone(), running_job);
 
         Ok(Response::new(JobResponse {
             job_id,
             websocket_url,
         }))
+        }.instrument(span).await
     }
 
     type StreamJobStream = ReceiverStream<Result<LogEntry, Status>>;
