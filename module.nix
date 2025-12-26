@@ -64,6 +64,7 @@
     state_dir = "${cfg.stateDirectory}"
     db_path = "nix-jail.db"
     ${lib.optionalString (cfg.monorepoPath != null) ''monorepo_path = "${cfg.monorepoPath}"''}
+    ${lib.optionalString (cfg.otlpEndpoint != null) ''otlp_endpoint = "${cfg.otlpEndpoint}"''}
 
     ${lib.concatMapStringsSep "\n" (cred: ''
       [[credentials]]
@@ -160,6 +161,12 @@ in {
         When set, jobs only check out the specific project path, not the entire repo.
         This improves security by preventing data leakage between projects.
       '';
+    };
+
+    otlpEndpoint = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Optional OTLP endpoint for OpenTelemetry tracing (e.g., http://localhost:4317)";
     };
   };
 
