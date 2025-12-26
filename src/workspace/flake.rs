@@ -55,10 +55,6 @@ impl std::fmt::Display for FlakeSource {
 ///
 /// # Returns
 /// Some((flake_dir, output)) if found, None otherwise
-///
-/// Note: Currently unused - envrc detection is disabled to avoid sparse checkout issues.
-/// Kept for potential future use in `nj exec` mode where the full repo is available.
-#[allow(dead_code)]
 fn parse_envrc_flake(dir: &Path) -> Option<(PathBuf, Option<String>)> {
     let envrc_path = dir.join(".envrc");
     let content = fs::read_to_string(&envrc_path).ok()?;
@@ -124,21 +120,22 @@ fn parse_envrc_flake(dir: &Path) -> Option<(PathBuf, Option<String>)> {
 
 /// Detect flake source for a directory
 ///
-/// Only checks for local `flake.nix` file in the directory.
-///
-/// Note: We intentionally skip `.envrc` detection because:
-/// - `.envrc` `use flake` directives often point to parent directories (e.g., `../..`)
-/// - In sparse checkout scenarios, those parent flakes may have dependencies that
-///   weren't checked out (e.g., `nix/lib.nix`)
-/// - `.envrc` is designed for local development with direnv, not CI environments
+/// Checks for flake configuration in priority order:
+/// 1. `.envrc` with `use flake` directive (monorepo pattern)
+/// 2. Local `flake.nix` file
 ///
 /// # Arguments
 /// * `dir` - Directory to check for flake configuration
 ///
 /// # Returns
-/// Some(FlakeSource) if a local flake.nix is detected, None otherwise
+/// Some(FlakeSource) if a flake is detected, None otherwise
 pub fn detect_flake_source(dir: &Path) -> Option<FlakeSource> {
-    // Only check for local flake.nix (skip envrc to avoid sparse checkout issues)
+    // Priority 1: Check .envrc for use flake directive
+    if let Some((flake_dir, output)) = parse_envrc_flake(dir) {
+        return Some(FlakeSource::Envrc { flake_dir, output });
+    }
+
+    // Priority 2: Check for local flake.nix
     let flake_path = dir.join("flake.nix");
     if flake_path.exists() && flake_path.is_file() {
         return Some(FlakeSource::Local {
@@ -348,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn test_envrc_ignored_without_local_flake() {
+    fn test_parse_envrc_with_output() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
 
         // Create a parent "flake" directory
@@ -356,20 +353,81 @@ mod tests {
         fs::create_dir(&flake_dir).expect("Failed to create flake dir");
         fs::write(flake_dir.join("flake.nix"), "{}").expect("Failed to write flake.nix");
 
-        // Create a project subdirectory with .envrc but NO local flake.nix
+        // Create a project subdirectory with .envrc
         let project_dir = flake_dir.join("projects/my-project");
         fs::create_dir_all(&project_dir).expect("Failed to create project dir");
         fs::write(project_dir.join(".envrc"), "use flake ../..#my-project")
             .expect("Failed to write .envrc");
 
-        // Should return None - we intentionally skip envrc detection to avoid
-        // sparse checkout issues where parent flake deps may be missing
         let source = detect_flake_source(&project_dir);
-        assert!(source.is_none());
+        match source {
+            Some(FlakeSource::Envrc {
+                flake_dir: dir,
+                output,
+            }) => {
+                assert_eq!(dir, flake_dir.canonicalize().unwrap());
+                assert_eq!(output, Some("my-project".to_string()));
+            }
+            other => panic!("Expected Envrc, got {:?}", other),
+        }
     }
 
     #[test]
-    fn test_local_flake_takes_priority_over_envrc() {
+    fn test_parse_envrc_without_output() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+        // Create a parent "flake" directory
+        let flake_dir = temp_dir.path().join("flake-root");
+        fs::create_dir(&flake_dir).expect("Failed to create flake dir");
+        fs::write(flake_dir.join("flake.nix"), "{}").expect("Failed to write flake.nix");
+
+        // Create a project subdirectory with .envrc (no output fragment)
+        let project_dir = flake_dir.join("subdir");
+        fs::create_dir(&project_dir).expect("Failed to create project dir");
+        fs::write(project_dir.join(".envrc"), "use flake ..").expect("Failed to write .envrc");
+
+        let source = detect_flake_source(&project_dir);
+        match source {
+            Some(FlakeSource::Envrc {
+                flake_dir: dir,
+                output,
+            }) => {
+                assert_eq!(dir, flake_dir.canonicalize().unwrap());
+                assert_eq!(output, None);
+            }
+            other => panic!("Expected Envrc, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_envrc_with_comments() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+        // Create a parent "flake" directory
+        let flake_dir = temp_dir.path().join("flake-root");
+        fs::create_dir(&flake_dir).expect("Failed to create flake dir");
+        fs::write(flake_dir.join("flake.nix"), "{}").expect("Failed to write flake.nix");
+
+        // Create a project with .envrc containing comments
+        let project_dir = flake_dir.join("proj");
+        fs::create_dir(&project_dir).expect("Failed to create project dir");
+        fs::write(
+            project_dir.join(".envrc"),
+            "# This is a comment\n\nuse flake ..#proj\n# Another comment",
+        )
+        .expect("Failed to write .envrc");
+
+        let source = detect_flake_source(&project_dir);
+        match source {
+            Some(FlakeSource::Envrc { output, .. }) => {
+                assert_eq!(output, Some("proj".to_string()));
+            }
+            other => panic!("Expected Envrc, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_envrc_priority_over_local_flake() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
 
         // Create a parent "flake" directory
@@ -384,9 +442,9 @@ mod tests {
         fs::write(project_dir.join("flake.nix"), "{ outputs = {}; }")
             .expect("Failed to write local flake.nix");
 
-        // Local flake.nix should be detected (envrc is ignored)
+        // .envrc should take priority
         let source = detect_flake_source(&project_dir);
-        assert!(matches!(source, Some(FlakeSource::Local { .. })));
+        assert!(matches!(source, Some(FlakeSource::Envrc { .. })));
     }
 
     #[test]
