@@ -61,9 +61,9 @@ Make nix-jail easier to deploy and operate in production.
 - Environment variable overrides
 - Per-user vs system-wide settings
 **Observability:**
-- Metrics collection (Prometheus exporter?)
-- Structured logging (JSON)
-- Health check endpoints
+- See "Prometheus Metrics" section for detailed metrics design
+- Structured logging (JSON) - already implemented via tracing
+- Health check endpoints: `/health` returning 200 OK
 **Permissions:**
 - `nix-jail` group for access control
 - Per-user resource quotas
@@ -119,6 +119,82 @@ Beyond btrfs snapshots, explore multi-level caching strategies.
 **Smart invalidation:**
 - Nix derivation-based expiry
 - Automatic refresh when nixpkgs updates
+
+## Prometheus Metrics
+
+Expose `/metrics` endpoint for Prometheus scraping with job execution and cache performance data.
+
+### Proposed Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `nix_jail_jobs_total` | Counter | `status` | Jobs completed (success/failure/cancelled) |
+| `nix_jail_job_duration_seconds` | Histogram | - | Total job duration |
+| `nix_jail_phase_duration_seconds` | Histogram | `phase` | Duration by execution phase |
+| `nix_jail_cache_hits_total` | Counter | `cache_type` | Cache hits |
+| `nix_jail_cache_misses_total` | Counter | `cache_type` | Cache misses |
+| `nix_jail_closure_paths_total` | Histogram | - | Number of store paths per closure |
+| `nix_jail_closure_size_bytes` | Histogram | - | Closure size distribution |
+| `nix_jail_active_jobs` | Gauge | - | Currently running jobs |
+
+**Label values:**
+- `status`: `success`, `failure`, `cancelled`
+- `phase`: `closure_resolution`, `root_prepare`, `workspace_prepare`, `proxy_setup`, `execution`
+- `cache_type`: `workspace` (git sparse checkout), `root` (nix closure btrfs snapshot)
+
+### Implementation Pattern
+
+**Where to instrument** (existing tracing spans already mark these):
+- `orchestration.rs`: `setup_workspace`, `resolve_packages`, `compute_closure`, `prepare_root`, `start_proxy`
+- `cache/mod.rs`: `prepare_root()` returns cache hit/miss
+- `job_workspace.rs`: sparse checkout cache hit/miss at lines 477-523
+
+**Data flow option 1 - gRPC extension:**
+```protobuf
+message JobMetrics {
+  bool workspace_cache_hit = 1;
+  bool root_cache_hit = 2;
+  uint32 closure_resolution_ms = 3;
+  uint32 root_prepare_ms = 4;
+  uint32 workspace_prepare_ms = 5;
+  uint32 proxy_setup_ms = 6;
+  uint32 execution_ms = 7;
+  uint64 closure_size_bytes = 8;
+  uint32 closure_path_count = 9;
+}
+
+message JobInfo {
+  // ...existing fields...
+  optional JobMetrics metrics = 10;
+}
+```
+
+Clients (forgejo-nix-ci) can fetch `JobInfo` after completion and record metrics locally.
+
+**Data flow option 2 - native /metrics endpoint:**
+Add HTTP server to nix-jail daemon exposing Prometheus metrics directly. Requires:
+- `prometheus` crate
+- `axum` or `hyper` for HTTP
+- Config: `metrics_port = 9091`
+
+**Recommended:** Option 2 (native endpoint) for simplicity. Option 1 useful if clients need per-job breakdown.
+
+### Storage Schema Extension
+
+Add columns to `jobs` table:
+```sql
+ALTER TABLE jobs ADD COLUMN workspace_cache_hit BOOLEAN;
+ALTER TABLE jobs ADD COLUMN root_cache_hit BOOLEAN;
+ALTER TABLE jobs ADD COLUMN closure_resolution_ms INTEGER;
+ALTER TABLE jobs ADD COLUMN root_prepare_ms INTEGER;
+ALTER TABLE jobs ADD COLUMN workspace_prepare_ms INTEGER;
+ALTER TABLE jobs ADD COLUMN proxy_setup_ms INTEGER;
+ALTER TABLE jobs ADD COLUMN execution_ms INTEGER;
+ALTER TABLE jobs ADD COLUMN closure_size_bytes INTEGER;
+ALTER TABLE jobs ADD COLUMN closure_path_count INTEGER;
+```
+
+Populate during job execution in `orchestration.rs`.
 
 ## Observability & Debugging
 
