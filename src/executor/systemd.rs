@@ -768,9 +768,7 @@ impl Executor for SystemdExecutor {
         let _ = cmd
             .arg("--property=WorkingDirectory=/workspace")
             .arg("--setenv")
-            .arg("TERM=dumb")
-            .arg("--setenv")
-            .arg("LANG=C.UTF-8");
+            .arg("TERM=dumb");
 
         // Add environment variables, normalizing workspace paths to chroot-relative paths
         for (key, value) in &config.env {
