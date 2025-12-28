@@ -338,7 +338,9 @@ impl Executor for DockerExecutor {
 
         // Environment variables
         // Set TERM=dumb to prevent ANSI escape codes
+        // Set LANG=C.UTF-8 for proper UTF-8 text handling
         let _ = cmd.arg("-e").arg("TERM=dumb");
+        let _ = cmd.arg("-e").arg("LANG=C.UTF-8");
 
         // Cache environment variables from resolved cache mounts
         for mount in &config.cache_mounts {
