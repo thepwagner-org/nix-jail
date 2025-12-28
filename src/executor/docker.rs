@@ -145,8 +145,8 @@ fn add_resource_limits(cmd: &mut Command, config: &ExecutionConfig) {
     // Memory limit (matches systemd MemoryMax=4G)
     let _ = cmd.arg("--memory=4g");
 
-    // PID limit (matches systemd TasksMax=100)
-    let _ = cmd.arg("--pids-limit=100");
+    // PID limit (matches systemd TasksMax=512)
+    let _ = cmd.arg("--pids-limit=512");
 
     // File descriptor limit (matches systemd LimitNOFILE=1024)
     let _ = cmd.arg("--ulimit=nofile=1024:1024");

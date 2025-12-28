@@ -462,7 +462,7 @@ The SystemdExecutor applies 32 hardening properties across seven categories:
 | **Syscall Filtering** (4) | SystemCallFilter=@system-service, SystemCallErrorNumber=EPERM, SystemCallArchitectures=native, RestrictNamespaces=true | Allowlist safe syscalls, block dangerous operations |
 | **Memory/Execution** (3) | MemoryDenyWriteExecute, LockPersonality, RestrictRealtime | Prevent W^X violations and memory exploits |
 | **Network Isolation** (1) | RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 | Isolate network access to proxy-only communication |
-| **Resource Limits** (4) | RuntimeMaxSec, MemoryMax=4G, TasksMax=100, LimitNOFILE=1024 | Prevent resource exhaustion attacks |
+| **Resource Limits** (4) | RuntimeMaxSec, MemoryMax=4G, TasksMax=512, LimitNOFILE=1024 | Prevent resource exhaustion attacks |
 | **Cleanup/Isolation** (4) | RemoveIPC, KeyringMode=private, UMask=0000, ProtectClock | Clean up resources and isolate kernel interfaces (permissive umask safe due to chroot isolation) |
 
 **Note:** `PrivateNetwork=true` was replaced with `NetworkNamespacePath` to enable network namespace integration with the veth pair topology.

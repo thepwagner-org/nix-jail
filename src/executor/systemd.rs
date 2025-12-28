@@ -143,7 +143,7 @@ fn generate_hardening_properties(
     props.push(format!("--property=RuntimeMaxSec={}", timeout_secs));
     // Default resource limits - can be made configurable later
     props.push("--property=MemoryMax=4G".to_string());
-    props.push("--property=TasksMax=100".to_string());
+    props.push("--property=TasksMax=512".to_string());
     props.push("--property=LimitNOFILE=1024".to_string());
 
     // === Cleanup/Isolation (4 properties) ===
