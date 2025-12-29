@@ -1289,16 +1289,47 @@ async fn run_populate_phase(
 
     let handle = executor.execute(populate_config).await?;
 
-    // Wait for completion and collect exit code
-    // We don't stream logs for populate phase - it runs silently
+    // Collect output from the populate command for debugging on failure
+    let mut output_lines = Vec::new();
+    let (mut stdout_rx, mut stderr_rx) = match handle.io {
+        crate::executor::IoHandle::Piped { stdout, stderr } => (stdout, stderr),
+        crate::executor::IoHandle::Pty { .. } => {
+            // PTY mode shouldn't happen for populate phase (interactive=false)
+            unreachable!("populate phase should never use PTY mode");
+        }
+    };
+
+    // Drain stdout/stderr into output buffer
+    loop {
+        tokio::select! {
+            Some(line) = stdout_rx.recv() => {
+                output_lines.push(format!("stdout: {}", line));
+            }
+            Some(line) = stderr_rx.recv() => {
+                output_lines.push(format!("stderr: {}", line));
+            }
+            else => break,
+        }
+    }
+
     let exit_code = handle.exit_code.await.unwrap_or(-1);
 
-    tracing::debug!(
-        job_id = %job_id,
-        cache = %cache.bucket,
-        exit_code,
-        "populate phase completed"
-    );
+    // Log output on failure for debugging
+    if exit_code != 0 {
+        tracing::warn!(
+            job_id = %job_id,
+            cache = %cache.bucket,
+            exit_code,
+            output = ?output_lines,
+            "populate phase failed"
+        );
+    } else {
+        tracing::debug!(
+            job_id = %job_id,
+            cache = %cache.bucket,
+            "populate phase completed"
+        );
+    }
 
     Ok(exit_code)
 }
