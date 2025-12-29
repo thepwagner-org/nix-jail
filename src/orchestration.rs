@@ -69,6 +69,12 @@ pub enum OrchestrationError {
 
     #[error("proxy stderr not available")]
     ProxyStderrError,
+
+    #[error("cache populate phase failed for '{0}': {1}")]
+    PopulatePhaseError(String, String),
+
+    #[error("failed to create cache snapshot: {0}")]
+    SnapshotError(String),
 }
 
 /// Context for job execution containing all required services and configuration
@@ -583,10 +589,207 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
     };
 
     // Resolve cache mounts from client request (or empty if none specified)
+    // For caches with populate_command: run populate, snapshot, then mount live cache
     let cache_mounts = if job.caches.is_empty() {
         build_default_cache_mounts(&config, repo_hash.as_deref())
     } else {
-        resolve_caches(&job.caches, &config, repo_hash.as_deref())
+        // Partition caches: those with populate_command vs without
+        let (populate_caches, normal_caches): (Vec<_>, Vec<_>) = job
+            .caches
+            .clone()
+            .into_iter()
+            .partition(|c| c.populate_command.is_some());
+
+        // Phase 1: Run populate commands sequentially, then snapshot
+        let mut populated_mounts = Vec::new();
+        for cache in &populate_caches {
+            // SAFETY: Only called for caches where populate_command.is_some() from partition
+            #[allow(clippy::expect_used)]
+            let populate_cmd = cache
+                .populate_command
+                .as_ref()
+                .expect("populate_command is Some");
+            let cache_host_path = resolve_cache_host_path(cache, &config, repo_hash.as_deref());
+
+            // Ensure data directory exists
+            let data_path = match crate::cache::snapshots::ensure_data_dir(&cache_host_path) {
+                Ok(path) => path,
+                Err(e) => {
+                    log_sink.error(
+                        &job_id,
+                        &format!(
+                            "Failed to create cache data dir for {}: {}",
+                            cache.bucket, e
+                        ),
+                    );
+                    if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                        tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                    }
+                    return;
+                }
+            };
+
+            log_sink.info(
+                &job_id,
+                &format!(
+                    "Populate phase: running '{}' for cache {}",
+                    populate_cmd, cache.bucket
+                ),
+            );
+
+            // Run populate command
+            let populate_result = run_populate_phase(
+                &job_id,
+                cache,
+                &data_path,
+                proxy.as_ref().map(|p| p.port),
+                &executor,
+                &job_dir,
+                &env,
+                &closure,
+                &store_setup,
+                hardening_profile,
+            )
+            .await;
+
+            match populate_result {
+                Ok(0) => {
+                    log_sink.info(
+                        &job_id,
+                        &format!("Populate phase completed for cache {}", cache.bucket),
+                    );
+                }
+                Ok(exit_code) => {
+                    log_sink.error(
+                        &job_id,
+                        &format!(
+                            "Populate phase failed for cache {} (exit code {})",
+                            cache.bucket, exit_code
+                        ),
+                    );
+                    if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                        tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                    }
+                    return;
+                }
+                Err(e) => {
+                    log_sink.error(
+                        &job_id,
+                        &format!("Populate phase error for cache {}: {}", cache.bucket, e),
+                    );
+                    if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                        tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                    }
+                    return;
+                }
+            }
+
+            // Create snapshot of the populated cache
+            let workspace_storage = crate::cache::detect_storage(&config.cache_dir());
+            let snapshot_data_path = match crate::cache::snapshots::create_snapshot(
+                &cache_host_path,
+                populate_cmd,
+                &workspace_storage,
+            )
+            .await
+            {
+                Ok(snapshot_dir) => {
+                    log_sink.info(
+                        &job_id,
+                        &format!("Created snapshot for cache {}", cache.bucket),
+                    );
+
+                    // Clean up old snapshots (keep 3)
+                    let _ = crate::cache::snapshots::cleanup_snapshots(
+                        &cache_host_path,
+                        3,
+                        &workspace_storage,
+                    )
+                    .await;
+
+                    // Return path to the data directory inside the snapshot
+                    snapshot_dir.join("data")
+                }
+                Err(e) => {
+                    log_sink.error(
+                        &job_id,
+                        &format!(
+                            "Failed to create snapshot for cache {}: {}",
+                            cache.bucket, e
+                        ),
+                    );
+                    if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                        tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                    }
+                    return;
+                }
+            };
+
+            // Create a working copy from snapshot for this build (CoW on btrfs/reflink)
+            // This copy is writable but discarded after job - protects snapshot from corruption
+            let working_copies_dir = job_dir.base.join("cache-workcopies");
+            let working_copy_path = working_copies_dir.join(&cache.bucket);
+            if let Err(e) = std::fs::create_dir_all(&working_copies_dir) {
+                log_sink.error(
+                    &job_id,
+                    &format!("Failed to create working copy dir: {}", e),
+                );
+                if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                    tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                }
+                return;
+            }
+
+            if let Err(e) = crate::cache::snapshot_or_copy(
+                &snapshot_data_path,
+                &working_copy_path,
+                &workspace_storage,
+            )
+            .await
+            {
+                log_sink.error(
+                    &job_id,
+                    &format!(
+                        "Failed to create working copy for cache {}: {}",
+                        cache.bucket, e
+                    ),
+                );
+                if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                    tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                }
+                return;
+            }
+
+            log_sink.info(
+                &job_id,
+                &format!(
+                    "Created working copy for cache {} (will be discarded after job)",
+                    cache.bucket
+                ),
+            );
+
+            // Mount the working copy - writable, but discarded with job directory
+            let mount_path = if cache.mount_path.is_empty() {
+                format!("/{}", cache.bucket)
+            } else {
+                cache.mount_path.clone()
+            };
+
+            populated_mounts.push(ResolvedCacheMount {
+                host_path: working_copy_path,
+                mount_path,
+                env_var: cache.env_var.clone(),
+                docker_volume: None,
+            });
+        }
+
+        // Phase 2: Resolve normal caches (no populate_command)
+        let mut mounts = resolve_caches(&normal_caches, &config, repo_hash.as_deref());
+
+        // Add populated cache mounts
+        mounts.extend(populated_mounts);
+
+        mounts
     };
 
     let exec_config = ExecutionConfig {
@@ -986,6 +1189,118 @@ fn build_default_cache_mounts(
     // No default caches - clients must specify what they need
     // This is the new model where all ecosystem knowledge is in forgejo-nix-ci
     vec![]
+}
+
+/// Resolve the host path for a cache request (without fallback logic for populate phase)
+fn resolve_cache_host_path(
+    request: &CacheRequest,
+    config: &ServerConfig,
+    repo_hash: Option<&str>,
+) -> PathBuf {
+    let cache_dir = config.cache_dir();
+    let bucket_dir = cache_dir.join(&request.bucket);
+
+    match CacheScope::try_from(request.scope).unwrap_or(CacheScope::Shared) {
+        CacheScope::PerRepo => {
+            if let Some(hash) = repo_hash {
+                bucket_dir.join(hash).join(&request.key)
+            } else {
+                // Fallback to shared if no repo context
+                bucket_dir.join(&request.key)
+            }
+        }
+        CacheScope::Shared => bucket_dir.join(&request.key),
+    }
+}
+
+/// Run the populate phase for a cache with populate_command
+///
+/// Executes the populate command with:
+/// - Network access enabled (via proxy)
+/// - Cache mounted writable at the expected location
+/// - Same environment as the main job
+///
+/// Returns the exit code on success, or an error on failure to execute.
+#[allow(clippy::too_many_arguments, clippy::expect_used)]
+async fn run_populate_phase(
+    job_id: &str,
+    cache: &CacheRequest,
+    data_path: &Path,
+    proxy_port: Option<u16>,
+    executor: &Arc<dyn Executor>,
+    job_dir: &JobDirectory,
+    env: &HashMap<String, String>,
+    closure: &[PathBuf],
+    store_setup: &crate::root::StoreSetup,
+    hardening_profile: HardeningProfile,
+) -> Result<i32, crate::executor::ExecutorError> {
+    // SAFETY: Only called for caches where populate_command.is_some() from partition
+    let populate_cmd = cache
+        .populate_command
+        .as_ref()
+        .expect("populate_command is Some");
+
+    // Build command: bash -c "populate_command"
+    let command = vec!["bash".to_string(), "-c".to_string(), populate_cmd.clone()];
+
+    // Mount path for the cache
+    let mount_path = if cache.mount_path.is_empty() {
+        format!("/{}", cache.bucket)
+    } else {
+        cache.mount_path.clone()
+    };
+
+    // Create a single cache mount for this populate phase
+    let cache_mount = ResolvedCacheMount {
+        host_path: data_path.to_path_buf(),
+        mount_path: mount_path.clone(),
+        env_var: cache.env_var.clone(),
+        docker_volume: None,
+    };
+
+    // Build environment with cache env var
+    let mut populate_env = env.clone();
+    if let Some(ref env_var) = cache.env_var {
+        let _ = populate_env.insert(env_var.clone(), mount_path);
+    }
+
+    let populate_config = ExecutionConfig {
+        job_id: format!("{}-populate-{}", job_id, cache.bucket),
+        command,
+        env: populate_env,
+        working_dir: job_dir.workspace.clone(),
+        root_dir: job_dir.root.clone(),
+        store_setup: store_setup.clone(),
+        timeout: std::time::Duration::from_secs(600), // 10 min timeout for populate
+        store_paths: closure.to_vec(),
+        proxy_port, // Network enabled for populate phase
+        hardening_profile,
+        interactive: false,
+        pty_size: None,
+        cache_mounts: vec![cache_mount],
+    };
+
+    tracing::debug!(
+        job_id = %job_id,
+        cache = %cache.bucket,
+        command = %populate_cmd,
+        "starting populate phase"
+    );
+
+    let handle = executor.execute(populate_config).await?;
+
+    // Wait for completion and collect exit code
+    // We don't stream logs for populate phase - it runs silently
+    let exit_code = handle.exit_code.await.unwrap_or(-1);
+
+    tracing::debug!(
+        job_id = %job_id,
+        cache = %cache.bucket,
+        exit_code,
+        "populate phase completed"
+    );
+
+    Ok(exit_code)
 }
 
 fn build_environment(

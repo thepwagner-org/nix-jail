@@ -150,6 +150,15 @@ message CacheRequest {
   // Environment variable to set (e.g., "CARGO_HOME")
   // If set, the env var will be set to the mount_path value
   optional string env_var = 6;
+
+  // Command to populate cache before main script execution.
+  // If set, enables two-phase execution:
+  //   1. Run this command with network enabled, cache writable
+  //   2. Snapshot the cache state after successful completion
+  //   3. Main script runs with ephemeral overlay (writes discarded)
+  // On populate failure (non-zero exit), the job aborts immediately.
+  // Example: "cargo fetch --locked" for Rust, "pnpm fetch" for Node.js
+  optional string populate_command = 7;
 }
 
 // Response containing the job ID

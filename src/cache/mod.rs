@@ -4,6 +4,7 @@
 //! copy-on-write workspace creation.
 
 mod btrfs;
+pub mod snapshots;
 
 use crate::storage::{CacheEntry, JobStorage, StorageError};
 use std::path::{Path, PathBuf};
