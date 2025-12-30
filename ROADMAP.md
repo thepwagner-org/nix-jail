@@ -136,7 +136,6 @@ Expose `/metrics` endpoint for Prometheus scraping with job execution and cache 
 | `nix_jail_closure_paths_total` | Histogram | - | Number of store paths per closure |
 | `nix_jail_closure_size_bytes` | Histogram | - | Closure size distribution |
 | `nix_jail_active_jobs` | Gauge | - | Currently running jobs |
-
 **Label values:**
 - `status`: `success`, `failure`, `cancelled`
 - `phase`: `closure_resolution`, `root_prepare`, `workspace_prepare`, `proxy_setup`, `execution`
@@ -148,7 +147,6 @@ Expose `/metrics` endpoint for Prometheus scraping with job execution and cache 
 - `orchestration.rs`: `setup_workspace`, `resolve_packages`, `compute_closure`, `prepare_root`, `start_proxy`
 - `cache/mod.rs`: `prepare_root()` returns cache hit/miss
 - `job_workspace.rs`: sparse checkout cache hit/miss at lines 477-523
-
 **Data flow option 1 - gRPC extension:**
 ```protobuf
 message JobMetrics {
@@ -168,15 +166,12 @@ message JobInfo {
   optional JobMetrics metrics = 10;
 }
 ```
-
 Clients (forgejo-nix-ci) can fetch `JobInfo` after completion and record metrics locally.
-
 **Data flow option 2 - native /metrics endpoint:**
 Add HTTP server to nix-jail daemon exposing Prometheus metrics directly. Requires:
 - `prometheus` crate
 - `axum` or `hyper` for HTTP
 - Config: `metrics_port = 9091`
-
 **Recommended:** Option 2 (native endpoint) for simplicity. Option 1 useful if clients need per-job breakdown.
 
 ### Storage Schema Extension
@@ -193,7 +188,6 @@ ALTER TABLE jobs ADD COLUMN execution_ms INTEGER;
 ALTER TABLE jobs ADD COLUMN closure_size_bytes INTEGER;
 ALTER TABLE jobs ADD COLUMN closure_path_count INTEGER;
 ```
-
 Populate during job execution in `orchestration.rs`.
 
 ## Observability & Debugging
@@ -262,4 +256,3 @@ Explicitly out of scope to keep the project focused:
 
 - [SANDBOX.md](SANDBOX.md) - Current implementation (what exists today)
 - [CLAUDE.md](CLAUDE.md) - Development guidelines, security rules, and design decisions
-
