@@ -6,3 +6,16 @@ action = "allow"
 credential = "anthropic"
 [rules.pattern]
 host = "api\\.anthropic\\.com"
+
+# Claude Code also needs console.anthropic.com for OAuth/account
+[[rules]]
+action = "allow"
+credential = "anthropic"
+[rules.pattern]
+host = "console\\.anthropic\\.com"
+
+# Statsig for feature flags/analytics
+[[rules]]
+action = "allow"
+[rules.pattern]
+host = "statsig\\.anthropic\\.com"

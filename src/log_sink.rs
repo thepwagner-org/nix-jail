@@ -7,7 +7,7 @@
 
 use chrono::{DateTime, Utc};
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::sync::broadcast;
 use tonic::Status;
@@ -121,19 +121,76 @@ impl LogSink for StorageLogSink {
 }
 
 /// Log sink that prints to stdout/stderr for local execution
-#[derive(Debug)]
 pub struct StdioLogSink {
     show_prefix: bool,
+    /// Buffer proxy logs instead of printing immediately (for interactive mode)
+    buffer_proxy: bool,
+    /// Buffered proxy log lines
+    proxy_buffer: Mutex<Vec<String>>,
+}
+
+impl std::fmt::Debug for StdioLogSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StdioLogSink")
+            .field("show_prefix", &self.show_prefix)
+            .field("buffer_proxy", &self.buffer_proxy)
+            .field("proxy_buffer", &"<buffered logs>")
+            .finish()
+    }
 }
 
 impl StdioLogSink {
     pub fn new(show_prefix: bool) -> Self {
-        Self { show_prefix }
+        Self {
+            show_prefix,
+            buffer_proxy: false,
+            proxy_buffer: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Create a log sink that buffers proxy logs for later display
+    pub fn with_buffered_proxy(show_prefix: bool) -> Self {
+        Self {
+            show_prefix,
+            buffer_proxy: true,
+            proxy_buffer: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Flush buffered proxy logs to stderr
+    pub fn flush_proxy_logs(&self) {
+        let logs = {
+            let Ok(mut buffer) = self.proxy_buffer.lock() else {
+                return; // Mutex poisoned, skip flush
+            };
+            std::mem::take(&mut *buffer)
+        };
+
+        if logs.is_empty() {
+            return;
+        }
+
+        let mut stderr = std::io::stderr();
+        let _ = stderr.write_all(b"\n--- Proxy logs ---\n");
+        for line in logs {
+            let _ = stderr.write_all(line.as_bytes());
+        }
+        let _ = stderr.write_all(b"--- End proxy logs ---\n");
     }
 }
 
 impl LogSink for StdioLogSink {
     fn log(&self, _job_id: &str, source: LogSource, message: &str) {
+        let is_proxy = matches!(source, LogSource::ProxyStdout | LogSource::ProxyStderr);
+
+        // Buffer proxy logs if configured
+        if is_proxy && self.buffer_proxy {
+            if let Ok(mut buffer) = self.proxy_buffer.lock() {
+                buffer.push(message.to_string());
+            }
+            return;
+        }
+
         let output = if self.show_prefix {
             let prefix = match source {
                 LogSource::JobStdout => "[job:out] ",

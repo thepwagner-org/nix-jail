@@ -963,8 +963,12 @@ git checkout"#,
         vec![]
     };
 
-    // Create log sink
-    let log_sink = Arc::new(StdioLogSink::new(show_prefix));
+    // Create log sink (buffer proxy logs in interactive mode to avoid terminal spam)
+    let log_sink = Arc::new(if interactive {
+        StdioLogSink::with_buffered_proxy(show_prefix)
+    } else {
+        StdioLogSink::new(show_prefix)
+    });
 
     // Get terminal size for interactive mode
     let pty_size = if interactive {
@@ -1040,10 +1044,13 @@ git checkout"#,
     tracing::info!(strategy = ?store_strategy, "using store strategy");
 
     // Execute
-    let exit_code = execute_local(exec_config, executor, job_root, log_sink).await?;
+    let exit_code = execute_local(exec_config, executor, job_root, log_sink.clone()).await?;
 
     // Drop raw mode guard explicitly (though it would drop anyway)
     drop(raw_guard_holder);
+
+    // Flush buffered proxy logs (only prints if there are buffered logs)
+    log_sink.flush_proxy_logs();
 
     Ok(exit_code)
 }

@@ -473,9 +473,11 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
     }
 
     // Configure execution environment
+    // In server mode, workspace_dir is already isolated, so HOME=workspace_dir is fine
     let mut env = build_environment(
         proxy.as_ref(),
         &workspace_dir,
+        &workspace_dir, // home_dir = workspace_dir in server mode (isolated chroot)
         executor.proxy_connect_host(),
         executor.uses_chroot(),
         &job_dir.root,
@@ -1329,6 +1331,7 @@ async fn run_populate_phase(
 fn build_environment(
     proxy: Option<&ProxyManager>,
     working_dir: &Path,
+    home_dir: &Path,
     proxy_connect_host: &str,
     uses_chroot: bool,
     root_dir: &Path,
@@ -1363,10 +1366,11 @@ fn build_environment(
         let _ = env.insert("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string());
     }
 
-    // Sandbox isolation
+    // Sandbox isolation - HOME is separate from working_dir in local mode
+    // to avoid project's .claude/ shadowing user config
     let _ = env.insert(
         "HOME".to_string(),
-        working_dir.to_string_lossy().to_string(),
+        home_dir.to_string_lossy().to_string(),
     );
 
     let _ = env.insert("USER".to_string(), "sbc-admin".to_string());
@@ -1479,6 +1483,7 @@ async fn configure_proxy(
     }
 
     let filtered_credentials = filter_credentials(credentials, network_policy);
+
     let proxy_username = Some(format!("job-{}", job_id));
     let proxy_password = Some(workspace::generate_proxy_password());
 
@@ -1604,13 +1609,22 @@ fn setup_credentials_env(
 
     // Claude Code credential
     if has_credential_with_type(&filtered_credentials, CredentialType::Claude) {
-        if let Ok(()) = workspace::setup_claude_config(working_dir, job_id, &filtered_credentials) {
+        if let Ok(()) = workspace::setup_claude_config(
+            &job_dir.base,
+            working_dir,
+            job_id,
+            &filtered_credentials,
+        ) {
             let wrapper_bin = job_dir.base.join("bin");
             if let Some(path) = env.get("PATH").cloned() {
-                let _ = env.insert(
-                    "PATH".to_string(),
-                    format!("{}:{}", wrapper_bin.display(), path),
+                let new_path = format!("{}:{}", wrapper_bin.display(), path);
+                tracing::info!(
+                    job_id = %job_id,
+                    wrapper_bin = %wrapper_bin.display(),
+                    new_path = %new_path,
+                    "injecting security wrapper into PATH"
                 );
+                let _ = env.insert("PATH".to_string(), new_path);
             }
             log_sink.info(job_id, "Claude Code credentials configured");
         }
@@ -1893,6 +1907,11 @@ pub async fn execute_local(
     let tmp_dir = config.working_dir.join("tmp");
     let _ = std::fs::create_dir_all(&tmp_dir);
 
+    // Create separate home directory in job to avoid project's .claude/ shadowing user config
+    // In local mode, working_dir is the actual project directory which may have its own .claude/
+    let home_dir = job_dir.base.join("home");
+    let _ = std::fs::create_dir_all(&home_dir);
+
     // Chown job directory to nix-jail so jobs can write to it
     // (daemon runs as root, jobs run as nix-jail user)
     if let Err(e) = std::process::Command::new("chown")
@@ -1905,6 +1924,7 @@ pub async fn execute_local(
     let mut env = build_environment(
         proxy.as_ref(),
         &config.working_dir,
+        &home_dir, // Separate home directory to avoid project .claude/ shadowing user config
         executor.proxy_connect_host(),
         executor.uses_chroot(),
         &job_dir.root,

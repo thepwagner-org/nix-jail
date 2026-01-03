@@ -687,6 +687,7 @@ mod tests {
     /// Requires: The current directory to be inside a git repository
     #[tokio::test]
     #[ignore] // Requires local git repo
+    #[allow(clippy::print_stderr)] // Debug output for manual test
     async fn test_cached_workspace_with_mirror() {
         use std::process::Command;
 
@@ -696,7 +697,7 @@ mod tests {
             .output()
             .expect("Failed to run git");
         let repo_root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        println!("Using repo root: {}", repo_root);
+        eprintln!("Using repo root: {}", repo_root);
 
         // Get current commit
         let output = Command::new("git")
@@ -704,7 +705,7 @@ mod tests {
             .output()
             .expect("Failed to get HEAD");
         let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        println!("Current commit: {}", commit);
+        eprintln!("Current commit: {}", commit);
 
         // Get remote URL (needed for actual clone)
         let output = Command::new("git")
@@ -712,7 +713,7 @@ mod tests {
             .output()
             .expect("Failed to get remote URL");
         let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        println!("Remote URL: {}", remote_url);
+        eprintln!("Remote URL: {}", remote_url);
 
         // Create workspace
         let temp = tempdir().expect("Failed to create temp dir");
@@ -739,7 +740,7 @@ mod tests {
             .await
             .expect("Failed to setup workspace");
 
-        println!("Workspace created at: {}", result_dir.display());
+        eprintln!("Workspace created at: {}", result_dir.display());
 
         // Verify the workspace
         assert!(workspace_dir.exists(), "Workspace dir should exist");
@@ -757,7 +758,7 @@ mod tests {
             .args(["-C", &workspace_dir.to_string_lossy(), "status", "--short"])
             .output()
             .expect("Failed to run git status");
-        println!("Git status:\n{}", String::from_utf8_lossy(&output.stdout));
+        eprintln!("Git status:\n{}", String::from_utf8_lossy(&output.stdout));
 
         // Check sparse-checkout config
         let output = Command::new("git")
@@ -769,7 +770,7 @@ mod tests {
             ])
             .output()
             .expect("Failed to run sparse-checkout list");
-        println!(
+        eprintln!(
             "Sparse checkout paths:\n{}",
             String::from_utf8_lossy(&output.stdout)
         );
@@ -780,7 +781,7 @@ mod tests {
             .output()
             .expect("Failed to run git remote");
         let remotes = String::from_utf8_lossy(&output.stdout);
-        println!("Remotes:\n{}", remotes);
+        eprintln!("Remotes:\n{}", remotes);
         assert!(
             remotes.contains(&remote_url) || remotes.contains("git@"),
             "Origin should point to remote"
@@ -791,7 +792,7 @@ mod tests {
             .args(["-la", &workspace_dir.to_string_lossy()])
             .output()
             .expect("Failed to ls");
-        println!(
+        eprintln!(
             "Workspace contents:\n{}",
             String::from_utf8_lossy(&output.stdout)
         );
@@ -806,7 +807,7 @@ mod tests {
             ])
             .output()
             .expect("Failed to count objects");
-        println!(
+        eprintln!(
             "Workspace git objects:\n{}",
             String::from_utf8_lossy(&output.stdout)
         );
@@ -815,11 +816,11 @@ mod tests {
             .args(["-C", &repo_root, "count-objects", "-v"])
             .output()
             .expect("Failed to count source objects");
-        println!(
+        eprintln!(
             "Source repo git objects:\n{}",
             String::from_utf8_lossy(&output.stdout)
         );
 
-        println!("SUCCESS: Sparse checkout verified!");
+        eprintln!("SUCCESS: Sparse checkout verified!");
     }
 }

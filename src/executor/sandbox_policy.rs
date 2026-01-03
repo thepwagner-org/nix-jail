@@ -124,9 +124,25 @@ pub fn generate_profile_with_cache(
     // Allow workspace access (read-write and execute for build scripts)
     profile.push_str(";; Workspace access (read-write, execute for cargo build scripts)\n");
     profile.push_str(&format!(
-        "(allow file-read* file-write* process-exec* (subpath \"{}\"))\n\n",
+        "(allow file-read* file-write* process-exec* (subpath \"{}\"))\n",
         workspace_path.display()
     ));
+
+    // Allow file-read-metadata on parent directories (for realpath resolution)
+    // Node.js realpathSync needs to lstat each component of the path
+    profile.push_str(";; Parent directories (for realpath resolution)\n");
+    let mut parent = workspace_path.parent();
+    while let Some(p) = parent {
+        if p.as_os_str().is_empty() || p == std::path::Path::new("/") {
+            break;
+        }
+        profile.push_str(&format!(
+            "(allow file-read-metadata (literal \"{}\"))\n",
+            p.display()
+        ));
+        parent = p.parent();
+    }
+    profile.push('\n');
 
     // Allow wrapper bin directory (for security wrapper script)
     if let Some(job_base) = workspace_path.parent() {

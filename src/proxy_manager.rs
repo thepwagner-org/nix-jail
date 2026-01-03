@@ -24,6 +24,36 @@ use tokio::sync::mpsc;
 /// Default proxy port (standard HTTP proxy port)
 pub const DEFAULT_PROXY_PORT: u16 = 3128;
 
+/// Find the proxy binary, checking both production and dev names.
+///
+/// In production (nix build), the binary is named `nixjail-proxy`.
+/// In development (cargo build), it's named `proxy`.
+fn find_proxy_binary() -> std::io::Result<PathBuf> {
+    let current_exe = std::env::current_exe()?;
+    let bin_dir = current_exe
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No parent dir"))?;
+
+    // Try production name first, then dev name
+    let production = bin_dir.join("nixjail-proxy");
+    if production.exists() {
+        return Ok(production);
+    }
+
+    let dev = bin_dir.join("proxy");
+    if dev.exists() {
+        return Ok(dev);
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!(
+            "proxy binary not found (tried {:?} and {:?})",
+            production, dev
+        ),
+    ))
+}
+
 /// CA certificate path inside the sandbox (chroot-relative)
 ///
 /// Use this for environment variables like SSL_CERT_FILE that are
@@ -115,11 +145,7 @@ impl ProxyManager {
 
         tracing::debug!(job_id = %job_id, port = port, "Starting proxy for job");
 
-        let current_exe = std::env::current_exe()?;
-        let proxy_bin = current_exe
-            .parent()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No parent dir"))?
-            .join("nixjail-proxy");
+        let proxy_bin = find_proxy_binary()?;
 
         let (stdout_tx, stdout_rx) = mpsc::channel::<String>(128);
         let (stderr_tx, stderr_rx) = mpsc::channel::<String>(128);
@@ -301,16 +327,8 @@ mod tests {
     #[tokio::test]
     async fn test_proxy_manager_lifecycle() {
         // Check if proxy binary exists (it needs to be built first: cargo build --bin proxy)
-        let current_exe = std::env::current_exe().expect("failed to get current exe path");
-        let proxy_bin = current_exe
-            .parent()
-            .expect("failed to get exe parent dir")
-            .join("nixjail-proxy");
-
-        if !proxy_bin.exists() {
-            // Skip test if proxy binary isn't built
+        if find_proxy_binary().is_err() {
             tracing::warn!(
-                proxy_bin = ?proxy_bin,
                 "skipping test_proxy_manager_lifecycle: proxy binary not found, run 'cargo build --bin proxy' to build it"
             );
             return;
