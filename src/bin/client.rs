@@ -42,6 +42,14 @@ impl opentelemetry::propagation::Injector for MetadataInjector<'_> {
     }
 }
 
+/// Parse KEY=VALUE environment variable argument
+fn parse_env_var(s: &str) -> Result<(String, String), String> {
+    let pos = s
+        .find('=')
+        .ok_or_else(|| format!("invalid KEY=VALUE: no '=' found in '{s}'"))?;
+    Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
+}
+
 #[derive(Parser)]
 #[command(name = "nix-jail", version)]
 #[command(about = "A secure jail for Nix derivations", long_about = None)]
@@ -275,6 +283,12 @@ enum Commands {
         #[arg(long, default_value = "cached")]
         store_strategy: String,
 
+        /// Environment variables to set (can be specified multiple times)
+        ///
+        /// Format: KEY=VALUE
+        #[arg(short, long = "env", value_parser = parse_env_var)]
+        env: Vec<(String, String)>,
+
         /// Command to execute (everything after --)
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -310,6 +324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interactive,
         executor,
         store_strategy,
+        env,
         command,
     } = cli.command
     {
@@ -329,6 +344,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             interactive,
             executor,
             store_strategy,
+            env,
             command,
         )
         .instrument(tracing::info_span!("run"))
@@ -745,6 +761,7 @@ async fn run_local(
     interactive: bool,
     executor_type: String,
     store_strategy: String,
+    env: Vec<(String, String)>,
     command: Vec<String>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     tracing::info!(packages = ?packages, repo = ?repo, path = ?path, "running locally");
@@ -989,6 +1006,7 @@ git checkout"#,
         interactive,
         pty_size,
         on_pty_ready,
+        env,
     };
 
     // Create executor and job root

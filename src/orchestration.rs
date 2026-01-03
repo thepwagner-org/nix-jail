@@ -328,20 +328,24 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         }
     };
 
-    // Check if workspace has a flake - if so, use it instead of explicit packages
-    let store_paths = if let Some(ref source) = flake_source {
-        // Flake detected - use flake shell and ignore explicit packages
-        if !packages.is_empty() {
-            let pkg_list = packages.join(", ");
-            log_sink.info(
-                &job_id,
-                &format!(
-                    "Found flake - using flake shell (ignoring specified packages: {})",
-                    pkg_list
-                ),
-            );
+    // Explicit packages take precedence over detected flakes
+    let store_paths = if !packages.is_empty() {
+        let nixpkgs_version = job.nixpkgs_version.as_deref();
+        let store_paths = find_packages(
+            is_exec_mode,
+            &packages,
+            nixpkgs_version,
+            &job_id,
+            &storage,
+            &log_sink,
+        )
+        .instrument(tracing::info_span!("resolve_packages"))
+        .await;
+        match store_paths {
+            Some(paths) => paths,
+            None => return, // Error already logged
         }
-
+    } else if let Some(ref source) = flake_source {
         log_sink.info(&job_id, &format!("Computing flake closure from {}", source));
 
         match workspace::compute_flake_closure(source).await {
@@ -366,22 +370,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
             }
         }
     } else {
-        // No flake - use explicit packages (original behavior)
-        let nixpkgs_version = job.nixpkgs_version.as_deref();
-        let store_paths = find_packages(
-            is_exec_mode,
-            &packages,
-            nixpkgs_version,
-            &job_id,
-            &storage,
-            &log_sink,
-        )
-        .instrument(tracing::info_span!("resolve_packages"))
-        .await;
-        match store_paths {
-            Some(paths) => paths,
-            None => return, // Error already logged
-        }
+        vec![]
     };
 
     // Compute full closure once (used for both cache and executor)
@@ -490,6 +479,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         executor.proxy_connect_host(),
         executor.uses_chroot(),
         &job_dir.root,
+        &[], // Server path doesn't support extra env vars
     );
 
     // Update PATH, NIX_LDFLAGS, NIX_CFLAGS_COMPILE with package paths
@@ -1342,8 +1332,12 @@ fn build_environment(
     proxy_connect_host: &str,
     uses_chroot: bool,
     root_dir: &Path,
+    extra_env: &[(String, String)],
 ) -> HashMap<String, String> {
     let mut env = HashMap::new();
+
+    // Set default TERM for proper terminal output (colors, etc.)
+    let _ = env.insert("TERM".to_string(), "xterm-256color".to_string());
 
     // Proxy configuration (only if proxy is running)
     if let Some(proxy) = proxy {
@@ -1393,6 +1387,11 @@ fn build_environment(
         if std::path::Path::new(sdk_path).exists() {
             let _ = env.insert("SDKROOT".to_string(), sdk_path.to_string());
         }
+    }
+
+    // Merge user-provided environment variables (overrides defaults)
+    for (key, value) in extra_env {
+        let _ = env.insert(key.clone(), value.clone());
     }
 
     env
@@ -1533,25 +1532,17 @@ async fn resolve_packages_and_closure(
     log_sink: &Arc<dyn LogSink>,
     cache_dir: Option<&Path>,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>), OrchestrationError> {
-    let store_paths = if let Some(source) = flake_source {
-        if !packages.is_empty() {
-            log_sink.info(
-                job_id,
-                &format!(
-                    "Ignoring explicit packages ({}), using flake",
-                    packages.join(", ")
-                ),
-            );
-        }
-        log_sink.info(job_id, &format!("Computing flake closure from {}", source));
-        workspace::compute_flake_closure(source)
-            .await
-            .map_err(|e| OrchestrationError::FlakeClosureError(e.to_string()))?
-    } else if !packages.is_empty() {
+    // Explicit packages take precedence over detected flakes
+    let store_paths = if !packages.is_empty() {
         let pkg_refs: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
         workspace::find_nix_packages_cached(&pkg_refs, nixpkgs_version, cache_dir)
             .await
             .map_err(|e| OrchestrationError::PackageError(e.to_string()))?
+    } else if let Some(source) = flake_source {
+        log_sink.info(job_id, &format!("Computing flake closure from {}", source));
+        workspace::compute_flake_closure(source)
+            .await
+            .map_err(|e| OrchestrationError::FlakeClosureError(e.to_string()))?
     } else {
         vec![]
     };
@@ -1782,6 +1773,9 @@ pub struct LocalExecutionConfig {
 
     /// Callback invoked right before PTY I/O starts (for enabling raw mode)
     pub on_pty_ready: Option<Box<dyn FnOnce() + Send>>,
+
+    /// Additional environment variables
+    pub env: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for LocalExecutionConfig {
@@ -1914,6 +1908,7 @@ pub async fn execute_local(
         executor.proxy_connect_host(),
         executor.uses_chroot(),
         &job_dir.root,
+        &config.env,
     );
 
     // Update PATH, NIX_LDFLAGS, NIX_CFLAGS_COMPILE with package paths
