@@ -64,7 +64,7 @@ pkgs.mkShell {
 nix-jail run -- cargo build  # uses flake.nix/shell.nix from workspace
 ```
 
-**Key point:** Only the packages you specify (+ their dependencies) are available in the sandbox.
+**Key point:** Like distroless, but built dynamically per job - only the packages you specify are available.
 
 ---
 
