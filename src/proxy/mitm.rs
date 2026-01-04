@@ -764,173 +764,88 @@ where
                                         }
                                     };
 
-                                    // Determine which header to inject and what value
-                                    // For Claude credentials: handle both Authorization and x-api-key
-                                    // For other credentials: handle Authorization only
-
+                                    // Check Authorization header for dummy token replacement
                                     let client_auth = req
                                         .headers
                                         .iter()
                                         .find(|h| h.name.eq_ignore_ascii_case("authorization"))
                                         .map(|h| String::from_utf8_lossy(h.value).to_string());
 
-                                    let client_api_key = req
-                                        .headers
-                                        .iter()
-                                        .find(|h| h.name.eq_ignore_ascii_case("x-api-key"))
-                                        .map(|h| String::from_utf8_lossy(h.value).to_string());
-
                                     let dummy_token = credential.dummy_token.as_deref();
 
-                                    // Determine injection strategy based on credential type and headers
-                                    enum InjectionTarget {
-                                        Authorization { new_value: String },
-                                        XApiKey { new_value: String },
-                                        None,
-                                    }
-
-                                    let injection = if credential.credential_type
-                                        == CredentialType::Claude
-                                    {
-                                        // Claude credentials: token is full JSON
-                                        // For Authorization: extract accessToken
-                                        // For x-api-key: use full JSON
-                                        if let Some(ref api_key) = client_api_key {
-                                            // Check if x-api-key contains the dummy token
-                                            if let Some(dummy) = dummy_token {
-                                                if api_key.contains(dummy) {
-                                                    tracing::debug!(
-                                                        "x-api-key contains dummy token, will inject full JSON"
-                                                    );
-                                                    InjectionTarget::XApiKey {
-                                                        new_value: token.clone(),
-                                                    }
-                                                } else {
-                                                    tracing::debug!(
-                                                        dummy = %dummy,
-                                                        "x-api-key does not contain dummy, forwarding unchanged for {} {}",
-                                                        method, path
-                                                    );
-                                                    InjectionTarget::None
-                                                }
-                                            } else {
-                                                tracing::debug!(
-                                                    "no dummy_token configured, forwarding x-api-key unchanged for {} {}",
-                                                    method, path
-                                                );
-                                                InjectionTarget::None
-                                            }
-                                        } else if let Some(ref auth) = client_auth {
-                                            // Check Authorization header
-                                            if let Some(dummy) = dummy_token {
-                                                let expected_dummy = credential
-                                                    .header_format
-                                                    .replace("{token}", dummy);
-                                                if auth == &expected_dummy {
-                                                    // Extract accessToken from raw JSON for Bearer header
-                                                    if let Some(access_token) =
-                                                        extract_access_token(&token)
-                                                    {
-                                                        let new_value = credential
-                                                            .header_format
-                                                            .replace("{token}", &access_token);
-                                                        tracing::debug!(
-                                                            "client sent expected dummy in Authorization, will replace"
-                                                        );
-                                                        InjectionTarget::Authorization { new_value }
-                                                    } else {
-                                                        tracing::error!(
-                                                            "failed to extract accessToken from credential JSON"
-                                                        );
-                                                        InjectionTarget::None
-                                                    }
-                                                } else {
-                                                    tracing::debug!(
-                                                        client_sent = %auth,
-                                                        expected_dummy = %expected_dummy,
-                                                        "client auth does not match dummy, forwarding unchanged for {} {}",
-                                                        method, path
-                                                    );
-                                                    InjectionTarget::None
-                                                }
-                                            } else {
-                                                InjectionTarget::None
-                                            }
+                                    // For Claude credentials, extract accessToken from JSON
+                                    // For other credentials, use token directly
+                                    let inject_token =
+                                        if credential.credential_type == CredentialType::Claude {
+                                            extract_access_token(&token)
                                         } else {
-                                            // No auth headers at all - forward unchanged
-                                            tracing::debug!(
-                                                "no auth headers, forwarding unchanged for {} {}",
-                                                method,
-                                                path
-                                            );
-                                            InjectionTarget::None
-                                        }
-                                    } else {
-                                        // Non-Claude credentials: use existing logic
-                                        let expected_dummy = dummy_token.map(|dt| {
-                                            credential.header_format.replace("{token}", dt)
-                                        });
+                                            Some(token.clone())
+                                        };
 
-                                        match (&client_auth, &expected_dummy) {
-                                            (Some(sent), Some(expected)) if sent == expected => {
+                                    let header_value = match (
+                                        &client_auth,
+                                        dummy_token,
+                                        inject_token,
+                                    ) {
+                                        (Some(sent), Some(dummy), Some(real_token)) => {
+                                            let expected_dummy =
+                                                credential.header_format.replace("{token}", dummy);
+                                            if sent == &expected_dummy {
                                                 tracing::debug!(
                                                     "client sent expected dummy, will replace"
                                                 );
-                                                let new_value = credential
-                                                    .header_format
-                                                    .replace("{token}", &token);
-                                                InjectionTarget::Authorization { new_value }
-                                            }
-                                            (Some(sent), Some(expected)) => {
+                                                Some(
+                                                    credential
+                                                        .header_format
+                                                        .replace("{token}", &real_token),
+                                                )
+                                            } else {
                                                 tracing::debug!(
-                                                    client_sent = %sent,
-                                                    expected_dummy = %expected,
                                                     "client auth does not match dummy, forwarding unchanged for {} {}",
                                                     method, path
                                                 );
-                                                InjectionTarget::None
+                                                None
                                             }
-                                            (None, _) => {
-                                                tracing::debug!(
-                                                    "no client auth header, forwarding unchanged for {} {}",
-                                                    method, path
-                                                );
-                                                InjectionTarget::None
-                                            }
-                                            (Some(_), None) => {
-                                                tracing::warn!(
-                                                    "client sent auth but no dummy configured, forwarding unchanged for {} {}",
-                                                    method, path
-                                                );
-                                                InjectionTarget::None
-                                            }
+                                        }
+                                        (None, _, _) => {
+                                            tracing::debug!(
+                                                "no client auth header, forwarding unchanged for {} {}",
+                                                method, path
+                                            );
+                                            None
+                                        }
+                                        (Some(_), None, _) => {
+                                            tracing::warn!(
+                                                "client sent auth but no dummy configured, forwarding unchanged for {} {}",
+                                                method, path
+                                            );
+                                            None
+                                        }
+                                        (_, _, None) => {
+                                            tracing::error!(
+                                                "failed to extract token for injection"
+                                            );
+                                            None
                                         }
                                     };
 
-                                    // Apply the injection or forward unchanged
-                                    let (target_header, header_value) = match injection {
-                                        InjectionTarget::Authorization { new_value } => {
-                                            ("authorization", new_value)
-                                        }
-                                        InjectionTarget::XApiKey { new_value } => {
-                                            ("x-api-key", new_value)
-                                        }
-                                        InjectionTarget::None => {
-                                            // Forward request unchanged (including body)
+                                    // If no injection needed, forward unchanged
+                                    let header_value = match header_value {
+                                        Some(v) => v,
+                                        None => {
                                             upstream_writer.write_all(&accumulated).await?;
                                             accumulated.clear();
                                             continue;
                                         }
                                     };
 
-                                    // Build new headers list, replacing the target header IN PLACE
+                                    // Build new headers list, replacing Authorization in place
                                     let mut new_headers: Vec<(&str, String)> = Vec::new();
                                     for header in req.headers.iter() {
                                         let header_value_str =
                                             std::str::from_utf8(header.value).unwrap_or("");
 
-                                        // Replace the target header in its original position
-                                        if header.name.eq_ignore_ascii_case(target_header) {
+                                        if header.name.eq_ignore_ascii_case("authorization") {
                                             new_headers.push((header.name, header_value.clone()));
                                         } else {
                                             new_headers
