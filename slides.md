@@ -37,27 +37,34 @@ flowchart LR
 
 ---
 
-## Slide 2: Nix Expression → Minimal Closure
+## Slide 2: Sandbox Contents from Nix Expression
 
-```mermaid
-flowchart TD
-    CLI["-p bash -p curl"]
+The sandbox environment is derived at job time from a Nix expression.
 
-    CLI --> Resolve["nix-instantiate<br/>(resolve packages)"]
-    Resolve --> Closure["Closure Computation<br/>(transitive deps only)"]
-    Closure --> Store["/nix/store<br/>(minimal set)"]
-
-    subgraph Sandbox
-        Store --> Agent["Agent sees only<br/>requested packages"]
-    end
-
-    NixStore["Host /nix/store<br/>(thousands of packages)"] -.-x|"❌"| Agent
+**Option 1: Nixpkgs branch + packages**
+```bash
+nix-jail run --nixpkgs nixos-24.11 -p cargo -p rustfmt -p clippy -- cargo build
 ```
 
-**Key points:**
-- `-p bash -p curl` → only those packages + dependencies
-- Flake support: `flake.nix` → `nix develop` shell automatically
-- No access to host's full `/nix/store`
+**Option 2: Flake with mkShell**
+```nix
+# shell.nix
+pkgs.mkShell {
+  buildInputs = with pkgs; [
+    cargo
+    rustfmt
+    clippy
+    protobuf
+    pkg-config
+    openssl.dev
+  ];
+}
+```
+```bash
+nix-jail run -- cargo build  # uses flake.nix/shell.nix from workspace
+```
+
+**Key point:** Only the packages you specify (+ their dependencies) are available in the sandbox.
 
 ---
 
