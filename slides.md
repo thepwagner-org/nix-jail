@@ -39,7 +39,7 @@ flowchart LR
 
 ## Slide 2: Sandbox Contents from Nix Expression
 
-The sandbox environment is derived at job time from a Nix expression.
+The sandbox environment is derived **at job time** from a Nix expression.
 
 **Option 1: Nixpkgs branch + packages**
 ```bash
