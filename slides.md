@@ -15,11 +15,15 @@ flowchart LR
         Creds["Credentials<br/>(keychain, env, files)"]
     end
 
-    Internet["api.anthropic.com"]
+    subgraph Internet
+        Anthropic["api.anthropic.com"]
+        Wikipedia["wikipedia.org"]
+    end
 
     Sandbox -->|"HTTPS"| Proxy
     Proxy -.->|"read"| Creds
-    Proxy -->|"inject"| Internet
+    Proxy -->|"HTTPS+inject"| Anthropic
+    Proxy -->|"HTTPS"| Wikipedia
 
     Sandbox -.-x|"❌"| Internet
     Sandbox -.-x|"❌"| Creds
