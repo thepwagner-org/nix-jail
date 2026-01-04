@@ -17,9 +17,9 @@ flowchart LR
 
     Internet["api.anthropic.com"]
 
-    Sandbox -->|"only exit"| Proxy
-    Creds -.->|"inject"| Proxy
-    Proxy --> Internet
+    Sandbox -->|"HTTPS"| Proxy
+    Proxy -.->|"read"| Creds
+    Proxy -->|"inject"| Internet
 
     Sandbox -.-x|"❌"| Internet
     Sandbox -.-x|"❌"| Creds
