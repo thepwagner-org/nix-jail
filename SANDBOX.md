@@ -7,6 +7,7 @@
 Platform-specific executors provide defense-in-depth isolation:
 - **SandboxExecutor** (macOS) - Apple sandbox-exec with SBPL profiles
 - **SystemdExecutor** (Linux) - systemd transient units with 32 hardening properties
+- **DockerExecutor** (cross-platform) - Container isolation with capability dropping
 
 See [TESTING.md](TESTING.md) for usage examples and testing workflows.
 
