@@ -7,7 +7,7 @@ flowchart LR
     subgraph Sandbox
         Agent["Agent<br/>(e.g. Claude Code)"]
         Shell["Shell"]
-        MCP["MCP Servers"]
+        MCP["stdio mcp"]
     end
 
     subgraph Host["Host (outside sandbox)"]
