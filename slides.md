@@ -33,7 +33,7 @@ flowchart LR
 **Key points:**
 - Sandbox has NO direct internet access - must go through proxy
 - Sandbox has NO access to credentials (keychain, env vars, files)
-- Proxy injects real tokens into requests, sandbox only sees dummies
+- Sandbox backends: sandbox-exec (macOS), systemd (Linux), Docker (both)
 
 ---
 
