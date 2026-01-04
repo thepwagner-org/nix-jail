@@ -5,6 +5,7 @@
 ```mermaid
 flowchart LR
     subgraph Sandbox
+        direction TB
         Agent["Agent<br/>(e.g. Claude Code)"]
         Shell["Shell"]
         MCP["stdio mcp"]
