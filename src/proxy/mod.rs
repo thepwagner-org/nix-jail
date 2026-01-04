@@ -47,6 +47,10 @@ pub struct ProxyConfig {
     /// Optional password for HTTP Basic Auth
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
+
+    /// Optional path to log all requests as JSON lines (for debugging)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_log_path: Option<PathBuf>,
 }
 
 fn default_ca_cert_path() -> PathBuf {
@@ -101,6 +105,7 @@ pub async fn run_proxy(
         stats: Arc::new(ProxyStats::new()),
         proxy_username: config.proxy_username,
         proxy_password: config.proxy_password,
+        request_log_path: config.request_log_path,
     });
 
     // Start MITM proxy server (CA cert is written after bind for reliable readiness signal)

@@ -8,6 +8,7 @@ use hyper_util::rt::TokioIo;
 use moka::future::Cache;
 use rustls::ServerConfig;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -15,9 +16,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio_rustls::TlsAcceptor;
 
+/// Global connection counter for generating unique connection IDs
+static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 type BoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, hyper::Error>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+use crate::config::{extract_access_token, CredentialType};
 use crate::proxy::policy::{CompiledPolicy, PolicyDecision};
 use crate::proxy::stats::ProxyStats;
 
@@ -42,6 +47,9 @@ pub struct ProxyState {
 
     /// Optional password for HTTP Basic Auth
     pub proxy_password: Option<String>,
+
+    /// Optional path to log requests as JSON lines (for debugging)
+    pub request_log_path: Option<std::path::PathBuf>,
 }
 
 /// Global cache for DNS blackhole detection results (60-second TTL)
@@ -430,10 +438,6 @@ async fn handle_connect(
 /// 3. Performs TLS handshake with upstream server
 /// 4. Proxies decrypted traffic between client and server
 /// 5. Inspects traffic for logging
-#[tracing::instrument(
-    level = "debug",
-    skip(client_stream, cert_der, ca_cert_der, key_der, state, policy_decision)
-)]
 async fn handle_mitm<I>(
     client_stream: I,
     hostname: String,
@@ -446,6 +450,9 @@ async fn handle_mitm<I>(
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Generate unique connection ID for tracing
+    let conn_id = CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed);
+
     // Configure TLS for client connection (with forged cert)
     // Send the full certificate chain: [host cert, CA cert]
     // This allows clients to verify the chain without needing the CA pre-installed
@@ -490,7 +497,7 @@ where
 
     let upstream_tls = connector.connect(server_name, upstream_stream).await?;
 
-    tracing::debug!("upstream connection established");
+    tracing::debug!(conn_id, "upstream connection established");
 
     // HTTP/1.1: Use stream-based bidirectional relay
     let (client_reader, client_writer) = tokio::io::split(client_tls);
@@ -513,12 +520,13 @@ where
             hostname_clone,
             state_clone,
             policy_decision_clone,
+            conn_id,
         )
         .await
     };
 
     let upstream_to_client = async move {
-        // For now, just relay responses without inspection
+        // Relay responses without inspection
         let mut buf = vec![0u8; 8192];
         let mut upstream_reader = upstream_reader;
         loop {
@@ -526,7 +534,6 @@ where
             if n == 0 {
                 break;
             }
-
             tracing::trace!("upstream -> client: {} bytes", n);
             let mut client_writer = client_writer_for_upstream.lock().await;
             client_writer.write_all(&buf[..n]).await?;
@@ -551,6 +558,7 @@ async fn proxy_with_http1_inspection<R, CW, UW>(
     hostname: String,
     state: Arc<ProxyState>,
     policy_decision: Option<PolicyDecision>,
+    conn_id: u64,
 ) -> Result<(), BoxError>
 where
     R: AsyncRead + Unpin,
@@ -663,6 +671,7 @@ where
                         match (rule_index, credential_from_policy) {
                             (Some(idx), Some(cred)) => {
                                 tracing::debug!(
+                                    conn_id,
                                     rule_index = idx,
                                     credential = cred,
                                     "{} {}{}",
@@ -673,6 +682,7 @@ where
                             }
                             (Some(idx), None) => {
                                 tracing::debug!(
+                                    conn_id,
                                     rule_index = idx,
                                     "{} {}{}",
                                     method,
@@ -682,6 +692,7 @@ where
                             }
                             (None, Some(cred)) => {
                                 tracing::debug!(
+                                    conn_id,
                                     credential = cred,
                                     "{} {}{}",
                                     method,
@@ -690,7 +701,44 @@ where
                                 );
                             }
                             (None, None) => {
-                                tracing::debug!("{} {}{}", method, hostname, path);
+                                tracing::debug!(conn_id, "{} {}{}", method, hostname, path);
+                            }
+                        }
+
+                        // JSON request logging for debugging
+                        {
+                            use std::collections::HashMap;
+                            let headers: HashMap<String, String> = req
+                                .headers
+                                .iter()
+                                .map(|h| {
+                                    (
+                                        h.name.to_lowercase(),
+                                        String::from_utf8_lossy(h.value).to_string(),
+                                    )
+                                })
+                                .collect();
+                            let log_entry = serde_json::json!({
+                                "ts": chrono::Utc::now().to_rfc3339(),
+                                "conn_id": conn_id,
+                                "method": method,
+                                "host": hostname,
+                                "path": path,
+                                "headers": headers,
+                                "rule_index": rule_index,
+                                "credential": credential_from_policy,
+                            });
+                            if let Some(ref log_path) = state.request_log_path {
+                                if let Ok(json) = serde_json::to_string(&log_entry) {
+                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(log_path)
+                                    {
+                                        use std::io::Write;
+                                        let _ = writeln!(f, "{}", json);
+                                    }
+                                }
                             }
                         }
 
@@ -716,54 +764,179 @@ where
                                         }
                                     };
 
-                                    // Format header value using credential's header_format
-                                    let header_value =
-                                        credential.header_format.replace("{token}", &token);
+                                    // Determine which header to inject and what value
+                                    // For Claude credentials: handle both Authorization and x-api-key
+                                    // For other credentials: handle Authorization only
 
-                                    // Build new headers list
-                                    let mut new_headers = Vec::new();
+                                    let client_auth = req
+                                        .headers
+                                        .iter()
+                                        .find(|h| h.name.eq_ignore_ascii_case("authorization"))
+                                        .map(|h| String::from_utf8_lossy(h.value).to_string());
 
-                                    // Determine the expected dummy for comparison
-                                    let expected_dummy =
-                                        credential.dummy_token.as_ref().map(|token| {
-                                            credential.header_format.replace("{token}", token)
+                                    let client_api_key = req
+                                        .headers
+                                        .iter()
+                                        .find(|h| h.name.eq_ignore_ascii_case("x-api-key"))
+                                        .map(|h| String::from_utf8_lossy(h.value).to_string());
+
+                                    let dummy_token = credential.dummy_token.as_deref();
+
+                                    // Determine injection strategy based on credential type and headers
+                                    enum InjectionTarget {
+                                        Authorization { new_value: String },
+                                        XApiKey { new_value: String },
+                                        None,
+                                    }
+
+                                    let injection = if credential.credential_type
+                                        == CredentialType::Claude
+                                    {
+                                        // Claude credentials: token is full JSON
+                                        // For Authorization: extract accessToken
+                                        // For x-api-key: use full JSON
+                                        if let Some(ref api_key) = client_api_key {
+                                            // Check if x-api-key contains the dummy token
+                                            if let Some(dummy) = dummy_token {
+                                                if api_key.contains(dummy) {
+                                                    tracing::debug!(
+                                                        "x-api-key contains dummy token, will inject full JSON"
+                                                    );
+                                                    InjectionTarget::XApiKey {
+                                                        new_value: token.clone(),
+                                                    }
+                                                } else {
+                                                    tracing::debug!(
+                                                        dummy = %dummy,
+                                                        "x-api-key does not contain dummy, forwarding unchanged for {} {}",
+                                                        method, path
+                                                    );
+                                                    InjectionTarget::None
+                                                }
+                                            } else {
+                                                tracing::debug!(
+                                                    "no dummy_token configured, forwarding x-api-key unchanged for {} {}",
+                                                    method, path
+                                                );
+                                                InjectionTarget::None
+                                            }
+                                        } else if let Some(ref auth) = client_auth {
+                                            // Check Authorization header
+                                            if let Some(dummy) = dummy_token {
+                                                let expected_dummy = credential
+                                                    .header_format
+                                                    .replace("{token}", dummy);
+                                                if auth == &expected_dummy {
+                                                    // Extract accessToken from raw JSON for Bearer header
+                                                    if let Some(access_token) =
+                                                        extract_access_token(&token)
+                                                    {
+                                                        let new_value = credential
+                                                            .header_format
+                                                            .replace("{token}", &access_token);
+                                                        tracing::debug!(
+                                                            "client sent expected dummy in Authorization, will replace"
+                                                        );
+                                                        InjectionTarget::Authorization { new_value }
+                                                    } else {
+                                                        tracing::error!(
+                                                            "failed to extract accessToken from credential JSON"
+                                                        );
+                                                        InjectionTarget::None
+                                                    }
+                                                } else {
+                                                    tracing::debug!(
+                                                        client_sent = %auth,
+                                                        expected_dummy = %expected_dummy,
+                                                        "client auth does not match dummy, forwarding unchanged for {} {}",
+                                                        method, path
+                                                    );
+                                                    InjectionTarget::None
+                                                }
+                                            } else {
+                                                InjectionTarget::None
+                                            }
+                                        } else {
+                                            // No auth headers at all - forward unchanged
+                                            tracing::debug!(
+                                                "no auth headers, forwarding unchanged for {} {}",
+                                                method,
+                                                path
+                                            );
+                                            InjectionTarget::None
+                                        }
+                                    } else {
+                                        // Non-Claude credentials: use existing logic
+                                        let expected_dummy = dummy_token.map(|dt| {
+                                            credential.header_format.replace("{token}", dt)
                                         });
 
-                                    // Copy all existing headers, skipping ALL Authorization headers
-                                    // (we'll inject the correct one below)
+                                        match (&client_auth, &expected_dummy) {
+                                            (Some(sent), Some(expected)) if sent == expected => {
+                                                tracing::debug!(
+                                                    "client sent expected dummy, will replace"
+                                                );
+                                                let new_value = credential
+                                                    .header_format
+                                                    .replace("{token}", &token);
+                                                InjectionTarget::Authorization { new_value }
+                                            }
+                                            (Some(sent), Some(expected)) => {
+                                                tracing::debug!(
+                                                    client_sent = %sent,
+                                                    expected_dummy = %expected,
+                                                    "client auth does not match dummy, forwarding unchanged for {} {}",
+                                                    method, path
+                                                );
+                                                InjectionTarget::None
+                                            }
+                                            (None, _) => {
+                                                tracing::debug!(
+                                                    "no client auth header, forwarding unchanged for {} {}",
+                                                    method, path
+                                                );
+                                                InjectionTarget::None
+                                            }
+                                            (Some(_), None) => {
+                                                tracing::warn!(
+                                                    "client sent auth but no dummy configured, forwarding unchanged for {} {}",
+                                                    method, path
+                                                );
+                                                InjectionTarget::None
+                                            }
+                                        }
+                                    };
+
+                                    // Apply the injection or forward unchanged
+                                    let (target_header, header_value) = match injection {
+                                        InjectionTarget::Authorization { new_value } => {
+                                            ("authorization", new_value)
+                                        }
+                                        InjectionTarget::XApiKey { new_value } => {
+                                            ("x-api-key", new_value)
+                                        }
+                                        InjectionTarget::None => {
+                                            // Forward request unchanged (including body)
+                                            upstream_writer.write_all(&accumulated).await?;
+                                            accumulated.clear();
+                                            continue;
+                                        }
+                                    };
+
+                                    // Build new headers list, replacing the target header IN PLACE
+                                    let mut new_headers: Vec<(&str, String)> = Vec::new();
                                     for header in req.headers.iter() {
                                         let header_value_str =
                                             std::str::from_utf8(header.value).unwrap_or("");
 
-                                        // Skip ALL Authorization headers - we're injecting the correct one
-                                        if header.name.eq_ignore_ascii_case("authorization") {
-                                            if let Some(ref dummy) = expected_dummy {
-                                                if header_value_str == dummy {
-                                                    tracing::debug!("removing dummy authorization header (matches expected dummy)");
-                                                } else {
-                                                    tracing::warn!(
-                                                        actual = %header_value_str,
-                                                        expected = %dummy,
-                                                        "removing authorization header that does not match configured dummy"
-                                                    );
-                                                }
-                                            } else {
-                                                tracing::debug!("removing authorization header (no dummy configured)");
-                                            }
-                                            continue;
+                                        // Replace the target header in its original position
+                                        if header.name.eq_ignore_ascii_case(target_header) {
+                                            new_headers.push((header.name, header_value.clone()));
+                                        } else {
+                                            new_headers
+                                                .push((header.name, header_value_str.to_string()));
                                         }
-
-                                        new_headers.push((header.name, header_value_str));
                                     }
-
-                                    // Add the authorization header
-                                    new_headers.push(("Authorization", header_value.as_str()));
-
-                                    tracing::debug!(
-                                        "injected authorization header for {} {}",
-                                        method,
-                                        path
-                                    );
 
                                     // Reconstruct the HTTP/1.1 request with modified headers
                                     let mut reconstructed = Vec::new();
@@ -810,7 +983,7 @@ where
                                 }
                             }
                         } else {
-                            // No credential injection - just forward the raw bytes
+                            // No credential injection - forward as-is
                             upstream_writer
                                 .write_all(&accumulated[..bytes_parsed])
                                 .await?;
@@ -829,9 +1002,13 @@ where
                     break;
                 }
                 Err(e) => {
-                    // Parse error - log and forward raw data
-                    tracing::debug!("http/1.1 parse error for {}: {}", hostname, e);
-                    // Forward the data we couldn't parse
+                    // Parse error - forward raw data
+                    tracing::debug!(
+                        error = %e,
+                        buffer_len = accumulated.len(),
+                        "http/1.1 parse error for {}",
+                        hostname
+                    );
                     upstream_writer.write_all(&accumulated).await?;
                     accumulated.clear();
                     break;

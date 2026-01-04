@@ -542,6 +542,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
     }
 
     // Configure credentials (Claude Code, GitHub token)
+    // Server always uses secure mode (insecure_credentials = false)
     setup_credentials_env(
         &job_id,
         &workspace_dir,
@@ -550,6 +551,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         &config.credentials,
         job.network_policy.as_ref(),
         &log_sink,
+        false,
     );
 
     let command = build_command(script);
@@ -1368,10 +1370,7 @@ fn build_environment(
 
     // Sandbox isolation - HOME is separate from working_dir in local mode
     // to avoid project's .claude/ shadowing user config
-    let _ = env.insert(
-        "HOME".to_string(),
-        home_dir.to_string_lossy().to_string(),
-    );
+    let _ = env.insert("HOME".to_string(), home_dir.to_string_lossy().to_string());
 
     let _ = env.insert("USER".to_string(), "sbc-admin".to_string());
     let _ = env.insert("LOGNAME".to_string(), "sbc-admin".to_string());
@@ -1604,29 +1603,52 @@ fn setup_credentials_env(
     credentials: &[Credential],
     network_policy: Option<&NetworkPolicy>,
     log_sink: &Arc<dyn LogSink>,
+    insecure_credentials: bool,
 ) {
     let filtered_credentials = filter_credentials(credentials, network_policy);
 
+    tracing::debug!(
+        job_id = %job_id,
+        total_credentials = credentials.len(),
+        filtered_credentials = filtered_credentials.len(),
+        has_claude = has_credential_with_type(&filtered_credentials, CredentialType::Claude),
+        insecure = insecure_credentials,
+        working_dir = %working_dir.display(),
+        "setting up credentials environment"
+    );
+
     // Claude Code credential
     if has_credential_with_type(&filtered_credentials, CredentialType::Claude) {
-        if let Ok(()) = workspace::setup_claude_config(
+        tracing::info!(job_id = %job_id, "setting up claude config");
+        match workspace::setup_claude_config(
             &job_dir.base,
             working_dir,
             job_id,
             &filtered_credentials,
+            insecure_credentials,
         ) {
-            let wrapper_bin = job_dir.base.join("bin");
-            if let Some(path) = env.get("PATH").cloned() {
-                let new_path = format!("{}:{}", wrapper_bin.display(), path);
-                tracing::info!(
-                    job_id = %job_id,
-                    wrapper_bin = %wrapper_bin.display(),
-                    new_path = %new_path,
-                    "injecting security wrapper into PATH"
-                );
-                let _ = env.insert("PATH".to_string(), new_path);
+            Ok(()) => {
+                tracing::info!(job_id = %job_id, "claude config setup succeeded");
+                let wrapper_bin = job_dir.base.join("bin");
+                if let Some(path) = env.get("PATH").cloned() {
+                    let new_path = format!("{}:{}", wrapper_bin.display(), path);
+                    tracing::info!(
+                        job_id = %job_id,
+                        wrapper_bin = %wrapper_bin.display(),
+                        new_path = %new_path,
+                        "injecting security wrapper into PATH"
+                    );
+                    let _ = env.insert("PATH".to_string(), new_path);
+                }
+                log_sink.info(job_id, "Claude Code credentials configured");
             }
-            log_sink.info(job_id, "Claude Code credentials configured");
+            Err(e) => {
+                tracing::error!(job_id = %job_id, error = %e, "failed to setup claude config");
+                log_sink.info(
+                    job_id,
+                    &format!("WARNING: Claude config setup failed: {}", e),
+                );
+            }
         }
     }
 
@@ -1790,6 +1812,9 @@ pub struct LocalExecutionConfig {
 
     /// Additional environment variables
     pub env: Vec<(String, String)>,
+
+    /// Pass real credentials to sandbox (INSECURE - for debugging only)
+    pub insecure_credentials: bool,
 }
 
 impl std::fmt::Debug for LocalExecutionConfig {
@@ -1801,6 +1826,7 @@ impl std::fmt::Debug for LocalExecutionConfig {
             .field("interactive", &self.interactive)
             .field("pty_size", &self.pty_size)
             .field("on_pty_ready", &self.on_pty_ready.is_some())
+            .field("insecure_credentials", &self.insecure_credentials)
             .finish_non_exhaustive()
     }
 }
@@ -1968,15 +1994,16 @@ pub async fn execute_local(
         let _ = env.insert("OPENSSL_NO_VENDOR".to_string(), "1".to_string());
     }
 
-    // Configure credentials
+    // Configure credentials in home_dir (where $HOME points)
     setup_credentials_env(
         &job_id,
-        &config.working_dir,
+        &home_dir,
         &job_dir,
         &mut env,
         &config.credentials,
         config.network_policy.as_ref(),
         &log_sink,
+        config.insecure_credentials,
     );
 
     // Phase 6: Execute

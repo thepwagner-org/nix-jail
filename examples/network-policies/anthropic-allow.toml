@@ -14,8 +14,3 @@ credential = "anthropic"
 [rules.pattern]
 host = "console\\.anthropic\\.com"
 
-# Statsig for feature flags/analytics
-[[rules]]
-action = "allow"
-[rules.pattern]
-host = "statsig\\.anthropic\\.com"

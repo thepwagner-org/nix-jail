@@ -289,6 +289,13 @@ enum Commands {
         #[arg(short, long = "env", value_parser = parse_env_var)]
         env: Vec<(String, String)>,
 
+        /// Pass real credentials to sandbox (INSECURE - for debugging only)
+        ///
+        /// WARNING: Real tokens will be visible inside the sandbox. Only use for debugging
+        /// credential-related issues when proxy injection isn't working.
+        #[arg(long)]
+        insecure_credentials: bool,
+
         /// Command to execute (everything after --)
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -325,6 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         executor,
         store_strategy,
         env,
+        insecure_credentials,
         command,
     } = cli.command
     {
@@ -345,6 +353,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             executor,
             store_strategy,
             env,
+            insecure_credentials,
             command,
         )
         .instrument(tracing::info_span!("run"))
@@ -762,6 +771,7 @@ async fn run_local(
     executor_type: String,
     store_strategy: String,
     env: Vec<(String, String)>,
+    insecure_credentials: bool,
     command: Vec<String>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     tracing::info!(packages = ?packages, repo = ?repo, path = ?path, "running locally");
@@ -1011,6 +1021,7 @@ git checkout"#,
         pty_size,
         on_pty_ready,
         env,
+        insecure_credentials,
     };
 
     // Create executor and job root

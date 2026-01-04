@@ -168,21 +168,10 @@ fn fetch_from_keychain(service: &str, account: Option<&str>) -> Result<String, S
         return Err(format!("Empty token from keychain (service={})", service));
     }
 
-    // For Claude Code credentials, the keychain stores JSON: {"claudeAiOauth":{"accessToken":"sk-ant-oat01-..."}}
-    // Extract just the accessToken value
-    if service.starts_with("Claude Code") {
-        if let Some(start) = raw_output.find("sk-ant-oat01-") {
-            let token_part = &raw_output[start..];
-            let token_end = token_part.find('"').unwrap_or(token_part.len());
-            let token = &token_part[..token_end];
-            Ok(token.to_string())
-        } else {
-            Err("Failed to extract accessToken from Claude Code keychain entry".to_string())
-        }
-    } else {
-        // For other services, return the raw value
-        Ok(raw_output)
-    }
+    // For Claude Code credentials, return the full JSON
+    // The proxy handles extracting accessToken when needed for Authorization header
+    // and uses the full JSON for x-api-key header
+    Ok(raw_output)
 }
 
 /// Fetch token from file (e.g., ~/.claude/.credentials.json)
@@ -211,22 +200,24 @@ fn fetch_from_file(file_path: &str) -> Result<String, String> {
         }
     }
 
-    // Read the file
+    // Read the file and return raw contents
+    // For Claude credentials, this is the full JSON that the proxy will use
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read credential file {}: {}", expanded_path, e))?;
 
-    // Parse JSON and extract accessToken
-    // Expected format: {"claudeAiOauth":{"accessToken":"sk-ant-oat01-..."}}
-    if let Some(start) = contents.find("sk-ant-oat01-") {
-        let token_part = &contents[start..];
+    Ok(contents.trim().to_string())
+}
+
+/// Extract accessToken from Claude credential JSON
+/// The raw JSON format is: {"claudeAiOauth":{"accessToken":"sk-ant-oat01-...",...}}
+pub fn extract_access_token(raw_json: &str) -> Option<String> {
+    // Find the accessToken value - look for sk-ant-oat01- prefix
+    if let Some(start) = raw_json.find("sk-ant-oat01-") {
+        let token_part = &raw_json[start..];
         let token_end = token_part.find('"').unwrap_or(token_part.len());
-        let token = &token_part[..token_end];
-        Ok(token.to_string())
+        Some(token_part[..token_end].to_string())
     } else {
-        Err(format!(
-            "Failed to extract accessToken from credential file {}",
-            expanded_path
-        ))
+        None
     }
 }
 

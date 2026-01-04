@@ -11,21 +11,42 @@ use crate::config::{Credential, CredentialSource, CredentialType};
 /// - File: Creates dummy .claude.json and ~/.claude/.credentials.json files
 ///
 /// The proxy will intercept requests and inject the real tokens.
+///
+/// When `insecure_credentials` is true, real credentials are passed directly to the
+/// sandbox instead of dummy tokens. This is for debugging credential issues only.
 pub fn setup_claude_config(
     job_base: &Path,
     workspace_home: &Path,
     job_id: &str,
     credentials: &[&Credential],
+    insecure_credentials: bool,
 ) -> Result<(), WorkspaceError> {
     use std::env;
     use std::path::Path;
 
+    tracing::debug!(
+        job_id = %job_id,
+        job_base = %job_base.display(),
+        workspace_home = %workspace_home.display(),
+        num_credentials = credentials.len(),
+        insecure = insecure_credentials,
+        "setup_claude_config called"
+    );
+
     // Get user home directory, using SUDO_USER when running under sudo
     let user_home = if let Ok(sudo_user) = env::var("SUDO_USER") {
-        format!("/home/{}", sudo_user)
+        tracing::debug!(sudo_user = %sudo_user, "running under sudo");
+        // macOS uses /Users, Linux uses /home
+        if cfg!(target_os = "macos") {
+            format!("/Users/{}", sudo_user)
+        } else {
+            format!("/home/{}", sudo_user)
+        }
     } else {
+        tracing::debug!("not running under sudo, using HOME");
         env::var("HOME").map_err(|_| WorkspaceError::InvalidPath("HOME not set".to_string()))?
     };
+    tracing::debug!(user_home = %user_home, "resolved user home directory");
     let user_home_path = Path::new(&user_home);
 
     // Find Claude credentials and determine their source type
@@ -34,6 +55,13 @@ pub fn setup_claude_config(
         .filter(|c| c.credential_type == CredentialType::Claude)
         .copied()
         .collect();
+
+    tracing::debug!(
+        job_id = %job_id,
+        claude_cred_count = claude_creds.len(),
+        cred_types = ?claude_creds.iter().map(|c| format!("{:?}", c.source)).collect::<Vec<_>>(),
+        "found claude credentials"
+    );
 
     if claude_creds.is_empty() {
         tracing::debug!("no claude credentials found, skipping claude config setup");
@@ -44,10 +72,24 @@ pub fn setup_claude_config(
     // TODO: Remove this and restore minimal config once we identify which files are needed
     let claude_dir = workspace_home.join(".claude");
     let source_claude_dir = user_home_path.join(".claude");
+    tracing::debug!(
+        source = %source_claude_dir.display(),
+        dest = %claude_dir.display(),
+        source_exists = source_claude_dir.exists(),
+        "checking source .claude directory"
+    );
     if source_claude_dir.exists() {
         copy_dir_recursive(&source_claude_dir, &claude_dir)?;
-        tracing::info!("TEMPORARY: copied entire ~/.claude/ to workspace for verification");
+        tracing::info!(
+            source = %source_claude_dir.display(),
+            dest = %claude_dir.display(),
+            "copied entire ~/.claude/ to workspace"
+        );
     } else {
+        tracing::warn!(
+            source = %source_claude_dir.display(),
+            "source .claude directory does not exist, creating empty"
+        );
         fs::create_dir_all(&claude_dir)?;
     }
     #[cfg(unix)]
@@ -65,41 +107,18 @@ pub fn setup_claude_config(
         .iter()
         .any(|c| matches!(c.source, CredentialSource::File { .. }));
 
-    // Copy essential config from ~/.claude.json to skip onboarding prompts
-    // We need: oauthAccount (for auth), numStartups (skip first-run), theme (skip theme prompt)
+    // Copy entire ~/.claude.json to workspace
     let claude_json = user_home_path.join(".claude.json");
     let dest_json = workspace_home.join(".claude.json");
 
     if claude_json.exists() {
-        // Parse existing config and extract essential sections
-        match fs::read_to_string(&claude_json) {
-            Ok(json_content) => {
-                match serde_json::from_str::<serde_json::Value>(&json_content) {
-                    Ok(full_config) => {
-                        // Extract sections needed to skip onboarding
-                        let minimal_config = serde_json::json!({
-                            "oauthAccount": full_config.get("oauthAccount"),
-                            // Non-zero numStartups skips first-run prompts
-                            "numStartups": full_config.get("numStartups").unwrap_or(&serde_json::json!(100)),
-                            // Set theme to skip theme selection prompt
-                            "theme": full_config.get("theme").unwrap_or(&serde_json::json!("dark")),
-                        });
-
-                        // Write minimal config
-                        let minimal_json =
-                            serde_json::to_string_pretty(&minimal_config).map_err(|e| {
-                                WorkspaceError::IoError(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("Failed to serialize minimal config: {}", e),
-                                ))
-                            })?;
-                        fs::write(&dest_json, &minimal_json)?;
-                        tracing::debug!("copied essential config from .claude.json to workspace");
-                    }
-                    Err(e) => {
-                        tracing::warn!("failed to parse .claude.json: {}, skipping", e);
-                    }
-                }
+        match fs::copy(&claude_json, &dest_json) {
+            Ok(_) => {
+                tracing::debug!(
+                    source = %claude_json.display(),
+                    dest = %dest_json.display(),
+                    "copied .claude.json to workspace"
+                );
             }
             Err(e) => {
                 tracing::warn!("failed to read .claude.json: {}, skipping", e);
@@ -121,7 +140,12 @@ pub fn setup_claude_config(
     if has_file {
         for cred in &claude_creds {
             if let CredentialSource::File { file_path } = &cred.source {
-                setup_file_based_credential(workspace_home, job_id, file_path)?;
+                setup_file_based_credential(
+                    workspace_home,
+                    job_id,
+                    file_path,
+                    insecure_credentials,
+                )?;
             }
         }
     }
@@ -132,6 +156,16 @@ pub fn setup_claude_config(
         return Ok(());
     }
 
+    // Find the keychain credential to get the dummy_token from config
+    let keychain_cred = claude_creds
+        .iter()
+        .find(|c| matches!(c.source, CredentialSource::Keychain { .. }));
+
+    let dummy_access_token = keychain_cred
+        .and_then(|c| c.dummy_token.as_ref())
+        .map(|s| s.as_str())
+        .unwrap_or("DUMMY_TOKEN_NOT_CONFIGURED");
+
     // Create security wrapper that returns a fixed dummy token
     // The dummy token is defined in the credential config file (dummy_token field)
     // The proxy intercepts requests and replaces the dummy with the real token
@@ -140,12 +174,19 @@ pub fn setup_claude_config(
 
     let security_wrapper = bin_dir.join("security");
 
-    // Fixed dummy token - must match dummy_token in credential config
-    const DUMMY_ACCESS_TOKEN: &str = "sk-ant-oat01-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA_AAAAAA_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-AAAA";
-    const DUMMY_REFRESH_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA_AAAAAA_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-AAAA";
+    // Dummy refresh token - uses same pattern as access token but without sk-ant-oat01- prefix
+    let dummy_refresh_token = if dummy_access_token.starts_with("sk-ant-oat01-") {
+        dummy_access_token
+            .strip_prefix("sk-ant-oat01-")
+            .unwrap_or(dummy_access_token)
+    } else {
+        dummy_access_token
+    };
 
-    // Fetch real token JSON structure but replace tokens with dummies
-    let dummy_token_json = std::process::Command::new("/usr/bin/security")
+    // Fetch real token JSON from keychain
+    // When insecure_credentials is true, use real tokens directly (DANGEROUS - for debugging only)
+    // When false (normal mode), replace with dummy tokens for proxy injection
+    let token_json = std::process::Command::new("/usr/bin/security")
         .args([
             "find-generic-password",
             "-s",
@@ -157,19 +198,29 @@ pub fn setup_claude_config(
         .and_then(|output| {
             if output.status.success() {
                 let token_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let mut json_value: serde_json::Value = serde_json::from_str(&token_str).ok()?;
 
-                // Replace tokens with fixed dummies
-                if let Some(claude_oauth) = json_value.get_mut("claudeAiOauth") {
-                    claude_oauth["accessToken"] =
-                        serde_json::Value::String(DUMMY_ACCESS_TOKEN.to_string());
-                    claude_oauth["refreshToken"] =
-                        serde_json::Value::String(DUMMY_REFRESH_TOKEN.to_string());
+                if insecure_credentials {
+                    // INSECURE MODE: Return real token JSON directly
+                    tracing::warn!(
+                        job_id = %job_id,
+                        "INSECURE: using real keychain tokens in security wrapper"
+                    );
+                    Some(token_str)
+                } else {
+                    // SECURE MODE: Replace tokens with dummies
+                    let mut json_value: serde_json::Value =
+                        serde_json::from_str(&token_str).ok()?;
+                    if let Some(claude_oauth) = json_value.get_mut("claudeAiOauth") {
+                        claude_oauth["accessToken"] =
+                            serde_json::Value::String(dummy_access_token.to_string());
+                        claude_oauth["refreshToken"] =
+                            serde_json::Value::String(dummy_refresh_token.to_string());
+                    }
+
+                    let dummy_json = serde_json::to_string(&json_value).ok()?;
+                    tracing::info!(job_id = %job_id, "created dummy token json for security wrapper");
+                    Some(dummy_json)
                 }
-
-                let dummy_json = serde_json::to_string(&json_value).ok()?;
-                tracing::info!(job_id = %job_id, "created dummy token json for security wrapper");
-                Some(dummy_json)
             } else {
                 None
             }
@@ -178,7 +229,7 @@ pub fn setup_claude_config(
             tracing::warn!(job_id = %job_id, "failed to fetch claude oauth token from keychain, using minimal dummy");
             format!(
                 r#"{{"claudeAiOauth":{{"accessToken":"{}","refreshToken":"{}"}}}}"#,
-                DUMMY_ACCESS_TOKEN, DUMMY_REFRESH_TOKEN
+                dummy_access_token, dummy_refresh_token
             )
         });
 
@@ -236,7 +287,7 @@ else
     exit 1
 fi
 "#,
-        dummy_token_json
+        token_json
     );
 
     fs::write(&security_wrapper, wrapper_script)?;
@@ -248,19 +299,25 @@ fi
         fs::set_permissions(&security_wrapper, fs::Permissions::from_mode(0o755))?;
     }
 
-    tracing::info!(job_id = %job_id, wrapper_path = %security_wrapper.display(), "created security wrapper with dummy token");
+    if insecure_credentials {
+        tracing::warn!(job_id = %job_id, wrapper_path = %security_wrapper.display(), "created INSECURE security wrapper with REAL tokens");
+    } else {
+        tracing::info!(job_id = %job_id, wrapper_path = %security_wrapper.display(), "created security wrapper with dummy token");
+    }
 
     Ok(())
 }
 
-/// Setup file-based Claude credential by creating dummy credential files
+/// Setup file-based Claude credential by creating credential files
 ///
-/// Reads the real credential from the specified file path, creates dummy versions,
-/// and writes both .claude.json and ~/.claude/.credentials.json to the workspace.
+/// Reads the real credential from the specified file path, creates dummy versions
+/// (or uses real credentials when insecure_credentials is true), and writes to
+/// ~/.claude/.credentials.json in the workspace.
 fn setup_file_based_credential(
     workspace_home: &Path,
     job_id: &str,
     file_path: &str,
+    insecure_credentials: bool,
 ) -> Result<(), WorkspaceError> {
     use std::env;
     use std::path::Path;
@@ -269,7 +326,12 @@ fn setup_file_based_credential(
     // When running under sudo, use SUDO_USER to get the real user's home directory
     let expanded_path = if file_path.starts_with("~/") {
         let home = if let Ok(sudo_user) = env::var("SUDO_USER") {
-            format!("/home/{}", sudo_user)
+            // macOS uses /Users, Linux uses /home
+            if cfg!(target_os = "macos") {
+                format!("/Users/{}", sudo_user)
+            } else {
+                format!("/home/{}", sudo_user)
+            }
         } else {
             env::var("HOME").map_err(|_| WorkspaceError::InvalidPath("HOME not set".to_string()))?
         };
@@ -288,64 +350,81 @@ fn setup_file_based_credential(
         ))
     })?;
 
-    // Parse and create dummy version
-    let mut json_value: serde_json::Value =
-        serde_json::from_str(&real_credential_json).map_err(|e| {
-            WorkspaceError::IoError(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to parse credential JSON: {}", e),
-            ))
-        })?;
+    // INSECURE MODE: Use real credentials directly
+    let output_json = if insecure_credentials {
+        tracing::warn!(
+            job_id = %job_id,
+            "INSECURE: using real file-based credentials in workspace"
+        );
+        real_credential_json
+    } else {
+        // SECURE MODE: Parse and create dummy version
+        let mut json_value: serde_json::Value = serde_json::from_str(&real_credential_json)
+            .map_err(|e| {
+                WorkspaceError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Failed to parse credential JSON: {}", e),
+                ))
+            })?;
 
-    // Helper function to create dummy token
-    let make_dummy = |real_token: &str, prefix: &str| -> String {
-        let mut dummy = prefix.to_string();
-        for ch in real_token[prefix.len()..].chars() {
-            if ch.is_alphanumeric() {
-                dummy.push('A');
-            } else {
-                dummy.push(ch); // Keep special chars like - and _
+        // Helper function to create dummy token
+        let make_dummy = |real_token: &str, prefix: &str| -> String {
+            let mut dummy = prefix.to_string();
+            for ch in real_token[prefix.len()..].chars() {
+                if ch.is_alphanumeric() {
+                    dummy.push('A');
+                } else {
+                    dummy.push(ch); // Keep special chars like - and _
+                }
+            }
+            dummy
+        };
+
+        // Replace .claudeAiOauth.accessToken with dummy
+        if let Some(claude_oauth) = json_value.get_mut("claudeAiOauth") {
+            if let Some(access_token) = claude_oauth.get("accessToken").and_then(|v| v.as_str()) {
+                let dummy_access = if access_token.starts_with("sk-ant-oat01-") {
+                    make_dummy(access_token, "sk-ant-oat01-")
+                } else {
+                    "dummy-access-token".to_string()
+                };
+                claude_oauth["accessToken"] = serde_json::Value::String(dummy_access);
+            }
+
+            // Replace .claudeAiOauth.refreshToken with dummy
+            if let Some(refresh_token) = claude_oauth.get("refreshToken").and_then(|v| v.as_str()) {
+                let dummy_refresh = make_dummy(refresh_token, "");
+                claude_oauth["refreshToken"] = serde_json::Value::String(dummy_refresh);
             }
         }
-        dummy
+
+        serde_json::to_string_pretty(&json_value).map_err(|e| {
+            WorkspaceError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to serialize dummy credential: {}", e),
+            ))
+        })?
     };
 
-    // Replace .claudeAiOauth.accessToken with dummy
-    if let Some(claude_oauth) = json_value.get_mut("claudeAiOauth") {
-        if let Some(access_token) = claude_oauth.get("accessToken").and_then(|v| v.as_str()) {
-            let dummy_access = if access_token.starts_with("sk-ant-oat01-") {
-                make_dummy(access_token, "sk-ant-oat01-")
-            } else {
-                "dummy-access-token".to_string()
-            };
-            claude_oauth["accessToken"] = serde_json::Value::String(dummy_access);
-        }
-
-        // Replace .claudeAiOauth.refreshToken with dummy
-        if let Some(refresh_token) = claude_oauth.get("refreshToken").and_then(|v| v.as_str()) {
-            let dummy_refresh = make_dummy(refresh_token, "");
-            claude_oauth["refreshToken"] = serde_json::Value::String(dummy_refresh);
-        }
-    }
-
-    let dummy_json = serde_json::to_string_pretty(&json_value).map_err(|e| {
-        WorkspaceError::IoError(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Failed to serialize dummy credential: {}", e),
-        ))
-    })?;
-
-    // Write dummy .claude/.credentials.json to workspace
+    // Write credential JSON to workspace
     // (.claude directory already created in setup_claude_config with correct permissions)
     let claude_dir = workspace_home.join(".claude");
     let credentials_json = claude_dir.join(".credentials.json");
-    fs::write(&credentials_json, &dummy_json)?;
+    fs::write(&credentials_json, &output_json)?;
 
-    tracing::info!(
-        job_id = %job_id,
-        path = %credentials_json.display(),
-        "created dummy ~/.claude/.credentials.json for file-based credential"
-    );
+    if insecure_credentials {
+        tracing::warn!(
+            job_id = %job_id,
+            path = %credentials_json.display(),
+            "created INSECURE ~/.claude/.credentials.json with REAL tokens"
+        );
+    } else {
+        tracing::info!(
+            job_id = %job_id,
+            path = %credentials_json.display(),
+            "created dummy ~/.claude/.credentials.json for file-based credential"
+        );
+    }
 
     // Note: .claude.json is already created by setup_claude_config() with the trimmed
     // oauthAccount section from the user's ~/.claude.json file

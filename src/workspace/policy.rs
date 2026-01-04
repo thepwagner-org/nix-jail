@@ -40,6 +40,7 @@ pub fn write_proxy_config(
         credentials: credentials.iter().map(|c| (*c).clone()).collect(),
         proxy_username,
         proxy_password,
+        request_log_path: None,
     };
 
     let config_path = config_dir.join("proxy-config.json");
