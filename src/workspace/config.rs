@@ -68,35 +68,13 @@ pub fn setup_claude_config(
         return Ok(());
     }
 
-    // TEMPORARY: Copy entire ~/.claude/ directory for verification
-    // TODO: Remove this and restore minimal config once we identify which files are needed
+    // Create empty .claude directory for Claude Code to use
     let claude_dir = workspace_home.join(".claude");
-    let source_claude_dir = user_home_path.join(".claude");
-    tracing::debug!(
-        source = %source_claude_dir.display(),
-        dest = %claude_dir.display(),
-        source_exists = source_claude_dir.exists(),
-        "checking source .claude directory"
-    );
-    if source_claude_dir.exists() {
-        copy_dir_recursive(&source_claude_dir, &claude_dir)?;
-        tracing::info!(
-            source = %source_claude_dir.display(),
-            dest = %claude_dir.display(),
-            "copied entire ~/.claude/ to workspace"
-        );
-    } else {
-        tracing::warn!(
-            source = %source_claude_dir.display(),
-            "source .claude directory does not exist, creating empty"
-        );
-        fs::create_dir_all(&claude_dir)?;
-    }
+    fs::create_dir_all(&claude_dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // Make writable so Claude Code can modify files
-        fs::set_permissions(&claude_dir, fs::Permissions::from_mode(0o777))?;
+        fs::set_permissions(&claude_dir, fs::Permissions::from_mode(0o755))?;
     }
 
     // Detect credential source type (keychain vs file)
@@ -428,56 +406,6 @@ fn setup_file_based_credential(
 
     // Note: .claude.json is already created by setup_claude_config() with the trimmed
     // oauthAccount section from the user's ~/.claude.json file
-
-    Ok(())
-}
-
-/// TEMPORARY: Recursively copy a directory
-/// TODO: Remove this once we identify which specific files are needed
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), WorkspaceError> {
-    if !dst.exists() {
-        fs::create_dir_all(dst)?;
-    }
-
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        if src_path.is_dir() {
-            // Skip certain directories that shouldn't be copied
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str == "todos"
-                || name_str == "statsig"
-                || name_str == "debug"
-                || name_str == "projects"
-            {
-                continue;
-            }
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else if src_path.is_symlink() {
-            // Follow symlinks and copy the target file
-            if let Ok(target) = fs::read_link(&src_path) {
-                let resolved = if target.is_absolute() {
-                    target
-                } else {
-                    src_path.parent().unwrap_or(src).join(&target)
-                };
-                if resolved.exists() && resolved.is_file() {
-                    fs::copy(&resolved, &dst_path)?;
-                }
-            }
-        } else {
-            // Skip large files like conversation logs
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.ends_with(".jsonl") {
-                continue;
-            }
-            fs::copy(&src_path, &dst_path)?;
-        }
-    }
 
     Ok(())
 }

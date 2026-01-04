@@ -2034,7 +2034,9 @@ pub async fn execute_local(
     .await?;
 
     // Extract stdout/stderr from handle based on mode
-    let (stdout_task, stderr_task) = match handle.io {
+    // In PTY mode, stdout_task is the stdin forwarder which blocks on user input
+    // and must be aborted when the job exits
+    let (stdout_task, stderr_task, is_pty_mode) = match handle.io {
         crate::executor::IoHandle::Piped { stdout, stderr } => {
             let log_sink_stdout = log_sink.clone();
             let log_sink_stderr = log_sink.clone();
@@ -2061,7 +2063,7 @@ pub async fn execute_local(
                 .await
             });
 
-            (stdout_task, stderr_task)
+            (stdout_task, stderr_task, false)
         }
         crate::executor::IoHandle::Pty { stdin, stdout } => {
             // PTY mode: connect directly to user's terminal
@@ -2101,7 +2103,9 @@ pub async fn execute_local(
                 }
             });
 
-            (stdin_task, stdout_task)
+            // Return (stdin_task, stdout_task, true) - stdin needs to be aborted on exit
+            // since it blocks forever on user input
+            (stdin_task, stdout_task, true)
         }
     };
 
@@ -2158,7 +2162,16 @@ pub async fn execute_local(
         p.stop().await;
     }
 
-    if let Some((pout, perr)) = proxy_tasks {
+    // In PTY mode, stdout_task is actually stdin forwarder which blocks on read
+    // We must abort it since it won't complete on its own
+    if is_pty_mode {
+        stdout_task.abort();
+        if let Some((pout, perr)) = proxy_tasks {
+            let _ = tokio::join!(stderr_task, pout, perr);
+        } else {
+            let _ = stderr_task.await;
+        }
+    } else if let Some((pout, perr)) = proxy_tasks {
         let _ = tokio::join!(stdout_task, stderr_task, pout, perr);
     } else {
         let _ = tokio::join!(stdout_task, stderr_task);
