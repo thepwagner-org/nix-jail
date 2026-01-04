@@ -5,7 +5,9 @@
 ```mermaid
 flowchart LR
     subgraph Sandbox
-        Agent["Agent<br/>(Claude Code)"]
+        Agent["Agent<br/>(e.g. Claude Code)"]
+        Shell["Shell"]
+        MCP["MCP Servers"]
     end
 
     subgraph Host["Host (outside sandbox)"]
@@ -15,12 +17,12 @@ flowchart LR
 
     Internet["api.anthropic.com"]
 
-    Agent -->|"only exit"| Proxy
+    Sandbox -->|"only exit"| Proxy
     Creds -.->|"inject"| Proxy
     Proxy --> Internet
 
-    Agent -.-x|"❌ blocked"| Internet
-    Agent -.-x|"❌ blocked"| Creds
+    Sandbox -.-x|"❌"| Internet
+    Sandbox -.-x|"❌"| Creds
 ```
 
 **Key points:**
