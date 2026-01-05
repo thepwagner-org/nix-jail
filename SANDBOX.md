@@ -6,7 +6,7 @@
 
 Platform-specific executors provide defense-in-depth isolation:
 - **SandboxExecutor** (macOS) - Apple sandbox-exec with SBPL profiles
-- **SystemdExecutor** (Linux) - systemd transient units with 32 hardening properties
+- **SystemdExecutor** (Linux) - systemd transient units with comprehensive hardening
 - **DockerExecutor** (cross-platform) - Container isolation with capability dropping
 
 See [TESTING.md](TESTING.md) for usage examples and testing workflows.
@@ -161,19 +161,19 @@ The **SystemdExecutor** uses systemd transient units with comprehensive hardenin
 ```bash
 systemd-run --unit=nix-jail-{job_id} --scope --user \
   --property=RootDirectory=/tmp/nix-jail-{job_id}/root \
-  [... 32 hardening properties ...] \
+  [... hardening properties ...] \
   /bin/bash /workspace/script.sh
 ```
 
-**Defense-in-Depth:** 32 hardening properties provide five layers of defense - filesystem isolation, user/privilege controls, syscall filtering, memory/execution controls, and network isolation. See [Appendix C](#c-linux-hardening-reference) for the complete property reference.
+**Defense-in-Depth:** Hardening properties provide five layers of defense - filesystem isolation, user/privilege controls, syscall filtering, memory/execution controls, and network isolation. See [Appendix C](#c-linux-hardening-reference) for the complete property reference.
 
 **Hardening Profiles:**
 
-The default security posture includes all 32 hardening properties. However, hardening profiles allow explicit, documented weakening for specific workload requirements:
+The default security posture includes all hardening properties. However, hardening profiles allow explicit, documented weakening for specific workload requirements:
 
-- **Default Profile** (32 properties): Maximum security for general workloads. Includes `MemoryDenyWriteExecute=true` which prevents W^X violations and **blocks JIT compilation** - this is intentional for maximum security.
+- **Default Profile**: Maximum security for general workloads. Includes `MemoryDenyWriteExecute=true` which prevents W^X violations and **blocks JIT compilation** - this is intentional for maximum security.
 
-- **JIT Runtime Profile** (32 properties): Removes `MemoryDenyWriteExecute=true` to enable legitimate JIT compilation required by runtimes like Node.js V8, Python PyPy, Java/JVM, and WebAssembly engines. All other 32 hardening properties remain active. Use ONLY when running JIT-based runtimes (Node.js, Python with JIT, Java, etc.). Users must explicitly request via `--hardening-profile jit-runtime`.
+- **JIT Runtime Profile**: Removes `MemoryDenyWriteExecute=true` to enable legitimate JIT compilation required by runtimes like Node.js V8, Python PyPy, Java/JVM, and WebAssembly engines. All other hardening properties remain active. Use ONLY when running JIT-based runtimes (Node.js, Python with JIT, Java, etc.). Users must explicitly request via `--hardening-profile jit-runtime`.
 
 **Store Strategy:**
 
@@ -346,7 +346,7 @@ nix-jail supports three executor backends. The table compares these to external 
 
 **nix-jail backends (built-in):** systemd (Linux default), Docker (cross-platform), sandbox-exec (macOS default).
 
-**Why systemd on Linux:** Nix package closures typically contain 10-100+ packages. systemd's RootDirectory property handles this with a single chroot, comprehensive hardening (32 properties), and built-in resource limits. Present on 99% of modern Linux distributions.
+**Why systemd on Linux:** Nix package closures typically contain 10-100+ packages. systemd's RootDirectory property handles this with a single chroot, comprehensive hardening, and built-in resource limits. Present on 99% of modern Linux distributions.
 
 **Why Docker:** Cross-platform support (Linux, macOS with Docker Desktop, WSL2). Useful for non-systemd Linux (Alpine, Gentoo) or unified tooling across platforms.
 
@@ -454,23 +454,23 @@ message IpPattern {
 
 ### C. Linux Hardening Reference
 
-The SystemdExecutor applies 32 hardening properties across seven categories:
+The SystemdExecutor applies hardening properties across seven categories:
 
 | Category | Properties | Purpose |
 |----------|-----------|---------|
-| **Filesystem Isolation** (10) | PrivateTmp, ProtectHome, ProtectSystem=strict, ProtectKernelTunables, ProtectKernelModules, ProtectKernelLogs, ProtectControlGroups, ProtectProc=invisible, ProcSubset=pid, PrivateDevices | Restrict filesystem access to minimal required paths |
-| **User & Privilege** (6) | DynamicUser, PrivateUsers, NoNewPrivileges, RestrictSUIDSGID, CapabilityBoundingSet=, AmbientCapabilities= | Prevent privilege escalation and capability acquisition |
-| **Syscall Filtering** (4) | SystemCallFilter=@system-service, SystemCallErrorNumber=EPERM, SystemCallArchitectures=native, RestrictNamespaces=true | Allowlist safe syscalls, block dangerous operations |
-| **Memory/Execution** (3) | MemoryDenyWriteExecute, LockPersonality, RestrictRealtime | Prevent W^X violations and memory exploits |
-| **Network Isolation** (1) | RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 | Isolate network access to proxy-only communication |
-| **Resource Limits** (4) | RuntimeMaxSec, MemoryMax=4G, TasksMax=512, LimitNOFILE=1024 | Prevent resource exhaustion attacks |
-| **Cleanup/Isolation** (4) | RemoveIPC, KeyringMode=private, UMask=0000, ProtectClock | Clean up resources and isolate kernel interfaces (permissive umask safe due to chroot isolation) |
+| **Filesystem Isolation** | PrivateTmp, ProtectHome, ProtectSystem=strict, ProtectKernelTunables, ProtectKernelModules, ProtectKernelLogs, ProtectControlGroups, ProtectProc=invisible, ProcSubset=pid, PrivateDevices | Restrict filesystem access to minimal required paths |
+| **User & Privilege** | DynamicUser, PrivateUsers, NoNewPrivileges, RestrictSUIDSGID, CapabilityBoundingSet=, AmbientCapabilities= | Prevent privilege escalation and capability acquisition |
+| **Syscall Filtering** | SystemCallFilter=@system-service, SystemCallErrorNumber=EPERM, SystemCallArchitectures=native, RestrictNamespaces=true | Allowlist safe syscalls, block dangerous operations |
+| **Memory/Execution** | MemoryDenyWriteExecute, LockPersonality, RestrictRealtime | Prevent W^X violations and memory exploits |
+| **Network Isolation** | RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 | Isolate network access to proxy-only communication |
+| **Resource Limits** | RuntimeMaxSec, MemoryMax=4G, TasksMax=512, LimitNOFILE=1024 | Prevent resource exhaustion attacks |
+| **Cleanup/Isolation** | RemoveIPC, KeyringMode=private, UMask=0000, ProtectClock | Clean up resources and isolate kernel interfaces (permissive umask safe due to chroot isolation) |
 
 **Note:** `PrivateNetwork=true` was replaced with `NetworkNamespacePath` to enable network namespace integration with the veth pair topology.
 
 **Hardening Profiles:**
 
-- **Default**: All 32 properties enabled
+- **Default**: All properties enabled
 - **JIT Runtime**: Removes `MemoryDenyWriteExecute` for JIT compilation support (Node.js, PyPy, JVM)
 
 ### D. External References
