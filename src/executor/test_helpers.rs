@@ -30,6 +30,7 @@ pub struct TestConfigBuilder {
     pty_size: Option<(u16, u16)>,
 }
 
+#[allow(dead_code)]
 impl TestConfigBuilder {
     /// Create a new builder with the given job ID
     pub fn new(job_id: &str) -> Self {

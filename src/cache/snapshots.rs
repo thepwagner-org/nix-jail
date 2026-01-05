@@ -337,7 +337,7 @@ mod tests {
         fs::write(data.join("test.txt"), "v1").unwrap();
 
         // Create snapshot with command A
-        create_snapshot(&cache_path, "command-a", &storage)
+        let _ = create_snapshot(&cache_path, "command-a", &storage)
             .await
             .unwrap();
 
@@ -346,7 +346,7 @@ mod tests {
 
         // Modify data and create snapshot with command B
         fs::write(data.join("test.txt"), "v2").unwrap();
-        create_snapshot(&cache_path, "command-b", &storage)
+        let _ = create_snapshot(&cache_path, "command-b", &storage)
             .await
             .unwrap();
 
@@ -376,7 +376,7 @@ mod tests {
 
         // Create multiple snapshots
         for i in 0..5 {
-            create_snapshot(&cache_path, &format!("command-{}", i), &storage)
+            let _ = create_snapshot(&cache_path, &format!("command-{}", i), &storage)
                 .await
                 .unwrap();
             std::thread::sleep(std::time::Duration::from_millis(1100));
