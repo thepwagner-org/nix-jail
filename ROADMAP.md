@@ -20,55 +20,6 @@ macOS SandboxExecutor could enforce resource limits using ulimit-based restricti
 - Processes: 100
 Linux SystemdExecutor already has these via systemd properties (CPUQuota, MemoryMax, TasksMax, RuntimeMaxSec).
 
-## Platform Abstraction
-
-Formalize platform abstractions to make adding new isolation backends easier.
-**Trait design:**
-```rust
-trait IsolationProvider {
-    fn spawn(&self, job: Job) -> Result<Process>;
-    fn cleanup(&self, job_id: String) -> Result<()>;
-}
-
-trait FilesystemProvider {
-    fn prepare_workspace(&self, closure: &[Path]) -> Result<Workspace>;
-}
-
-trait NetworkProvider {
-    fn setup_network(&self, job_id: String) -> Result<NetworkConfig>;
-}
-```
-**Benefits:**
-- Easier to add new platforms (FreeBSD, NixOS-specific optimizations)
-- Conditional compilation with feature flags
-- Shared core logic (workspace, proxy, storage)
-- Clear platform capabilities matrix
-
-## Deployment Tooling
-
-Make nix-jail easier to deploy and operate in production.
-**systemd service:**
-- `nix-jail.service` for daemon
-- Socket activation
-- Automatic restarts
-- Log integration with journald
-**Installation:**
-- Nix flake for reproducible builds
-- NixOS module for system-wide deployment
-- Home Manager integration for user services
-**Configuration:**
-- TOML/YAML config files
-- Environment variable overrides
-- Per-user vs system-wide settings
-**Observability:**
-- See "Prometheus Metrics" section for detailed metrics design
-- Structured logging (JSON) - already implemented via tracing
-- Health check endpoints: `/health` returning 200 OK
-**Permissions:**
-- `nix-jail` group for access control
-- Per-user resource quotas
-- Audit logging
-
 ## Testing & Validation
 
 Rigorous security testing to validate the sandbox.
@@ -190,56 +141,11 @@ ALTER TABLE jobs ADD COLUMN closure_path_count INTEGER;
 ```
 Populate during job execution in `orchestration.rs`.
 
-## Observability & Debugging
+## Debugging
 
-Rich introspection and debugging capabilities.
-**Web UI:**
-- Job status dashboard
-- Real-time logs
-- Resource usage graphs (CPU/memory/disk over time)
-- Network traffic visualization
-**Distributed tracing:**
-- OpenTelemetry integration
-- Trace job execution through all components
-- Performance bottleneck identification
-**Audit trails:**
-- Complete history of job executions
-- Who ran what, when
-- What network connections were made
-- What files were accessed
 **Debugging mode:**
 - Interactive shell in failed job workspaces
 - Preserve failed job environments
-- Step-through execution
-- Breakpoint support (for supported runtimes)
-**Structured logging:**
-- JSON logs for easy parsing
-- Log aggregation (Loki, CloudWatch, etc.)
-- Log-based alerting
-
-## Developer Experience
-
-Tools to make nix-jail easier to use and debug.
-**CLI improvements:**
-- Interactive job selection: `nix-jail attach`
-- Job history browsing
-- Log filtering and search
-- Config file validation
-- Shell completions (bash, zsh, fish)
-**IDE integration:**
-- VS Code extension (syntax highlighting for config, job status)
-- Language Server Protocol for config validation
-- Debugging integration
-**Template library:**
-- Common job patterns (CI/CD, data processing, builds)
-- Pre-configured environments
-- Example repositories
-- Quick-start templates
-**Documentation:**
-- Interactive tutorials
-- Best practices guide
-- Security hardening guide
-- Performance tuning guide
 
 ## Non-Goals
 
@@ -251,6 +157,8 @@ Explicitly out of scope to keep the project focused:
 - **SLSA Level 3+ compliance** - Personal automation, not supply chain hardening
 - **Real-time guarantees** - Best-effort scheduling
 - **Compliance frameworks** - No PCI-DSS, FedRAMP, SOC2, etc.
+- **Web UI** - CLI-first, use external tools for dashboards
+- **Shell completions** - Not worth the maintenance
 
 ## See Also
 
