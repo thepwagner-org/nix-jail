@@ -752,6 +752,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
                 &working_copy_path,
                 &workspace_storage,
             )
+            .instrument(tracing::info_span!("create_working_copy", bucket = %cache.bucket))
             .await
             {
                 log_sink.error(
