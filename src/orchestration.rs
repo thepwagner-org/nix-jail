@@ -316,6 +316,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         executor.proxy_listen_addr(),
         &log_sink,
     )
+    .instrument(tracing::info_span!("configure_proxy"))
     .await
     {
         Ok(path) => path,
@@ -465,24 +466,30 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
 
     // Chown job directory to nix-jail so jobs can write to it
     // (daemon runs as root, jobs run as nix-jail user)
-    if let Err(e) = std::process::Command::new("chown")
-        .args(["-R", "nix-jail:nix-jail", &job_dir.base.to_string_lossy()])
-        .output()
     {
-        tracing::warn!(job_id = %job_id, error = %e, "failed to chown job directory");
+        let _span = tracing::info_span!("chown_job_dir").entered();
+        if let Err(e) = std::process::Command::new("chown")
+            .args(["-R", "nix-jail:nix-jail", &job_dir.base.to_string_lossy()])
+            .output()
+        {
+            tracing::warn!(job_id = %job_id, error = %e, "failed to chown job directory");
+        }
     }
 
     // Configure execution environment
     // In server mode, workspace_dir is already isolated, so HOME=workspace_dir is fine
-    let mut env = build_environment(
-        proxy.as_ref(),
-        &workspace_dir,
-        &workspace_dir, // home_dir = workspace_dir in server mode (isolated chroot)
-        executor.proxy_connect_host(),
-        executor.uses_chroot(),
-        &job_dir.root,
-        &[], // Server path doesn't support extra env vars
-    );
+    let mut env = {
+        let _span = tracing::info_span!("build_environment").entered();
+        build_environment(
+            proxy.as_ref(),
+            &workspace_dir,
+            &workspace_dir, // home_dir = workspace_dir in server mode (isolated chroot)
+            executor.proxy_connect_host(),
+            executor.uses_chroot(),
+            &job_dir.root,
+            &[], // Server path doesn't support extra env vars
+        )
+    };
 
     // Update PATH, NIX_LDFLAGS, NIX_CFLAGS_COMPILE with package paths
     // (skip for DockerVolume - paths are different architecture)
@@ -543,16 +550,19 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
 
     // Configure credentials (Claude Code, GitHub token)
     // Server always uses secure mode (insecure_credentials = false)
-    setup_credentials_env(
-        &job_id,
-        &workspace_dir,
-        &job_dir,
-        &mut env,
-        &config.credentials,
-        job.network_policy.as_ref(),
-        &log_sink,
-        false,
-    );
+    {
+        let _span = tracing::info_span!("setup_credentials").entered();
+        let ctx = CredentialsSetupContext {
+            job_id: &job_id,
+            working_dir: &workspace_dir,
+            job_dir: &job_dir,
+            credentials: &config.credentials,
+            network_policy: job.network_policy.as_ref(),
+            log_sink: &log_sink,
+            insecure_credentials: false,
+        };
+        setup_credentials_env(&ctx, &mut env);
+    }
 
     let command = build_command(script);
 
@@ -645,6 +655,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
                 &store_setup,
                 hardening_profile,
             )
+            .instrument(tracing::info_span!("run_populate_phase", bucket = %cache.bucket))
             .await;
 
             match populate_result {
@@ -686,6 +697,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
                 populate_cmd,
                 &workspace_storage,
             )
+            .instrument(tracing::info_span!("create_snapshot", bucket = %cache.bucket))
             .await
             {
                 Ok(snapshot_dir) => {
@@ -1594,18 +1606,29 @@ async fn start_proxy_if_configured(
     Ok(Some(proxy))
 }
 
-/// Setup credential-related environment variables
-fn setup_credentials_env(
-    job_id: &str,
-    working_dir: &Path,
-    job_dir: &JobDirectory,
-    env: &mut HashMap<String, String>,
-    credentials: &[Credential],
-    network_policy: Option<&NetworkPolicy>,
-    log_sink: &Arc<dyn LogSink>,
+/// Context for setting up credential-related environment variables
+struct CredentialsSetupContext<'a> {
+    job_id: &'a str,
+    working_dir: &'a Path,
+    job_dir: &'a JobDirectory,
+    credentials: &'a [Credential],
+    network_policy: Option<&'a NetworkPolicy>,
+    log_sink: &'a Arc<dyn LogSink>,
     insecure_credentials: bool,
-) {
-    let filtered_credentials = filter_credentials(credentials, network_policy);
+}
+
+/// Setup credential-related environment variables
+fn setup_credentials_env(ctx: &CredentialsSetupContext<'_>, env: &mut HashMap<String, String>) {
+    let CredentialsSetupContext {
+        job_id,
+        working_dir,
+        job_dir,
+        credentials,
+        network_policy,
+        log_sink,
+        insecure_credentials,
+    } = ctx;
+    let filtered_credentials = filter_credentials(credentials, *network_policy);
 
     tracing::debug!(
         job_id = %job_id,
@@ -1625,7 +1648,7 @@ fn setup_credentials_env(
             working_dir,
             job_id,
             &filtered_credentials,
-            insecure_credentials,
+            *insecure_credentials,
         ) {
             Ok(()) => {
                 tracing::info!(job_id = %job_id, "claude config setup succeeded");
@@ -1995,16 +2018,16 @@ pub async fn execute_local(
     }
 
     // Configure credentials in home_dir (where $HOME points)
-    setup_credentials_env(
-        &job_id,
-        &home_dir,
-        &job_dir,
-        &mut env,
-        &config.credentials,
-        config.network_policy.as_ref(),
-        &log_sink,
-        config.insecure_credentials,
-    );
+    let ctx = CredentialsSetupContext {
+        job_id: &job_id,
+        working_dir: &home_dir,
+        job_dir: &job_dir,
+        credentials: &config.credentials,
+        network_policy: config.network_policy.as_ref(),
+        log_sink: &log_sink,
+        insecure_credentials: config.insecure_credentials,
+    };
+    setup_credentials_env(&ctx, &mut env);
 
     // Phase 6: Execute
     // Note: Local execution doesn't have repo context, so no cache mounts
