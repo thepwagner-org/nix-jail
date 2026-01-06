@@ -65,6 +65,7 @@
     db_path = "nix-jail.db"
     ${lib.optionalString (cfg.monorepoPath != null) ''monorepo_path = "${cfg.monorepoPath}"''}
     ${lib.optionalString (cfg.otlpEndpoint != null) ''otlp_endpoint = "${cfg.otlpEndpoint}"''}
+    ${lib.optionalString (cfg.metricsPort != null) ''metrics_port = ${toString cfg.metricsPort}''}
 
     ${lib.concatMapStringsSep "\n" (cred: ''
       [[credentials]]
@@ -168,6 +169,18 @@ in {
       default = null;
       description = "Optional OTLP endpoint for OpenTelemetry tracing (e.g., http://localhost:4317)";
     };
+
+    metricsPort = lib.mkOption {
+      type = lib.types.nullOr lib.types.port;
+      default = null;
+      description = "Port for Prometheus metrics HTTP endpoint (e.g., 9102). When set, exposes /metrics.";
+    };
+
+    openMetricsFirewall = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Open firewall for metrics port";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -200,6 +213,9 @@ in {
 
     # Allow proxy port from nix-jail network namespaces (vp-* veth interfaces)
     networking.firewall.interfaces."vp-+".allowedTCPPorts = [3128];
+
+    # Open metrics port if configured
+    networking.firewall.allowedTCPPorts = lib.mkIf (cfg.metricsPort != null && cfg.openMetricsFirewall) [cfg.metricsPort];
 
     systemd.services.nixjaild = {
       description = "nix-jail sandbox daemon";
