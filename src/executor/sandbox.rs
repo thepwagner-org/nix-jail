@@ -85,6 +85,7 @@ impl Executor for SandboxExecutor {
                 &canonical_root,
                 canonical_home.as_deref(),
                 config.proxy_port,
+                config.interactive,
                 &canonical_cache_mounts,
             );
 

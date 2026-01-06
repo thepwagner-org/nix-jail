@@ -33,8 +33,9 @@ pub fn generate_profile(
     root_dir: &Path,
     home_dir: Option<&Path>,
     proxy_port: Option<u16>,
+    interactive: bool,
 ) -> String {
-    generate_profile_with_cache(closure_paths, workspace_path, root_dir, home_dir, proxy_port, &[])
+    generate_profile_with_cache(closure_paths, workspace_path, root_dir, home_dir, proxy_port, interactive, &[])
 }
 
 /// Generate sandbox profile with cache directories
@@ -44,6 +45,7 @@ pub fn generate_profile_with_cache(
     root_dir: &Path,
     home_dir: Option<&Path>,
     proxy_port: Option<u16>,
+    interactive: bool,
     cache_mounts: &[ResolvedCacheMount],
 ) -> String {
     let mut profile = String::from("(version 1)\n");
@@ -246,6 +248,14 @@ pub fn generate_profile_with_cache(
     profile.push_str("(allow file-read* (literal \"/dev/urandom\"))\n");
     profile.push_str("(allow file-read* (literal \"/dev/dtracehelper\"))\n");
     profile.push_str("(allow file-read* (subpath \"/dev/fd\"))\n"); // Process substitution for Nix wrappers (read-only)
+
+    // Interactive mode needs TTY access for terminal I/O
+    if interactive {
+        profile.push_str(";; TTY access for interactive mode\n");
+        profile.push_str("(allow file-read-data (literal \"/dev\"))\n"); // List /dev directory
+        profile.push_str("(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+$\"))\n"); // PTY slave devices
+        profile.push_str("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))\n"); // TTY ioctls (setRawMode, etc.)
+    }
     profile.push_str("(allow file-read* (subpath \"/usr/lib\"))\n");
     profile.push_str("(allow file-read* (subpath \"/usr/share\"))\n"); // zoneinfo, locale
     profile.push_str("(allow file-read* (literal \"/private/etc/localtime\"))\n"); // Timezone info (node needs this)
@@ -285,7 +295,7 @@ mod tests {
         let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
-        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128));
+        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128), false);
 
         // Should contain deny-by-default
         assert!(profile.contains("(deny default)"));
@@ -311,7 +321,7 @@ mod tests {
         ];
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
-        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128));
+        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128), false);
 
         // Should contain all closure paths
         assert!(profile.contains("/nix/store/abc-bash-5.0"));
@@ -323,7 +333,7 @@ mod tests {
         let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
-        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128));
+        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128), false);
 
         // Should have essential system access
         assert!(profile.contains("(allow sysctl-read)"));
@@ -339,7 +349,7 @@ mod tests {
         let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
-        let profile = generate_profile(&closure, &workspace, &root, None, None);
+        let profile = generate_profile(&closure, &workspace, &root, None, None, false);
 
         // Should contain deny-by-default
         assert!(profile.contains("(deny default)"));
@@ -358,10 +368,35 @@ mod tests {
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
         let home = PathBuf::from("/tmp/job/home");
-        let profile = generate_profile(&closure, &workspace, &root, Some(&home), Some(3128));
+        let profile = generate_profile(&closure, &workspace, &root, Some(&home), Some(3128), false);
 
         // Should allow home directory access
         assert!(profile.contains("/tmp/job/home"));
         assert!(profile.contains("Home directory"));
+    }
+
+    #[test]
+    fn test_generate_profile_interactive_mode() {
+        let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
+        let workspace = PathBuf::from("/tmp/workspace");
+        let root = PathBuf::from("/tmp/root");
+        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128), true);
+
+        // Should allow TTY access in interactive mode
+        assert!(profile.contains("TTY access for interactive mode"));
+        assert!(profile.contains("/dev/ttys"));
+        assert!(profile.contains("file-ioctl"));
+    }
+
+    #[test]
+    fn test_generate_profile_non_interactive_no_tty() {
+        let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
+        let workspace = PathBuf::from("/tmp/workspace");
+        let root = PathBuf::from("/tmp/root");
+        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128), false);
+
+        // Should NOT allow TTY access in non-interactive mode
+        assert!(!profile.contains("TTY access for interactive mode"));
+        assert!(!profile.contains("/dev/ttys"));
     }
 }
