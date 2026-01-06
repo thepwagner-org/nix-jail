@@ -31,11 +31,11 @@ pub fn generate_profile(
     closure_paths: &[PathBuf],
     workspace_path: &Path,
     root_dir: &Path,
-    home_dir: Option<&Path>,
+    job_dir: &Path,
     proxy_port: Option<u16>,
     interactive: bool,
 ) -> String {
-    generate_profile_with_cache(closure_paths, workspace_path, root_dir, home_dir, proxy_port, interactive, &[])
+    generate_profile_with_cache(closure_paths, workspace_path, root_dir, job_dir, proxy_port, interactive, &[])
 }
 
 /// Generate sandbox profile with cache directories
@@ -43,7 +43,7 @@ pub fn generate_profile_with_cache(
     closure_paths: &[PathBuf],
     workspace_path: &Path,
     root_dir: &Path,
-    home_dir: Option<&Path>,
+    job_dir: &Path,
     proxy_port: Option<u16>,
     interactive: bool,
     cache_mounts: &[ResolvedCacheMount],
@@ -133,13 +133,20 @@ pub fn generate_profile_with_cache(
     ));
 
     // Allow home directory access (for tool config files like .claude.json)
-    if let Some(home) = home_dir {
-        profile.push_str(";; Home directory (tool configuration files)\n");
-        profile.push_str(&format!(
-            "(allow file-read* file-write* (subpath \"{}\"))\n",
-            home.display()
-        ));
-    }
+    let home = job_dir.join("home");
+    profile.push_str(";; Home directory (tool configuration files)\n");
+    profile.push_str(&format!(
+        "(allow file-read* file-write* (subpath \"{}\"))\n",
+        home.display()
+    ));
+
+    // Allow wrapper bin directory (for security wrapper script)
+    let wrapper_bin = job_dir.join("bin");
+    profile.push_str(";; Wrapper bin directory (security wrapper)\n");
+    profile.push_str(&format!(
+        "(allow file-read* process-exec* (subpath \"{}\"))\n",
+        wrapper_bin.display()
+    ));
 
     // Allow file-read-metadata on parent directories (for realpath resolution)
     // Node.js realpathSync needs to lstat each component of the path
@@ -155,25 +162,19 @@ pub fn generate_profile_with_cache(
         ));
         parent = p.parent();
     }
-    profile.push('\n');
-
-    // Allow wrapper bin directory (for security wrapper script)
-    if let Some(job_base) = workspace_path.parent() {
-        let wrapper_bin = job_base.join("bin");
-        profile.push_str(";; Wrapper bin directory (security wrapper)\n");
+    // Also add job_dir parents for realpath resolution
+    let mut parent = job_dir.parent();
+    while let Some(p) = parent {
+        if p.as_os_str().is_empty() || p == std::path::Path::new("/") {
+            break;
+        }
         profile.push_str(&format!(
-            "(allow file-read-metadata (subpath \"{}\"))\n",
-            wrapper_bin.display()
+            "(allow file-read-metadata (literal \"{}\"))\n",
+            p.display()
         ));
-        profile.push_str(&format!(
-            "(allow file-read-data (subpath \"{}\"))\n",
-            wrapper_bin.display()
-        ));
-        profile.push_str(&format!(
-            "(allow process-exec* (subpath \"{}\"))\n\n",
-            wrapper_bin.display()
-        ));
+        parent = p.parent();
     }
+    profile.push('\n');
 
     // Allow reading CA cert from job root directory (for MITM proxy TLS)
     if proxy_port.is_some() {
@@ -295,7 +296,8 @@ mod tests {
         let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
-        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128), false);
+        let job_dir = PathBuf::from("/tmp/job");
+        let profile = generate_profile(&closure, &workspace, &root, &job_dir, Some(3128), false);
 
         // Should contain deny-by-default
         assert!(profile.contains("(deny default)"));
@@ -311,6 +313,10 @@ mod tests {
 
         // Should allow reading from root dir for CA cert
         assert!(profile.contains("/tmp/root"));
+
+        // Should allow home and bin directories
+        assert!(profile.contains("/tmp/job/home"));
+        assert!(profile.contains("/tmp/job/bin"));
     }
 
     #[test]
@@ -321,7 +327,8 @@ mod tests {
         ];
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
-        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128), false);
+        let job_dir = PathBuf::from("/tmp/job");
+        let profile = generate_profile(&closure, &workspace, &root, &job_dir, Some(3128), false);
 
         // Should contain all closure paths
         assert!(profile.contains("/nix/store/abc-bash-5.0"));
@@ -333,7 +340,8 @@ mod tests {
         let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
-        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128), false);
+        let job_dir = PathBuf::from("/tmp/job");
+        let profile = generate_profile(&closure, &workspace, &root, &job_dir, Some(3128), false);
 
         // Should have essential system access
         assert!(profile.contains("(allow sysctl-read)"));
@@ -349,7 +357,8 @@ mod tests {
         let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
-        let profile = generate_profile(&closure, &workspace, &root, None, None, false);
+        let job_dir = PathBuf::from("/tmp/job");
+        let profile = generate_profile(&closure, &workspace, &root, &job_dir, None, false);
 
         // Should contain deny-by-default
         assert!(profile.contains("(deny default)"));
@@ -363,24 +372,12 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_profile_with_home_dir() {
-        let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
-        let workspace = PathBuf::from("/tmp/workspace");
-        let root = PathBuf::from("/tmp/root");
-        let home = PathBuf::from("/tmp/job/home");
-        let profile = generate_profile(&closure, &workspace, &root, Some(&home), Some(3128), false);
-
-        // Should allow home directory access
-        assert!(profile.contains("/tmp/job/home"));
-        assert!(profile.contains("Home directory"));
-    }
-
-    #[test]
     fn test_generate_profile_interactive_mode() {
         let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
-        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128), true);
+        let job_dir = PathBuf::from("/tmp/job");
+        let profile = generate_profile(&closure, &workspace, &root, &job_dir, Some(3128), true);
 
         // Should allow TTY access in interactive mode
         assert!(profile.contains("TTY access for interactive mode"));
@@ -393,7 +390,8 @@ mod tests {
         let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
-        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128), false);
+        let job_dir = PathBuf::from("/tmp/job");
+        let profile = generate_profile(&closure, &workspace, &root, &job_dir, Some(3128), false);
 
         // Should NOT allow TTY access in non-interactive mode
         assert!(!profile.contains("TTY access for interactive mode"));
