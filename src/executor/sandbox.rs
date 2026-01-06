@@ -3,7 +3,6 @@
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::process::Stdio;
-use tempfile::NamedTempFile;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
@@ -101,19 +100,12 @@ impl Executor for SandboxExecutor {
             // Debug: log profile content
             tracing::debug!(job_id = %config.job_id, "Generated sandbox profile:\n{}", profile);
 
-            // Write profile to temp file
-            let profile_file = NamedTempFile::new().map_err(|e| {
-                ExecutorError::SpawnFailed(format!("Failed to create temp file: {}", e))
-            })?;
-            std::fs::write(profile_file.path(), profile.as_bytes()).map_err(|e| {
+            // Write profile to job directory (sibling of proxy-config.json)
+            let profile_path = config.job_dir.join("sandbox-profile.sb");
+            std::fs::write(&profile_path, profile.as_bytes()).map_err(|e| {
                 ExecutorError::SpawnFailed(format!("Failed to write sandbox profile: {}", e))
             })?;
-
-            // Persist the temp file so it doesn't get deleted when NamedTempFile is dropped
-            // Will be cleaned up by caller after job completes
-            let (_, persisted_path) = profile_file.keep().map_err(|e| {
-                ExecutorError::SpawnFailed(format!("Failed to persist sandbox profile: {}", e))
-            })?;
+            let persisted_path = profile_path;
 
             tracing::info!(job_id = %config.job_id, "using sandbox-exec for kernel-enforced isolation");
             tracing::debug!(job_id = %config.job_id, profile_path = %persisted_path.display(), command = ?resolved_command, "sandbox-exec configuration");

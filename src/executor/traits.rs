@@ -123,6 +123,8 @@ pub struct ExecutionConfig {
     pub command: Vec<String>,
     /// Environment variables
     pub env: HashMap<String, String>,
+    /// Job directory (parent of root/workspace, for writing sandbox profiles)
+    pub job_dir: PathBuf,
     /// Working directory for execution (bind-mounted as /workspace in chroot)
     pub working_dir: PathBuf,
     /// Root directory for chroot isolation
