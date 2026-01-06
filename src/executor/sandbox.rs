@@ -33,17 +33,12 @@ impl Executor for SandboxExecutor {
             ));
         }
 
-        // Create channels for output streaming
-        let (stdout_tx, stdout_rx) = mpsc::channel::<String>(128);
-        let (stderr_tx, stderr_rx) = mpsc::channel::<String>(128);
-        let (exit_tx, exit_rx) = oneshot::channel::<i32>();
-
         // Track profile path for internal cleanup (will be moved into spawned task)
         let mut cleanup_profile_path: Option<PathBuf> = None;
 
+        // Prepare sandbox profile and final command
         // With store paths, use sandbox-exec for kernel-enforced isolation
-        let mut child = if !config.store_paths.is_empty() {
-            // store_paths is the pre-computed closure from orchestration
+        let (final_command, env) = if !config.store_paths.is_empty() {
             let closure = &config.store_paths;
             tracing::debug!(job_id = %config.job_id, closure_size = closure.len(), "using pre-computed closure for sandbox");
 
@@ -105,53 +100,35 @@ impl Executor for SandboxExecutor {
             std::fs::write(&profile_path, profile.as_bytes()).map_err(|e| {
                 ExecutorError::SpawnFailed(format!("Failed to write sandbox profile: {}", e))
             })?;
-            let persisted_path = profile_path;
 
             tracing::info!(job_id = %config.job_id, "using sandbox-exec for kernel-enforced isolation");
-            tracing::debug!(job_id = %config.job_id, profile_path = %persisted_path.display(), command = ?resolved_command, "sandbox-exec configuration");
+            tracing::debug!(job_id = %config.job_id, profile_path = %profile_path.display(), command = ?resolved_command, "sandbox-exec configuration");
 
-            // Store profile path for cleanup (handled internally after job exits)
-            cleanup_profile_path = Some(persisted_path.clone());
+            // Store profile path for cleanup
+            cleanup_profile_path = Some(profile_path.clone());
 
-            // Spawn with sandbox-exec
-            let child = Command::new("/usr/bin/sandbox-exec")
-                .arg("-f")
-                .arg(&persisted_path)
-                .args(&resolved_command)
-                .current_dir(&config.working_dir)
-                .env_clear()
-                .envs(&env)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|e| ExecutorError::SpawnFailed(format!("sandbox-exec: {}", e)))?;
+            // Build final command: sandbox-exec -f <profile> <resolved_command...>
+            let mut final_cmd = vec![
+                "/usr/bin/sandbox-exec".to_string(),
+                "-f".to_string(),
+                profile_path.to_string_lossy().to_string(),
+            ];
+            final_cmd.extend(resolved_command);
 
-            child
+            (final_cmd, env)
         } else {
             // No sandboxing - direct execution
-            let (program, args) = config
-                .command
-                .split_first()
-                .ok_or_else(|| ExecutorError::SpawnFailed("command cannot be empty".to_string()))?;
-            Command::new(program)
-                .args(args)
-                .current_dir(&config.working_dir)
-                .env_clear()
-                .envs(&config.env)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|e| ExecutorError::SpawnFailed(format!("{}: {}", program, e)))?
+            (config.command.clone(), config.env.clone())
         };
 
         let timeout = config.timeout;
         let job_id = config.job_id.clone();
-        let interactive = config.interactive;
+
+        // Create channels for exit code
+        let (exit_tx, exit_rx) = oneshot::channel::<i32>();
 
         // Handle I/O based on interactive mode
-        let io_handle = if interactive {
+        let io_handle = if config.interactive {
             // PTY mode: use portable-pty for interactive terminal
             use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
@@ -166,12 +143,12 @@ impl Executor for SandboxExecutor {
                 })
                 .map_err(|e| ExecutorError::SpawnFailed(format!("Failed to create PTY: {}", e)))?;
 
-            // Build command for PTY
-            let mut cmd_builder = CommandBuilder::new(&config.command[0]);
-            cmd_builder.args(&config.command[1..]);
+            // Build command for PTY using the final (possibly sandboxed) command
+            let mut cmd_builder = CommandBuilder::new(&final_command[0]);
+            cmd_builder.args(&final_command[1..]);
             cmd_builder.cwd(&config.working_dir);
             cmd_builder.env_clear();
-            for (k, v) in &config.env {
+            for (k, v) in &env {
                 cmd_builder.env(k, v);
             }
 
@@ -266,6 +243,25 @@ impl Executor for SandboxExecutor {
             }
         } else {
             // Piped mode: separate stdout/stderr with line-based streaming
+            let (stdout_tx, stdout_rx) = mpsc::channel::<String>(128);
+            let (stderr_tx, stderr_rx) = mpsc::channel::<String>(128);
+
+            // Spawn the process
+            let (program, args) = final_command
+                .split_first()
+                .ok_or_else(|| ExecutorError::SpawnFailed("command cannot be empty".to_string()))?;
+
+            let mut child = Command::new(program)
+                .args(args)
+                .current_dir(&config.working_dir)
+                .env_clear()
+                .envs(&env)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|e| ExecutorError::SpawnFailed(format!("{}: {}", program, e)))?;
+
             let stdout = child.stdout.take().ok_or_else(|| {
                 ExecutorError::SpawnFailed("Failed to capture stdout".to_string())
             })?;

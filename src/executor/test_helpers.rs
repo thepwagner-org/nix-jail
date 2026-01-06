@@ -35,11 +35,14 @@ pub struct TestConfigBuilder {
 impl TestConfigBuilder {
     /// Create a new builder with the given job ID
     pub fn new(job_id: &str) -> Self {
+        // Create unique job directory to avoid conflicts between parallel tests
+        let job_dir = std::env::temp_dir().join(format!("nix-jail-test-{}", job_id));
+        let _ = std::fs::create_dir_all(&job_dir);
         Self {
             job_id: job_id.to_string(),
             command: vec![],
             env: HashMap::new(),
-            job_dir: PathBuf::from("/tmp"),
+            job_dir,
             working_dir: PathBuf::from("/tmp"),
             root_dir: PathBuf::from("/tmp"),
             store_setup: StoreSetup::Populated,
