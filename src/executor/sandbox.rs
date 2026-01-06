@@ -75,10 +75,15 @@ impl Executor for SandboxExecutor {
                 })
                 .collect();
 
+            // Home directory is job_dir/home (for tool config files like .claude.json)
+            let home_dir = config.job_dir.join("home");
+            let canonical_home = home_dir.canonicalize().ok();
+
             let profile = super::sandbox_policy::generate_profile_with_cache(
                 closure,
                 &canonical_workspace,
                 &canonical_root,
+                canonical_home.as_deref(),
                 config.proxy_port,
                 &canonical_cache_mounts,
             );

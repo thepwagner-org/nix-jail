@@ -31,9 +31,10 @@ pub fn generate_profile(
     closure_paths: &[PathBuf],
     workspace_path: &Path,
     root_dir: &Path,
+    home_dir: Option<&Path>,
     proxy_port: Option<u16>,
 ) -> String {
-    generate_profile_with_cache(closure_paths, workspace_path, root_dir, proxy_port, &[])
+    generate_profile_with_cache(closure_paths, workspace_path, root_dir, home_dir, proxy_port, &[])
 }
 
 /// Generate sandbox profile with cache directories
@@ -41,6 +42,7 @@ pub fn generate_profile_with_cache(
     closure_paths: &[PathBuf],
     workspace_path: &Path,
     root_dir: &Path,
+    home_dir: Option<&Path>,
     proxy_port: Option<u16>,
     cache_mounts: &[ResolvedCacheMount],
 ) -> String {
@@ -127,6 +129,15 @@ pub fn generate_profile_with_cache(
         "(allow file-read* file-write* process-exec* (subpath \"{}\"))\n",
         workspace_path.display()
     ));
+
+    // Allow home directory access (for tool config files like .claude.json)
+    if let Some(home) = home_dir {
+        profile.push_str(";; Home directory (tool configuration files)\n");
+        profile.push_str(&format!(
+            "(allow file-read* file-write* (subpath \"{}\"))\n",
+            home.display()
+        ));
+    }
 
     // Allow file-read-metadata on parent directories (for realpath resolution)
     // Node.js realpathSync needs to lstat each component of the path
@@ -274,7 +285,7 @@ mod tests {
         let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
-        let profile = generate_profile(&closure, &workspace, &root, Some(3128));
+        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128));
 
         // Should contain deny-by-default
         assert!(profile.contains("(deny default)"));
@@ -300,7 +311,7 @@ mod tests {
         ];
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
-        let profile = generate_profile(&closure, &workspace, &root, Some(3128));
+        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128));
 
         // Should contain all closure paths
         assert!(profile.contains("/nix/store/abc-bash-5.0"));
@@ -312,7 +323,7 @@ mod tests {
         let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
-        let profile = generate_profile(&closure, &workspace, &root, Some(3128));
+        let profile = generate_profile(&closure, &workspace, &root, None, Some(3128));
 
         // Should have essential system access
         assert!(profile.contains("(allow sysctl-read)"));
@@ -328,7 +339,7 @@ mod tests {
         let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
         let workspace = PathBuf::from("/tmp/workspace");
         let root = PathBuf::from("/tmp/root");
-        let profile = generate_profile(&closure, &workspace, &root, None);
+        let profile = generate_profile(&closure, &workspace, &root, None, None);
 
         // Should contain deny-by-default
         assert!(profile.contains("(deny default)"));
@@ -339,5 +350,18 @@ mod tests {
 
         // Should NOT allow reading from root dir when proxy is disabled
         assert!(!profile.contains("/tmp/root"));
+    }
+
+    #[test]
+    fn test_generate_profile_with_home_dir() {
+        let closure = vec![PathBuf::from("/nix/store/abc-bash-5.0")];
+        let workspace = PathBuf::from("/tmp/workspace");
+        let root = PathBuf::from("/tmp/root");
+        let home = PathBuf::from("/tmp/job/home");
+        let profile = generate_profile(&closure, &workspace, &root, Some(&home), Some(3128));
+
+        // Should allow home directory access
+        assert!(profile.contains("/tmp/job/home"));
+        assert!(profile.contains("Home directory"));
     }
 }
