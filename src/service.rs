@@ -54,6 +54,7 @@ pub struct JailServiceConfig {
     pub job_root: Arc<dyn crate::job_dir::JobRoot>,
     pub job_workspace: Arc<dyn JobWorkspace>,
     pub session_registry: Arc<crate::session::SessionRegistry>,
+    pub metrics: Option<crate::metrics::SharedMetrics>,
 }
 
 impl std::fmt::Debug for JailServiceConfig {
@@ -75,6 +76,7 @@ pub struct JailServiceImpl {
     job_root: Arc<dyn crate::job_dir::JobRoot>,
     job_workspace: Arc<dyn JobWorkspace>,
     session_registry: Arc<crate::session::SessionRegistry>,
+    metrics: Option<crate::metrics::SharedMetrics>,
 }
 
 impl std::fmt::Debug for JailServiceImpl {
@@ -88,6 +90,7 @@ impl std::fmt::Debug for JailServiceImpl {
             .field("job_root", &self.job_root)
             .field("job_workspace", &self.job_workspace)
             .field("session_registry", &self.session_registry)
+            .field("metrics", &self.metrics.is_some())
             .finish()
     }
 }
@@ -103,6 +106,7 @@ impl JailServiceImpl {
             job_root: cfg.job_root,
             job_workspace: cfg.job_workspace,
             session_registry: cfg.session_registry,
+            metrics: cfg.metrics,
         }
     }
 }
@@ -184,6 +188,7 @@ impl JailService for JailServiceImpl {
         let executor_for_exec = this.executor.clone();
         let job_root_for_exec = this.job_root.clone();
         let job_workspace_for_exec = this.job_workspace.clone();
+        let metrics_for_exec = this.metrics.clone();
 
         // Create broadcast channel for this job
         let (log_tx, _) = tokio::sync::broadcast::channel(1000);
@@ -231,6 +236,7 @@ impl JailService for JailServiceImpl {
                         job_root: job_root_for_exec,
                         job_workspace: job_workspace_for_exec,
                         session_registry: session_registry_for_exec,
+                        metrics: metrics_for_exec,
                     },
                     interactive,
                 )

@@ -22,6 +22,9 @@ pub struct ServerConfig {
     pub monorepo_path: Option<PathBuf>,
     /// Cargo/build cache configuration
     pub cache: CacheConfig,
+    /// Port for Prometheus metrics HTTP endpoint (optional)
+    /// When set, exposes /metrics on this port
+    pub metrics_port: Option<u16>,
 }
 
 /// Type of credential for determining setup requirements
@@ -107,6 +110,7 @@ impl Default for ServerConfig {
             otlp_endpoint: None,
             monorepo_path: None,
             cache: CacheConfig::default(),
+            metrics_port: None,
         }
     }
 }
@@ -246,6 +250,8 @@ struct ServerSection {
     otlp_endpoint: Option<String>,
     /// Path to existing monorepo clone for sparse checkout support
     monorepo_path: Option<String>,
+    /// Port for Prometheus metrics HTTP endpoint
+    metrics_port: Option<u16>,
 }
 
 impl Default for ServerSection {
@@ -257,6 +263,7 @@ impl Default for ServerSection {
             store_strategy: default_store_strategy(),
             otlp_endpoint: None,
             monorepo_path: None,
+            metrics_port: None,
         }
     }
 }
@@ -310,6 +317,7 @@ impl ServerConfig {
             otlp_endpoint: config.server.otlp_endpoint,
             monorepo_path: config.server.monorepo_path.map(PathBuf::from),
             cache: config.cache,
+            metrics_port: config.server.metrics_port,
         })
     }
 

@@ -3,11 +3,25 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
+/// Key for tracking request statistics with multiple dimensions
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RequestKey {
+    pub host: String,
+    pub method: String,
+    pub status: u16,
+    pub credential: String, // empty string if none
+    pub decision: String,   // "approved" or "denied"
+}
+
 /// Serializable proxy statistics for file output
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyStatsSummary {
+    /// Legacy format for backwards compatibility
     pub approved: Vec<(String, u64)>,
     pub denied: Vec<(String, u64)>,
+    /// New detailed format with all dimensions
+    #[serde(default)]
+    pub requests: Vec<(RequestKey, u64)>,
 }
 
 /// Thread-safe statistics tracking for proxy requests
@@ -15,6 +29,8 @@ pub struct ProxyStatsSummary {
 pub struct ProxyStats {
     approved: Mutex<HashMap<String, u64>>,
     denied: Mutex<HashMap<String, u64>>,
+    /// Detailed request tracking with all dimensions
+    requests: Mutex<HashMap<RequestKey, u64>>,
 }
 
 impl ProxyStats {
@@ -44,12 +60,36 @@ impl ProxyStats {
         is_first
     }
 
+    /// Record a request with full dimensional tracking
+    pub fn record_request(
+        &self,
+        host: &str,
+        method: &str,
+        status: u16,
+        credential: Option<&str>,
+        approved: bool,
+    ) {
+        let key = RequestKey {
+            host: host.to_string(),
+            method: method.to_string(),
+            status,
+            credential: credential.unwrap_or("").to_string(),
+            decision: if approved { "approved" } else { "denied" }.to_string(),
+        };
+
+        #[allow(clippy::expect_used)]
+        let mut map = self.requests.lock().expect("operation failed");
+        *map.entry(key).or_insert(0) += 1;
+    }
+
     /// Get summary statistics as a serializable struct
     pub fn summary(&self) -> ProxyStatsSummary {
         #[allow(clippy::expect_used)]
         let approved = self.approved.lock().expect("operation failed");
         #[allow(clippy::expect_used)]
         let denied = self.denied.lock().expect("operation failed");
+        #[allow(clippy::expect_used)]
+        let requests = self.requests.lock().expect("operation failed");
 
         let mut approved_vec: Vec<_> = approved.iter().map(|(k, v)| (k.clone(), *v)).collect();
         approved_vec.sort_by(|a, b| b.1.cmp(&a.1));
@@ -57,9 +97,13 @@ impl ProxyStats {
         let mut denied_vec: Vec<_> = denied.iter().map(|(k, v)| (k.clone(), *v)).collect();
         denied_vec.sort_by(|a, b| b.1.cmp(&a.1));
 
+        let mut requests_vec: Vec<_> = requests.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        requests_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
         ProxyStatsSummary {
             approved: approved_vec,
             denied: denied_vec,
+            requests: requests_vec,
         }
     }
 

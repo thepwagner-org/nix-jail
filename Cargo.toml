@@ -82,6 +82,7 @@ git2 = { version = "0.20.2", features = ["https", "vendored-openssl", "vendored-
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 thiserror = "2.0"
 portable-pty = "0.9"
+prometheus = { version = "0.14", features = ["process"] }
 
 # Network namespace management (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]

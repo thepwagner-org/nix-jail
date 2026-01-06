@@ -294,6 +294,9 @@ async fn handle_request(
                         if state.stats.record_denied(hostname) {
                             tracing::warn!("policy denies: {} - blocking at connect", hostname);
                         }
+                        state
+                            .stats
+                            .record_request(hostname, "CONNECT", 403, None, false);
                         return Ok(Response::builder()
                             .status(StatusCode::FORBIDDEN)
                             .body(empty_body())
@@ -328,6 +331,9 @@ async fn handle_request(
             if state.stats.record_denied(&denied_key) {
                 tracing::debug!("connect {} (blackholed) - rejecting early", req.uri());
             }
+            state
+                .stats
+                .record_request(hostname, "CONNECT", 502, None, false);
             return Ok(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(empty_body())
@@ -611,6 +617,9 @@ where
                                             path
                                         );
                                     }
+                                    state
+                                        .stats
+                                        .record_request(&hostname, method, 403, None, false);
 
                                     // Construct HTTP/1.1 403 Forbidden response
                                     let response = format!(
@@ -664,8 +673,15 @@ where
                             _ => (None, None),
                         };
 
-                        // Track approved request in statistics
+                        // Track approved request in statistics (legacy + detailed)
                         state.stats.record_approved(&hostname);
+                        state.stats.record_request(
+                            &hostname,
+                            method,
+                            0, // status not tracked yet
+                            credential_from_policy,
+                            true, // approved
+                        );
 
                         // Log request with enhanced metadata
                         match (rule_index, credential_from_policy) {

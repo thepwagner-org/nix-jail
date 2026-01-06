@@ -1,6 +1,7 @@
 use clap::Parser;
 use nix_jail::config::ServerConfig;
 use nix_jail::executor::EXECUTOR_NAME;
+use nix_jail::metrics::SharedMetrics;
 use nix_jail::session::SessionRegistry;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -57,13 +58,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create session registry for interactive sessions
     let session_registry = Arc::new(SessionRegistry::new());
 
+    // Initialize metrics registry if metrics_port is configured
+    let metrics: Option<SharedMetrics> = if config.metrics_port.is_some() {
+        match nix_jail::metrics::create_registry() {
+            Ok(m) => {
+                tracing::info!("prometheus metrics enabled");
+                Some(m)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create metrics registry");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Calculate WebSocket port (gRPC port + 1)
     let ws_port = addr.port() + 1;
     let ws_addr = std::net::SocketAddr::new(addr.ip(), ws_port);
 
+    // Calculate metrics port if configured
+    let metrics_addr = config
+        .metrics_port
+        .map(|port| std::net::SocketAddr::new(addr.ip(), port));
+
     tracing::info!(
         grpc_address = %addr,
         ws_address = %ws_addr,
+        metrics_address = ?metrics_addr,
         executor = EXECUTOR_NAME,
         num_credentials = num_credentials,
         "starting servers"
@@ -77,14 +100,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Start metrics HTTP server in background if configured
+    let metrics_handle = if let (Some(addr), Some(ref m)) = (metrics_addr, &metrics) {
+        let metrics_clone = m.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = run_metrics_server(addr, metrics_clone).await {
+                tracing::error!(error = %e, "metrics server failed");
+            }
+        }))
+    } else {
+        None
+    };
+
     // Start gRPC server
     let grpc_result = Server::builder()
-        .add_service(nix_jail::service(&db_path, config, session_registry)?)
+        .add_service(nix_jail::service(
+            &db_path,
+            config,
+            session_registry,
+            metrics,
+        )?)
         .serve(addr)
         .await;
 
-    // If gRPC server exits, abort WebSocket server
+    // If gRPC server exits, abort other servers
     ws_handle.abort();
+    if let Some(h) = metrics_handle {
+        h.abort();
+    }
 
     grpc_result?;
     Ok(())
@@ -232,4 +275,53 @@ async fn handle_websocket_connection(
 
     output_task.abort();
     Ok(())
+}
+
+/// Run HTTP server for Prometheus metrics endpoint
+async fn run_metrics_server(
+    addr: std::net::SocketAddr,
+    metrics: SharedMetrics,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response, StatusCode};
+    use hyper_util::rt::TokioIo;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!(address = %addr, "metrics server listening");
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+        let metrics = metrics.clone();
+
+        drop(tokio::spawn(async move {
+            let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                let metrics = metrics.clone();
+                async move {
+                    if req.uri().path() == "/metrics" {
+                        let body = metrics.encode();
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .header("Content-Type", "text/plain; charset=utf-8")
+                                .body(Full::new(Bytes::from(body)))
+                                .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("error")))),
+                        )
+                    } else {
+                        Ok(Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(Full::new(Bytes::from("not found")))
+                            .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("error")))))
+                    }
+                }
+            });
+
+            if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+                tracing::debug!(error = %e, "metrics connection error");
+            }
+        }));
+    }
 }

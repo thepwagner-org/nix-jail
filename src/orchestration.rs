@@ -87,6 +87,7 @@ pub struct ExecuteJobContext {
     pub job_root: Arc<dyn JobRoot>,
     pub job_workspace: Arc<dyn JobWorkspace>,
     pub session_registry: Option<Arc<crate::session::SessionRegistry>>,
+    pub metrics: Option<crate::metrics::SharedMetrics>,
 }
 
 impl std::fmt::Debug for ExecuteJobContext {
@@ -98,6 +99,7 @@ impl std::fmt::Debug for ExecuteJobContext {
             .field("executor", &self.executor.name())
             .field("job_root", &self.job_root)
             .field("job_workspace", &self.job_workspace)
+            .field("metrics", &self.metrics.is_some())
             .finish()
     }
 }
@@ -180,6 +182,49 @@ pub async fn serve_stored_logs(
     }));
 }
 
+/// Guard that ensures job metrics are recorded on all exit paths
+struct JobMetricsGuard {
+    metrics: Option<crate::metrics::SharedMetrics>,
+    start_time: std::time::Instant,
+    completed: bool,
+}
+
+impl JobMetricsGuard {
+    fn new(metrics: Option<crate::metrics::SharedMetrics>) -> Self {
+        if let Some(ref m) = metrics {
+            m.job_started();
+        }
+        Self {
+            metrics,
+            start_time: std::time::Instant::now(),
+            completed: false,
+        }
+    }
+
+    /// Mark job as completed with success/failure status
+    fn complete(&mut self, success: bool) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        if let Some(ref m) = self.metrics {
+            m.job_finished();
+            let duration_secs = self.start_time.elapsed().as_secs_f64();
+            let status = if success { "success" } else { "failure" };
+            m.record_job_completed(status, duration_secs);
+        }
+    }
+}
+
+impl Drop for JobMetricsGuard {
+    fn drop(&mut self) {
+        // If not explicitly completed, treat as failure (early return)
+        if !self.completed {
+            self.complete(false);
+        }
+    }
+}
+
 /// Execute a job and stream logs in real-time via broadcast channel
 ///
 /// This function is designed to be spawned as a background task by the caller.
@@ -197,7 +242,13 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         job_root,
         job_workspace,
         session_registry,
+        metrics,
     } = ctx;
+
+    // Guard ensures metrics are recorded on all exit paths (including early returns)
+    // Keep a clone for recording other metrics (cache hits, closure size)
+    let metrics_ref = metrics.clone();
+    let mut metrics_guard = JobMetricsGuard::new(metrics);
 
     // Create log sink for this job (replaces send_info/send_error pattern)
     let log_sink: Arc<dyn LogSink> = Arc::new(StorageLogSink::new(storage.clone(), tx.clone()));
@@ -382,6 +433,10 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         {
             Ok(c) => {
                 tracing::info!(closure_count = c.len(), "computed full closure");
+                // Record closure size metric
+                if let Some(ref m) = metrics_ref {
+                    m.record_closure_size(c.len());
+                }
                 c
             }
             Err(e) => {
@@ -432,7 +487,14 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
             return;
         }
     };
-    let _ = cache_hit; // Silence unused warning, info logged above
+    // Record cache hit/miss metrics for root
+    if let Some(ref m) = metrics_ref {
+        if cache_hit {
+            m.record_cache_hit("root");
+        } else {
+            m.record_cache_miss("root");
+        }
+    }
 
     // Create FHS-compatible symlinks (/bin/sh, /usr/bin/env) for scripts with shebangs
     if let Err(e) = crate::executor::exec::create_fhs_symlinks(&job_dir.root, &closure) {
@@ -973,6 +1035,20 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
                     approved_total, denied_total
                 ),
             );
+
+            // Aggregate detailed request stats into Prometheus metrics
+            if let Some(ref m) = metrics_ref {
+                for (key, count) in &stats.requests {
+                    m.record_proxy_request(
+                        &key.host,
+                        &key.method,
+                        key.status,
+                        &key.credential,
+                        &key.decision,
+                        *count,
+                    );
+                }
+            }
         }
     }
 
@@ -1032,6 +1108,10 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
     if let Err(e) = storage.update_job_status(&job_id, final_status.clone()) {
         tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
     }
+
+    // Record job completion metrics (success = exit_code 0)
+    metrics_guard.complete(exit_code == 0);
+
     tracing::info!(exit_code = exit_code, status = %final_status.to_string(), "job completed");
 
     // Remove job from registry - this closes the broadcast channel

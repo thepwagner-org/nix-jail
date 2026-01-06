@@ -13,6 +13,7 @@ pub mod job_dir;
 pub mod job_registry;
 pub mod job_workspace;
 pub mod log_sink;
+pub mod metrics;
 pub mod networkpolicy;
 pub mod orchestration;
 pub mod proxy;
@@ -159,6 +160,7 @@ pub fn service(
     db_path: impl AsRef<std::path::Path>,
     config: config::ServerConfig,
     session_registry: std::sync::Arc<session::SessionRegistry>,
+    metrics: Option<metrics::SharedMetrics>,
 ) -> Result<JailServiceServer<JailServiceImpl>, storage::StorageError> {
     let path_str = db_path.as_ref().to_str().ok_or_else(|| {
         storage::StorageError::InvalidPath("Database path contains invalid UTF-8".to_string())
@@ -205,6 +207,7 @@ pub fn service(
             job_root,
             job_workspace,
             session_registry,
+            metrics,
         },
     )))
 }
