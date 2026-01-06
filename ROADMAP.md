@@ -5,7 +5,9 @@ This document explores future possibilities for nix-jail. For current implementa
 ## Resource Limits (macOS)
 
 macOS SandboxExecutor could enforce resource limits using ulimit-based restrictions.
-**Possible approaches:**
+
+### Possible Approaches
+
 - `ulimit -t` for CPU time limits
 - `ulimit -v` for virtual memory caps
 - `ulimit -u` for max process limits
@@ -13,17 +15,22 @@ macOS SandboxExecutor could enforce resource limits using ulimit-based restricti
 - Job termination when disk quota exceeded
 - Per-job configurable limits via gRPC
 - Default limits in server config
-**Example limits:**
+
+### Example Limits
+
 - CPU time: 1 hour
 - Memory: 4 GB
 - Disk: 10 GB workspace
 - Processes: 100
+
 Linux SystemdExecutor already has these via systemd properties (CPUQuota, MemoryMax, TasksMax, RuntimeMaxSec).
 
 ## Testing & Validation
 
 Rigorous security testing to validate the sandbox.
-**Penetration testing scenarios:**
+
+### Penetration Testing Scenarios
+
 - Malicious npm/PyPI package attempts:
    - Direct HTTPS exfiltration
    - Reading `~/.ssh/id_rsa`
@@ -31,21 +38,29 @@ Rigorous security testing to validate the sandbox.
    - Reverse shell via netcat
    - Process injection attacks
    - Privilege escalation attempts
-**Verify threat model:**
+
+### Verify Threat Model
+
 - Confirm all attack vectors are blocked (see [CLAUDE.md](CLAUDE.md) for threat model)
 - Document what escapes are possible
-**Performance benchmarking:**
+
+### Performance Benchmarking
+
 - Job spawn time distribution
 - Proxy overhead measurement
 - Disk I/O impact
 - Memory footprint
 - Concurrent job scaling
-**Security audit:**
+
+### Security Audit
+
 - Token injection system review
 - Credential storage analysis
 - Network policy bypass attempts
 - Sandbox escape research
-**Load testing:**
+
+### Load Testing
+
 - Hundreds of concurrent jobs
 - Long-running jobs (hours/days)
 - Resource exhaustion scenarios
@@ -53,21 +68,31 @@ Rigorous security testing to validate the sandbox.
 ## Advanced Caching
 
 Beyond btrfs snapshots, explore multi-level caching strategies.
-**Remote caching:**
+
+### Remote Caching
+
 - S3-backed closure cache
 - HTTP cache server
 - Cache sharing across machines
-**Cache warming:**
+
+### Cache Warming
+
 - Pre-populate common closures (nodejs, python, rust toolchains)
 - Async background cache refresh
-**Deduplication:**
+
+### Deduplication
+
 - Shared base layers across closures
 - Content-addressed storage
 - Minimal delta transfers
-**Compression:**
+
+### Compression
+
 - zstd compression for remote cache
 - Transparent decompression on access
-**Smart invalidation:**
+
+### Smart Invalidation
+
 - Nix derivation-based expiry
 - Automatic refresh when nixpkgs updates
 
@@ -87,18 +112,23 @@ Expose `/metrics` endpoint for Prometheus scraping with job execution and cache 
 | `nix_jail_closure_paths_total` | Histogram | - | Number of store paths per closure |
 | `nix_jail_closure_size_bytes` | Histogram | - | Closure size distribution |
 | `nix_jail_active_jobs` | Gauge | - | Currently running jobs |
-**Label values:**
+
+### Label Values
+
 - `status`: `success`, `failure`, `cancelled`
 - `phase`: `closure_resolution`, `root_prepare`, `workspace_prepare`, `proxy_setup`, `execution`
 - `cache_type`: `workspace` (git sparse checkout), `root` (nix closure btrfs snapshot)
 
 ### Implementation Pattern
 
-**Where to instrument** (existing tracing spans already mark these):
+#### Where to Instrument
+
+Existing tracing spans already mark these:
 - `orchestration.rs`: `setup_workspace`, `resolve_packages`, `compute_closure`, `prepare_root`, `start_proxy`
 - `cache/mod.rs`: `prepare_root()` returns cache hit/miss
 - `job_workspace.rs`: sparse checkout cache hit/miss at lines 477-523
-**Data flow option 1 - gRPC extension:**
+
+#### Data Flow Option 1: gRPC Extension
 ```protobuf
 message JobMetrics {
   bool workspace_cache_hit = 1;
@@ -118,12 +148,17 @@ message JobInfo {
 }
 ```
 Clients (forgejo-nix-ci) can fetch `JobInfo` after completion and record metrics locally.
-**Data flow option 2 - native /metrics endpoint:**
+
+#### Data Flow Option 2: Native /metrics Endpoint
+
 Add HTTP server to nix-jail daemon exposing Prometheus metrics directly. Requires:
 - `prometheus` crate
 - `axum` or `hyper` for HTTP
 - Config: `metrics_port = 9091`
-**Recommended:** Option 2 (native endpoint) for simplicity. Option 1 useful if clients need per-job breakdown.
+
+#### Recommendation
+
+Option 2 (native endpoint) for simplicity. Option 1 useful if clients need per-job breakdown.
 
 ### Storage Schema Extension
 
@@ -143,7 +178,8 @@ Populate during job execution in `orchestration.rs`.
 
 ## Debugging
 
-**Debugging mode:**
+### Debugging Mode
+
 - Interactive shell in failed job workspaces
 - Preserve failed job environments
 
