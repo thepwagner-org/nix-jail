@@ -22,6 +22,12 @@ static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 type BoxBody = http_body_util::combinators::BoxBody<bytes::Bytes, hyper::Error>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Shared state for OAuth response redaction
+///
+/// When a request is sent to an OAuth token endpoint, the request handler sets this
+/// to the credential name. The response handler checks this and redacts tokens if set.
+type RedactionSignal = Arc<tokio::sync::Mutex<Option<String>>>;
+
 use crate::config::{extract_access_token, CredentialType};
 use crate::proxy::policy::{CompiledPolicy, PolicyDecision};
 use crate::proxy::stats::ProxyStats;
@@ -514,8 +520,14 @@ where
     let client_writer = Arc::new(Mutex::new(client_writer));
     let client_writer_for_upstream = client_writer.clone();
 
+    // Shared signal for OAuth response redaction
+    // Set by request handler when request goes to a redact path
+    let redaction_signal: RedactionSignal = Arc::new(Mutex::new(None));
+    let redaction_signal_for_upstream = redaction_signal.clone();
+
     let hostname_clone = hostname.clone();
     let state_clone = state.clone();
+    let state_for_upstream = state.clone();
     let policy_decision_clone = policy_decision;
 
     let client_to_upstream = async move {
@@ -527,27 +539,20 @@ where
             state_clone,
             policy_decision_clone,
             conn_id,
+            redaction_signal,
         )
         .await
     };
 
     let upstream_to_client = async move {
-        // Relay responses without inspection
-        let mut buf = vec![0u8; 8192];
-        let mut upstream_reader = upstream_reader;
-        loop {
-            let n = upstream_reader.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            tracing::trace!("upstream -> client: {} bytes", n);
-            let mut client_writer = client_writer_for_upstream.lock().await;
-            client_writer.write_all(&buf[..n]).await?;
-            client_writer.flush().await?;
-        }
-        let mut client_writer = client_writer_for_upstream.lock().await;
-        client_writer.shutdown().await?;
-        Ok::<(), BoxError>(())
+        relay_upstream_to_client(
+            upstream_reader,
+            client_writer_for_upstream,
+            state_for_upstream,
+            redaction_signal_for_upstream,
+            conn_id,
+        )
+        .await
     };
 
     // Run both directions concurrently
@@ -557,6 +562,7 @@ where
 }
 
 /// Proxy client to upstream with HTTP/1.1 request inspection and token injection
+#[allow(clippy::too_many_arguments)]
 async fn proxy_with_http1_inspection<R, CW, UW>(
     mut reader: R,
     client_writer: Arc<tokio::sync::Mutex<CW>>,
@@ -565,6 +571,7 @@ async fn proxy_with_http1_inspection<R, CW, UW>(
     state: Arc<ProxyState>,
     policy_decision: Option<PolicyDecision>,
     conn_id: u64,
+    redaction_signal: RedactionSignal,
 ) -> Result<(), BoxError>
 where
     R: AsyncRead + Unpin,
@@ -816,8 +823,67 @@ where
                                                         .replace("{token}", &real_token),
                                                 )
                                             } else {
-                                                tracing::debug!(
-                                                    "client auth does not match dummy, forwarding unchanged for {} {}",
+                                                // Check if the sent token is a redacted OAuth token
+                                                // Extract the token from the Authorization header
+                                                let sent_token = extract_bearer_token(sent);
+                                                if let Some(token_str) = sent_token {
+                                                    if let Some(real_oauth_token) = state
+                                                        .policy
+                                                        .get_real_oauth_token(token_str)
+                                                        .await
+                                                    {
+                                                        tracing::debug!(
+                                                            "client sent redacted oauth token, will replace"
+                                                        );
+                                                        Some(
+                                                            credential.header_format.replace(
+                                                                "{token}",
+                                                                &real_oauth_token,
+                                                            ),
+                                                        )
+                                                    } else {
+                                                        tracing::debug!(
+                                                            "client auth does not match dummy or oauth cache, forwarding unchanged for {} {}",
+                                                            method, path
+                                                        );
+                                                        None
+                                                    }
+                                                } else {
+                                                    tracing::debug!(
+                                                        "client auth does not match dummy, forwarding unchanged for {} {}",
+                                                        method, path
+                                                    );
+                                                    None
+                                                }
+                                            }
+                                        }
+                                        (Some(sent), None, Some(_)) => {
+                                            // No static dummy configured, but check OAuth cache
+                                            let sent_token = extract_bearer_token(sent);
+                                            if let Some(token_str) = sent_token {
+                                                if let Some(real_oauth_token) = state
+                                                    .policy
+                                                    .get_real_oauth_token(token_str)
+                                                    .await
+                                                {
+                                                    tracing::debug!(
+                                                        "client sent redacted oauth token (no static dummy), will replace"
+                                                    );
+                                                    Some(
+                                                        credential
+                                                            .header_format
+                                                            .replace("{token}", &real_oauth_token),
+                                                    )
+                                                } else {
+                                                    tracing::debug!(
+                                                        "client sent auth but no dummy configured and not in oauth cache, forwarding unchanged for {} {}",
+                                                        method, path
+                                                    );
+                                                    None
+                                                }
+                                            } else {
+                                                tracing::warn!(
+                                                    "client sent auth but no dummy configured, forwarding unchanged for {} {}",
                                                     method, path
                                                 );
                                                 None
@@ -830,10 +896,9 @@ where
                                             );
                                             None
                                         }
-                                        (Some(_), None, _) => {
-                                            tracing::warn!(
-                                                "client sent auth but no dummy configured, forwarding unchanged for {} {}",
-                                                method, path
+                                        (Some(_), None, None) => {
+                                            tracing::error!(
+                                                "failed to extract token for injection"
                                             );
                                             None
                                         }
@@ -855,7 +920,24 @@ where
                                         }
                                     };
 
+                                    // Check if this response needs redaction (for OAuth token responses)
+                                    let redact_credential =
+                                        state.policy.should_redact_response(&hostname, path);
+                                    let needs_response_redaction = redact_credential.is_some();
+
+                                    // Signal response handler to redact this response
+                                    if let Some(cred_name) = redact_credential {
+                                        let mut signal = redaction_signal.lock().await;
+                                        *signal = Some(cred_name.to_string());
+                                        tracing::debug!(
+                                            credential = cred_name,
+                                            "signaling response redaction for oauth path"
+                                        );
+                                    }
+
                                     // Build new headers list, replacing Authorization in place
+                                    // If response redaction is needed, strip Accept-Encoding to
+                                    // force uncompressed responses we can parse
                                     let mut new_headers: Vec<(&str, String)> = Vec::new();
                                     for header in req.headers.iter() {
                                         let header_value_str =
@@ -863,6 +945,13 @@ where
 
                                         if header.name.eq_ignore_ascii_case("authorization") {
                                             new_headers.push((header.name, header_value.clone()));
+                                        } else if needs_response_redaction
+                                            && header.name.eq_ignore_ascii_case("accept-encoding")
+                                        {
+                                            // Skip Accept-Encoding to force plaintext response
+                                            tracing::debug!(
+                                                "stripping accept-encoding for response redaction"
+                                            );
                                         } else {
                                             new_headers
                                                 .push((header.name, header_value_str.to_string()));
@@ -952,6 +1041,319 @@ where
     Ok(())
 }
 
+/// Relay responses from upstream to client, with optional OAuth token redaction
+///
+/// When the redaction signal is set, this function:
+/// 1. Buffers the complete HTTP response
+/// 2. Parses the JSON body
+/// 3. Replaces real OAuth tokens with dummy tokens
+/// 4. Caches the token mapping for future request injection
+/// 5. Sends the redacted response to the client
+async fn relay_upstream_to_client<R, W>(
+    mut upstream_reader: R,
+    client_writer: Arc<tokio::sync::Mutex<W>>,
+    state: Arc<ProxyState>,
+    redaction_signal: RedactionSignal,
+    conn_id: u64,
+) -> Result<(), BoxError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 8192];
+    let mut accumulated = Vec::new();
+    const MAX_REDACT_SIZE: usize = 1024 * 1024; // 1MB limit for redaction
+
+    loop {
+        let n = upstream_reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+
+        // Check if we need to redact this response
+        let credential_name = {
+            let signal = redaction_signal.lock().await;
+            signal.clone()
+        };
+
+        if credential_name.is_none() {
+            // No redaction needed - relay directly
+            tracing::trace!("upstream -> client: {} bytes", n);
+            let mut client_writer = client_writer.lock().await;
+            client_writer.write_all(&buf[..n]).await?;
+            client_writer.flush().await?;
+            continue;
+        }
+
+        // Redaction mode: buffer the response
+        accumulated.extend_from_slice(&buf[..n]);
+
+        // Enforce size limit
+        if accumulated.len() > MAX_REDACT_SIZE {
+            tracing::warn!(
+                conn_id,
+                size = accumulated.len(),
+                "response too large for redaction, forwarding as-is"
+            );
+            // Clear signal and forward what we have
+            {
+                let mut signal = redaction_signal.lock().await;
+                *signal = None;
+            }
+            let mut client_writer = client_writer.lock().await;
+            client_writer.write_all(&accumulated).await?;
+            accumulated.clear();
+            continue;
+        }
+
+        // Try to parse HTTP response to see if we have the complete body
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut resp = httparse::Response::new(&mut headers);
+
+        match resp.parse(&accumulated) {
+            Ok(httparse::Status::Complete(header_len)) => {
+                // Find Content-Length to determine body size
+                let content_length: Option<usize> = resp
+                    .headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|h| std::str::from_utf8(h.value).ok())
+                    .and_then(|v| v.parse().ok());
+
+                let body_received = accumulated.len() - header_len;
+
+                // Check if we have the complete body
+                let body_complete = match content_length {
+                    Some(len) => body_received >= len,
+                    None => {
+                        // No Content-Length - check for chunked encoding or assume complete
+                        let is_chunked = resp.headers.iter().any(|h| {
+                            h.name.eq_ignore_ascii_case("transfer-encoding")
+                                && std::str::from_utf8(h.value)
+                                    .map(|v| v.contains("chunked"))
+                                    .unwrap_or(false)
+                        });
+                        if is_chunked {
+                            // Look for final chunk marker
+                            accumulated.ends_with(b"0\r\n\r\n")
+                        } else {
+                            // No length indicator - can't reliably determine completeness
+                            // Forward as-is to avoid hanging
+                            true
+                        }
+                    }
+                };
+
+                if body_complete {
+                    // We have the complete response - redact it
+                    // Safety: credential_name is Some based on check at line 1021
+                    let Some(cred_name) = credential_name else {
+                        unreachable!("credential_name was checked to be Some above");
+                    };
+
+                    // Clear signal for next request
+                    {
+                        let mut signal = redaction_signal.lock().await;
+                        *signal = None;
+                    }
+
+                    let body = &accumulated[header_len..];
+                    let redacted = redact_oauth_response(body, &cred_name, &state, conn_id).await;
+
+                    match redacted {
+                        Ok(new_body) => {
+                            // Reconstruct response with new body
+                            let mut response = Vec::new();
+
+                            // Status line
+                            response.extend_from_slice(b"HTTP/1.");
+                            response.push(b'0' + resp.version.unwrap_or(1));
+                            response.push(b' ');
+                            response
+                                .extend_from_slice(resp.code.unwrap_or(200).to_string().as_bytes());
+                            response.push(b' ');
+                            response.extend_from_slice(resp.reason.unwrap_or("OK").as_bytes());
+                            response.extend_from_slice(b"\r\n");
+
+                            // Headers (update Content-Length)
+                            for header in resp.headers.iter() {
+                                if header.name.is_empty() {
+                                    continue;
+                                }
+                                if header.name.eq_ignore_ascii_case("content-length") {
+                                    response.extend_from_slice(b"Content-Length: ");
+                                    response
+                                        .extend_from_slice(new_body.len().to_string().as_bytes());
+                                    response.extend_from_slice(b"\r\n");
+                                } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
+                                    // Skip chunked encoding - we're sending fixed length
+                                    continue;
+                                } else {
+                                    response.extend_from_slice(header.name.as_bytes());
+                                    response.extend_from_slice(b": ");
+                                    response.extend_from_slice(header.value);
+                                    response.extend_from_slice(b"\r\n");
+                                }
+                            }
+                            response.extend_from_slice(b"\r\n");
+
+                            // New body
+                            response.extend_from_slice(&new_body);
+
+                            tracing::debug!(
+                                conn_id,
+                                original_size = body.len(),
+                                redacted_size = new_body.len(),
+                                "oauth response redacted"
+                            );
+
+                            let mut client_writer = client_writer.lock().await;
+                            client_writer.write_all(&response).await?;
+                            client_writer.flush().await?;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                conn_id,
+                                error = %e,
+                                "failed to redact oauth response, forwarding as-is"
+                            );
+                            let mut client_writer = client_writer.lock().await;
+                            client_writer.write_all(&accumulated).await?;
+                            client_writer.flush().await?;
+                        }
+                    }
+
+                    accumulated.clear();
+                }
+                // else: keep buffering until body is complete
+            }
+            Ok(httparse::Status::Partial) => {
+                // Keep buffering
+            }
+            Err(e) => {
+                tracing::warn!(conn_id, error = %e, "failed to parse response for redaction");
+                // Clear signal and forward as-is
+                {
+                    let mut signal = redaction_signal.lock().await;
+                    *signal = None;
+                }
+                let mut client_writer = client_writer.lock().await;
+                client_writer.write_all(&accumulated).await?;
+                accumulated.clear();
+            }
+        }
+    }
+
+    // Send any remaining buffered data
+    if !accumulated.is_empty() {
+        let mut client_writer = client_writer.lock().await;
+        client_writer.write_all(&accumulated).await?;
+    }
+
+    let mut client_writer = client_writer.lock().await;
+    client_writer.shutdown().await?;
+    Ok(())
+}
+
+/// Redact OAuth tokens from a JSON response body
+///
+/// Replaces access_token and refresh_token with dummy values,
+/// caching the mapping for future request injection.
+async fn redact_oauth_response(
+    body: &[u8],
+    credential_name: &str,
+    state: &ProxyState,
+    conn_id: u64,
+) -> Result<Vec<u8>, String> {
+    // Parse JSON
+    let mut json: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| format!("failed to parse oauth response as json: {}", e))?;
+
+    let mut redacted_count = 0;
+
+    // Redact access_token
+    if let Some(access_token) = json.get("access_token").and_then(|v| v.as_str()) {
+        let dummy = generate_dummy_token("access");
+        state
+            .policy
+            .cache_oauth_token(dummy.clone(), access_token.to_string())
+            .await;
+        json["access_token"] = serde_json::Value::String(dummy);
+        redacted_count += 1;
+        tracing::debug!(
+            conn_id,
+            credential = credential_name,
+            "redacted access_token"
+        );
+    }
+
+    // Redact refresh_token
+    if let Some(refresh_token) = json.get("refresh_token").and_then(|v| v.as_str()) {
+        let dummy = generate_dummy_token("refresh");
+        state
+            .policy
+            .cache_oauth_token(dummy.clone(), refresh_token.to_string())
+            .await;
+        json["refresh_token"] = serde_json::Value::String(dummy);
+        redacted_count += 1;
+        tracing::debug!(
+            conn_id,
+            credential = credential_name,
+            "redacted refresh_token"
+        );
+    }
+
+    if redacted_count == 0 {
+        tracing::debug!(
+            conn_id,
+            credential = credential_name,
+            "no tokens found to redact in oauth response"
+        );
+    }
+
+    serde_json::to_vec(&json).map_err(|e| format!("failed to serialize redacted json: {}", e))
+}
+
+/// Extract the token from a Bearer authorization header value
+///
+/// Given "Bearer sk-xxx" returns Some("sk-xxx")
+/// Given "token sk-xxx" returns Some("sk-xxx")
+fn extract_bearer_token(auth_header: &str) -> Option<&str> {
+    // Handle common formats: "Bearer TOKEN" or "token TOKEN"
+    let auth_header = auth_header.trim();
+
+    if let Some(token) = auth_header.strip_prefix("Bearer ") {
+        Some(token.trim())
+    } else if let Some(token) = auth_header.strip_prefix("bearer ") {
+        Some(token.trim())
+    } else if let Some(token) = auth_header.strip_prefix("token ") {
+        Some(token.trim())
+    } else {
+        // Unknown format - maybe just the token itself
+        None
+    }
+}
+
+/// Generate a dummy token that looks similar to a real OAuth token
+fn generate_dummy_token(token_type: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    // Generate a random-looking suffix
+    let random_part: u64 = timestamp as u64 ^ 0xDEADBEEF;
+
+    format!(
+        "REDACTED_{}_{:016x}_{:08x}",
+        token_type.to_uppercase(),
+        timestamp,
+        random_part
+    )
+}
+
 /// Handle plain HTTP request
 ///
 /// For now, just return 501 Not Implemented.
@@ -970,4 +1372,68 @@ fn empty_body() -> BoxBody {
     http_body_util::Empty::<bytes::Bytes>::new()
         .map_err(|never| match never {})
         .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_bearer_token() {
+        // Standard Bearer format
+        assert_eq!(
+            extract_bearer_token("Bearer sk-ant-abc123"),
+            Some("sk-ant-abc123")
+        );
+
+        // Lowercase bearer
+        assert_eq!(
+            extract_bearer_token("bearer sk-ant-abc123"),
+            Some("sk-ant-abc123")
+        );
+
+        // GitHub token format
+        assert_eq!(extract_bearer_token("token ghp_xxxx"), Some("ghp_xxxx"));
+
+        // With extra whitespace
+        assert_eq!(
+            extract_bearer_token("  Bearer   sk-ant-abc123  "),
+            Some("sk-ant-abc123")
+        );
+
+        // Unknown format
+        assert_eq!(extract_bearer_token("Basic dXNlcjpwYXNz"), None);
+
+        // Just the token (no prefix)
+        assert_eq!(extract_bearer_token("sk-ant-abc123"), None);
+    }
+
+    #[test]
+    fn test_generate_dummy_token() {
+        let token1 = generate_dummy_token("access");
+        let token2 = generate_dummy_token("refresh");
+
+        // Should have correct prefix
+        assert!(token1.starts_with("REDACTED_ACCESS_"));
+        assert!(token2.starts_with("REDACTED_REFRESH_"));
+
+        // Should be different due to timestamp
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let token3 = generate_dummy_token("access");
+        assert_ne!(token1, token3);
+    }
+
+    #[test]
+    fn test_dummy_token_format() {
+        let token = generate_dummy_token("test");
+
+        // Should start with expected prefix
+        assert!(token.starts_with("REDACTED_TEST_"));
+
+        // Should be long enough to be unique
+        assert!(token.len() > 30);
+
+        // Should contain only valid characters
+        assert!(token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    }
 }

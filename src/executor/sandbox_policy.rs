@@ -35,7 +35,15 @@ pub fn generate_profile(
     proxy_port: Option<u16>,
     interactive: bool,
 ) -> String {
-    generate_profile_with_cache(closure_paths, workspace_path, root_dir, job_dir, proxy_port, interactive, &[])
+    generate_profile_with_cache(
+        closure_paths,
+        workspace_path,
+        root_dir,
+        job_dir,
+        proxy_port,
+        interactive,
+        &[],
+    )
 }
 
 /// Generate sandbox profile with cache directories
@@ -255,7 +263,8 @@ pub fn generate_profile_with_cache(
         profile.push_str(";; TTY access for interactive mode\n");
         profile.push_str("(allow file-read-data (literal \"/dev\"))\n"); // List /dev directory
         profile.push_str("(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+$\"))\n"); // PTY slave devices
-        profile.push_str("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))\n"); // TTY ioctls (setRawMode, etc.)
+        profile.push_str("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))\n");
+        // TTY ioctls (setRawMode, etc.)
     }
     profile.push_str("(allow file-read* (subpath \"/usr/lib\"))\n");
     profile.push_str("(allow file-read* (subpath \"/usr/share\"))\n"); // zoneinfo, locale

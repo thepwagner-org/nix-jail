@@ -63,6 +63,16 @@ pub struct Credential {
     /// If set, the proxy will only inject if it finds this exact dummy token
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dummy_token: Option<String>,
+
+    /// Redact OAuth tokens from responses for this credential
+    /// When true, responses matching redact_paths will have tokens replaced with dummies
+    #[serde(default)]
+    pub redact_response: bool,
+
+    /// Path patterns that trigger response redaction (e.g., ["/oauth/token", "/token"])
+    /// Only used when redact_response is true
+    #[serde(default)]
+    pub redact_paths: Vec<String>,
 }
 
 /// Source of a credential value

@@ -178,6 +178,59 @@ pub fn validate_nixpkgs_version(version: &str) -> Result<(), Status> {
     Ok(())
 }
 
+/// Credential validation error
+#[derive(Debug)]
+pub enum CredentialValidationError {
+    InvalidRedactPath { path: String, error: String },
+    EmptyRedactPaths { credential: String },
+}
+
+impl std::fmt::Display for CredentialValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CredentialValidationError::InvalidRedactPath { path, error } => {
+                write!(f, "Invalid redact_path pattern '{}': {}", path, error)
+            }
+            CredentialValidationError::EmptyRedactPaths { credential } => {
+                write!(
+                    f,
+                    "Credential '{}' has redact_response=true but no redact_paths",
+                    credential
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CredentialValidationError {}
+
+/// Validate credential redact_paths configuration
+pub fn validate_credential_redact_paths(
+    credential: &Credential,
+) -> Result<(), CredentialValidationError> {
+    if !credential.redact_response {
+        return Ok(());
+    }
+
+    if credential.redact_paths.is_empty() {
+        return Err(CredentialValidationError::EmptyRedactPaths {
+            credential: credential.name.clone(),
+        });
+    }
+
+    for path in &credential.redact_paths {
+        let _ = RegexBuilder::new(path)
+            .size_limit(MAX_REGEX_SIZE)
+            .build()
+            .map_err(|e| CredentialValidationError::InvalidRedactPath {
+                path: path.clone(),
+                error: e.to_string(),
+            })?;
+    }
+
+    Ok(())
+}
+
 /// NetworkPolicy validation error
 #[derive(Debug)]
 pub enum NetworkPolicyError {
@@ -426,7 +479,83 @@ mod tests {
             allowed_host_patterns: vec!["api\\.anthropic\\.com".to_string()],
             header_format: "Bearer {token}".to_string(),
             dummy_token: None,
+            redact_response: false,
+            redact_paths: vec![],
         }]
+    }
+
+    #[test]
+    fn test_validate_credential_redact_disabled() {
+        let cred = Credential {
+            name: "test".to_string(),
+            credential_type: CredentialType::Generic,
+            source: CredentialSource::Environment {
+                source_env: "TEST".to_string(),
+            },
+            allowed_host_patterns: vec![],
+            header_format: "Bearer {token}".to_string(),
+            dummy_token: None,
+            redact_response: false,
+            redact_paths: vec![], // Empty is OK when redact_response is false
+        };
+        assert!(validate_credential_redact_paths(&cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_credential_redact_enabled_valid() {
+        let cred = Credential {
+            name: "oauth".to_string(),
+            credential_type: CredentialType::Generic,
+            source: CredentialSource::Environment {
+                source_env: "TEST".to_string(),
+            },
+            allowed_host_patterns: vec![],
+            header_format: "Bearer {token}".to_string(),
+            dummy_token: None,
+            redact_response: true,
+            redact_paths: vec!["/oauth/token".to_string(), "/token".to_string()],
+        };
+        assert!(validate_credential_redact_paths(&cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_credential_redact_enabled_empty_paths() {
+        let cred = Credential {
+            name: "oauth".to_string(),
+            credential_type: CredentialType::Generic,
+            source: CredentialSource::Environment {
+                source_env: "TEST".to_string(),
+            },
+            allowed_host_patterns: vec![],
+            header_format: "Bearer {token}".to_string(),
+            dummy_token: None,
+            redact_response: true,
+            redact_paths: vec![], // Error: redact_response=true but no paths
+        };
+        assert!(matches!(
+            validate_credential_redact_paths(&cred),
+            Err(CredentialValidationError::EmptyRedactPaths { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_credential_redact_invalid_regex() {
+        let cred = Credential {
+            name: "oauth".to_string(),
+            credential_type: CredentialType::Generic,
+            source: CredentialSource::Environment {
+                source_env: "TEST".to_string(),
+            },
+            allowed_host_patterns: vec![],
+            header_format: "Bearer {token}".to_string(),
+            dummy_token: None,
+            redact_response: true,
+            redact_paths: vec!["[invalid(".to_string()],
+        };
+        assert!(matches!(
+            validate_credential_redact_paths(&cred),
+            Err(CredentialValidationError::InvalidRedactPath { .. })
+        ));
     }
 
     #[test]

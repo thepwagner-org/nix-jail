@@ -39,6 +39,9 @@ pub struct CompiledPolicy {
     credentials: HashMap<String, Credential>,
     /// Token cache: credential_name -> token (with 5-minute TTL)
     token_cache: Cache<String, String>,
+    /// OAuth response redaction: dummy_token -> real_token
+    /// Used to inject real tokens when client sends dummy tokens from redacted responses
+    oauth_token_map: Cache<String, String>,
 }
 
 /// A single compiled rule with pre-compiled regexes
@@ -118,6 +121,10 @@ impl CompiledPolicy {
                 .time_to_live(Duration::from_secs(300)) // 5 minutes
                 .max_capacity(100)
                 .build(),
+            oauth_token_map: Cache::builder()
+                .time_to_live(Duration::from_secs(300)) // 5 minutes
+                .max_capacity(1000)
+                .build(),
         }
     }
 
@@ -180,6 +187,10 @@ impl CompiledPolicy {
             token_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(300)) // 5 minutes
                 .max_capacity(100)
+                .build(),
+            oauth_token_map: Cache::builder()
+                .time_to_live(Duration::from_secs(300)) // 5 minutes
+                .max_capacity(1000)
                 .build(),
         })
     }
@@ -319,6 +330,66 @@ impl CompiledPolicy {
             })
             .await
             .map_err(|e: std::sync::Arc<String>| e.to_string())
+    }
+
+    /// Cache an OAuth token mapping (dummy → real) for response redaction
+    ///
+    /// When we redact OAuth responses, we replace real tokens with dummy tokens.
+    /// This cache stores the mapping so we can inject the real token when the
+    /// sandbox later uses the dummy token in requests.
+    pub async fn cache_oauth_token(&self, dummy_token: String, real_token: String) {
+        tracing::debug!(
+            dummy_prefix = &dummy_token[..dummy_token.len().min(20)],
+            "cached oauth token mapping"
+        );
+        self.oauth_token_map.insert(dummy_token, real_token).await;
+    }
+
+    /// Look up the real token for a dummy token from a redacted OAuth response
+    ///
+    /// Returns None if the token is not in the cache (either expired or never cached).
+    pub async fn get_real_oauth_token(&self, dummy_token: &str) -> Option<String> {
+        self.oauth_token_map.get(dummy_token).await
+    }
+
+    /// Check if a path matches any credential's redact_paths patterns
+    ///
+    /// Returns the credential name if the path should trigger response redaction.
+    pub fn should_redact_response(&self, hostname: &str, path: &str) -> Option<&str> {
+        for (name, cred) in &self.credentials {
+            if !cred.redact_response {
+                continue;
+            }
+
+            // Check if hostname matches this credential's allowed hosts
+            let host_matches = cred.allowed_host_patterns.iter().any(|pattern| {
+                Regex::new(pattern)
+                    .map(|re| re.is_match(hostname))
+                    .unwrap_or(false)
+            });
+
+            if !host_matches {
+                continue;
+            }
+
+            // Check if path matches any redact pattern
+            let path_matches = cred.redact_paths.iter().any(|pattern| {
+                Regex::new(pattern)
+                    .map(|re| re.is_match(path))
+                    .unwrap_or(false)
+            });
+
+            if path_matches {
+                tracing::debug!(
+                    credential = name,
+                    hostname,
+                    path,
+                    "path matches redact pattern"
+                );
+                return Some(name);
+            }
+        }
+        None
     }
 }
 
@@ -469,6 +540,8 @@ mod tests {
                 allowed_host_patterns: vec![r"api\.anthropic\.com".to_string()],
                 header_format: "Bearer {token}".to_string(),
                 dummy_token: None,
+                redact_response: false,
+                redact_paths: vec![],
             },
             Credential {
                 name: "github".to_string(),
@@ -479,6 +552,8 @@ mod tests {
                 allowed_host_patterns: vec![r"api\.github\.com".to_string()],
                 header_format: "token {token}".to_string(),
                 dummy_token: None,
+                redact_response: false,
+                redact_paths: vec![],
             },
         ]
     }
@@ -1468,5 +1543,75 @@ mod tests {
                 tracing::info!("google.com resolved only to ipv4 addresses");
             }
         }
+    }
+
+    #[test]
+    fn test_should_redact_response() {
+        // Create credential with redaction enabled
+        let credentials = vec![Credential {
+            name: "oauth-test".to_string(),
+            credential_type: CredentialType::Generic,
+            source: CredentialSource::Environment {
+                source_env: "TEST_TOKEN".to_string(),
+            },
+            allowed_host_patterns: vec![r"auth\.example\.com".to_string()],
+            header_format: "Bearer {token}".to_string(),
+            dummy_token: None,
+            redact_response: true,
+            redact_paths: vec![r"/oauth/token".to_string(), r"/token$".to_string()],
+        }];
+
+        let policy = NetworkPolicy { rules: vec![] };
+        let compiled = CompiledPolicy::compile(policy, &credentials).expect("failed to compile");
+
+        // Should match oauth endpoint
+        assert_eq!(
+            compiled.should_redact_response("auth.example.com", "/oauth/token"),
+            Some("oauth-test")
+        );
+
+        // Should match token endpoint
+        assert_eq!(
+            compiled.should_redact_response("auth.example.com", "/token"),
+            Some("oauth-test")
+        );
+
+        // Should not match non-redact paths
+        assert_eq!(
+            compiled.should_redact_response("auth.example.com", "/api/users"),
+            None
+        );
+
+        // Should not match different hostname
+        assert_eq!(
+            compiled.should_redact_response("other.example.com", "/oauth/token"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_should_redact_response_disabled() {
+        // Create credential with redaction disabled
+        let credentials = vec![Credential {
+            name: "no-redact".to_string(),
+            credential_type: CredentialType::Generic,
+            source: CredentialSource::Environment {
+                source_env: "TEST_TOKEN".to_string(),
+            },
+            allowed_host_patterns: vec![r"auth\.example\.com".to_string()],
+            header_format: "Bearer {token}".to_string(),
+            dummy_token: None,
+            redact_response: false,
+            redact_paths: vec![r"/oauth/token".to_string()],
+        }];
+
+        let policy = NetworkPolicy { rules: vec![] };
+        let compiled = CompiledPolicy::compile(policy, &credentials).expect("failed to compile");
+
+        // Should not match even if path matches - redaction is disabled
+        assert_eq!(
+            compiled.should_redact_response("auth.example.com", "/oauth/token"),
+            None
+        );
     }
 }
