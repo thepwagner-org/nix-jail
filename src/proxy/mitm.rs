@@ -28,7 +28,22 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// to the credential name. The response handler checks this and redacts tokens if set.
 type RedactionSignal = Arc<tokio::sync::Mutex<Option<String>>>;
 
-use crate::config::{extract_access_token, CredentialType};
+/// Signal for LLM metrics extraction
+///
+/// When a request goes to an LLM API endpoint with metrics enabled, stores
+/// the context needed for response parsing (host, credential name, provider).
+#[derive(Debug, Clone)]
+struct LlmMetricsContext {
+    host: String,
+    credential: String,
+    provider: LlmProvider,
+}
+
+type LlmMetricsSignal = Arc<tokio::sync::Mutex<Option<LlmMetricsContext>>>;
+
+use crate::config::{extract_access_token, CredentialType, LlmProvider};
+use crate::metrics::SharedMetrics;
+use crate::proxy::llm::StreamingMetricsAccumulator;
 use crate::proxy::policy::{CompiledPolicy, PolicyDecision};
 use crate::proxy::stats::ProxyStats;
 
@@ -56,6 +71,9 @@ pub struct ProxyState {
 
     /// Optional path to log requests as JSON lines (for debugging)
     pub request_log_path: Option<std::path::PathBuf>,
+
+    /// Optional Prometheus metrics registry for LLM metrics
+    pub metrics: Option<SharedMetrics>,
 }
 
 /// Global cache for DNS blackhole detection results (60-second TTL)
@@ -525,6 +543,10 @@ where
     let redaction_signal: RedactionSignal = Arc::new(Mutex::new(None));
     let redaction_signal_for_upstream = redaction_signal.clone();
 
+    // Shared signal for LLM metrics extraction
+    let llm_metrics_signal: LlmMetricsSignal = Arc::new(Mutex::new(None));
+    let llm_metrics_signal_for_upstream = llm_metrics_signal.clone();
+
     let hostname_clone = hostname.clone();
     let state_clone = state.clone();
     let state_for_upstream = state.clone();
@@ -540,6 +562,7 @@ where
             policy_decision_clone,
             conn_id,
             redaction_signal,
+            llm_metrics_signal,
         )
         .await
     };
@@ -550,6 +573,7 @@ where
             client_writer_for_upstream,
             state_for_upstream,
             redaction_signal_for_upstream,
+            llm_metrics_signal_for_upstream,
             conn_id,
         )
         .await
@@ -572,6 +596,7 @@ async fn proxy_with_http1_inspection<R, CW, UW>(
     policy_decision: Option<PolicyDecision>,
     conn_id: u64,
     redaction_signal: RedactionSignal,
+    llm_metrics_signal: LlmMetricsSignal,
 ) -> Result<(), BoxError>
 where
     R: AsyncRead + Unpin,
@@ -935,6 +960,23 @@ where
                                         );
                                     }
 
+                                    // Check if this credential needs LLM metrics extraction
+                                    if credential.extract_llm_metrics {
+                                        if let Some(provider) = credential.llm_provider {
+                                            let mut signal = llm_metrics_signal.lock().await;
+                                            *signal = Some(LlmMetricsContext {
+                                                host: hostname.clone(),
+                                                credential: credential_name.to_string(),
+                                                provider,
+                                            });
+                                            tracing::debug!(
+                                                credential = credential_name,
+                                                provider = ?provider,
+                                                "signaling llm metrics extraction"
+                                            );
+                                        }
+                                    }
+
                                     // Build new headers list, replacing Authorization in place
                                     // If response redaction is needed, strip Accept-Encoding to
                                     // force uncompressed responses we can parse
@@ -1041,7 +1083,7 @@ where
     Ok(())
 }
 
-/// Relay responses from upstream to client, with optional OAuth token redaction
+/// Relay responses from upstream to client, with optional OAuth token redaction and LLM metrics
 ///
 /// When the redaction signal is set, this function:
 /// 1. Buffers the complete HTTP response
@@ -1049,11 +1091,17 @@ where
 /// 3. Replaces real OAuth tokens with dummy tokens
 /// 4. Caches the token mapping for future request injection
 /// 5. Sends the redacted response to the client
+///
+/// When the LLM metrics signal is set:
+/// 1. For streaming (SSE), parses events as they arrive
+/// 2. For non-streaming, parses the complete response body
+/// 3. Records token usage and tool calls to Prometheus metrics
 async fn relay_upstream_to_client<R, W>(
     mut upstream_reader: R,
     client_writer: Arc<tokio::sync::Mutex<W>>,
     state: Arc<ProxyState>,
     redaction_signal: RedactionSignal,
+    llm_metrics_signal: LlmMetricsSignal,
     conn_id: u64,
 ) -> Result<(), BoxError>
 where
@@ -1063,6 +1111,13 @@ where
     let mut buf = vec![0u8; 8192];
     let mut accumulated = Vec::new();
     const MAX_REDACT_SIZE: usize = 1024 * 1024; // 1MB limit for redaction
+
+    // LLM metrics state
+    let mut llm_context: Option<LlmMetricsContext> = None;
+    let mut llm_accumulator: Option<StreamingMetricsAccumulator> = None;
+    let mut llm_is_streaming: Option<bool> = None;
+    let mut llm_response_body: Vec<u8> = Vec::new();
+    let mut llm_headers_parsed = false;
 
     loop {
         let n = upstream_reader.read(&mut buf).await?;
@@ -1076,14 +1131,99 @@ where
             signal.clone()
         };
 
-        if credential_name.is_none() {
-            // No redaction needed - relay directly
+        // Check if we need LLM metrics extraction (only on first check)
+        if llm_context.is_none() {
+            let signal = llm_metrics_signal.lock().await;
+            llm_context = signal.clone();
+        }
+
+        if credential_name.is_none() && llm_context.is_none() {
+            // No special handling needed - relay directly
             tracing::trace!("upstream -> client: {} bytes", n);
             let mut client_writer = client_writer.lock().await;
             client_writer.write_all(&buf[..n]).await?;
             client_writer.flush().await?;
             continue;
         }
+
+        // Handle LLM metrics extraction (forward while parsing - no modification)
+        if credential_name.is_none() && llm_context.is_some() {
+            // Accumulate data for header parsing
+            accumulated.extend_from_slice(&buf[..n]);
+
+            // Detect streaming on first header parse
+            if !llm_headers_parsed {
+                let mut headers = [httparse::EMPTY_HEADER; 64];
+                let mut resp = httparse::Response::new(&mut headers);
+
+                if let Ok(httparse::Status::Complete(header_len)) = resp.parse(&accumulated) {
+                    llm_headers_parsed = true;
+
+                    // Check Content-Type for streaming
+                    let is_sse = resp.headers.iter().any(|h| {
+                        h.name.eq_ignore_ascii_case("content-type")
+                            && std::str::from_utf8(h.value)
+                                .map(|v| v.contains("text/event-stream"))
+                                .unwrap_or(false)
+                    });
+
+                    llm_is_streaming = Some(is_sse);
+
+                    if is_sse {
+                        // Create streaming accumulator
+                        if let Some(ref ctx) = llm_context {
+                            llm_accumulator = Some(StreamingMetricsAccumulator::new(ctx.provider));
+                            tracing::debug!(conn_id, "detected sse streaming llm response");
+                        }
+                    } else {
+                        tracing::debug!(conn_id, "detected non-streaming llm response");
+                    }
+
+                    // For streaming, process the body portion already received
+                    if is_sse {
+                        if let Some(ref mut acc) = llm_accumulator {
+                            acc.process_chunk(&accumulated[header_len..]);
+                        }
+                    } else {
+                        // Store body for non-streaming
+                        llm_response_body.extend_from_slice(&accumulated[header_len..]);
+                    }
+
+                    // Forward accumulated data to client
+                    let mut client_writer = client_writer.lock().await;
+                    client_writer.write_all(&accumulated).await?;
+                    client_writer.flush().await?;
+                    accumulated.clear();
+                    continue;
+                }
+            } else {
+                // Headers already parsed - process based on streaming mode
+                if llm_is_streaming == Some(true) {
+                    if let Some(ref mut acc) = llm_accumulator {
+                        acc.process_chunk(&buf[..n]);
+                    }
+                } else {
+                    // Non-streaming: accumulate body for final parsing
+                    llm_response_body.extend_from_slice(&buf[..n]);
+                }
+
+                // Forward immediately (no modification needed for metrics)
+                let mut client_writer = client_writer.lock().await;
+                client_writer.write_all(&buf[..n]).await?;
+                client_writer.flush().await?;
+                accumulated.clear();
+                continue;
+            }
+
+            // Headers not yet complete - wait for more data but still forward
+            let mut client_writer = client_writer.lock().await;
+            client_writer.write_all(&buf[..n]).await?;
+            client_writer.flush().await?;
+            // Don't clear accumulated - we need it for header parsing
+            continue;
+        }
+
+        // OAuth redaction is needed - credential_name.is_some()
 
         // Redaction mode: buffer the response
         accumulated.extend_from_slice(&buf[..n]);
@@ -1248,6 +1388,51 @@ where
     if !accumulated.is_empty() {
         let mut client_writer = client_writer.lock().await;
         client_writer.write_all(&accumulated).await?;
+    }
+
+    // Record LLM metrics at stream end
+    if let Some(ctx) = llm_context {
+        let metrics = if let Some(acc) = llm_accumulator {
+            // Streaming response - finalize accumulator
+            acc.finalize()
+        } else if !llm_response_body.is_empty() {
+            // Non-streaming response - parse the buffered body
+            crate::proxy::llm::parse_llm_response(&llm_response_body, ctx.provider)
+                .unwrap_or_default()
+        } else {
+            crate::proxy::llm::LlmMetrics::default()
+        };
+
+        // Record to Prometheus if registry available
+        if let Some(ref registry) = state.metrics {
+            registry.record_llm_usage(
+                &ctx.host,
+                &ctx.credential,
+                metrics.model.as_deref(),
+                metrics.input_tokens,
+                metrics.output_tokens,
+                metrics.cache_read_tokens,
+                &metrics.tool_calls,
+            );
+
+            tracing::debug!(
+                conn_id,
+                host = %ctx.host,
+                credential = %ctx.credential,
+                model = ?metrics.model,
+                input_tokens = ?metrics.input_tokens,
+                output_tokens = ?metrics.output_tokens,
+                cache_read_tokens = ?metrics.cache_read_tokens,
+                tool_calls = ?metrics.tool_calls.len(),
+                "recorded llm metrics"
+            );
+        }
+
+        // Clear signal for next request
+        {
+            let mut signal = llm_metrics_signal.lock().await;
+            *signal = None;
+        }
     }
 
     let mut client_writer = client_writer.lock().await;

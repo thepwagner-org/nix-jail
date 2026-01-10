@@ -481,6 +481,8 @@ mod tests {
             dummy_token: None,
             redact_response: false,
             redact_paths: vec![],
+            extract_llm_metrics: false,
+            llm_provider: None,
         }]
     }
 
@@ -497,6 +499,8 @@ mod tests {
             dummy_token: None,
             redact_response: false,
             redact_paths: vec![], // Empty is OK when redact_response is false
+            extract_llm_metrics: false,
+            llm_provider: None,
         };
         assert!(validate_credential_redact_paths(&cred).is_ok());
     }
@@ -514,6 +518,8 @@ mod tests {
             dummy_token: None,
             redact_response: true,
             redact_paths: vec!["/oauth/token".to_string(), "/token".to_string()],
+            extract_llm_metrics: false,
+            llm_provider: None,
         };
         assert!(validate_credential_redact_paths(&cred).is_ok());
     }
@@ -531,6 +537,8 @@ mod tests {
             dummy_token: None,
             redact_response: true,
             redact_paths: vec![], // Error: redact_response=true but no paths
+            extract_llm_metrics: false,
+            llm_provider: None,
         };
         assert!(matches!(
             validate_credential_redact_paths(&cred),
@@ -551,6 +559,8 @@ mod tests {
             dummy_token: None,
             redact_response: true,
             redact_paths: vec!["[invalid(".to_string()],
+            extract_llm_metrics: false,
+            llm_provider: None,
         };
         assert!(matches!(
             validate_credential_redact_paths(&cred),

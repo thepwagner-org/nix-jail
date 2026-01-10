@@ -542,6 +542,8 @@ mod tests {
                 dummy_token: None,
                 redact_response: false,
                 redact_paths: vec![],
+                extract_llm_metrics: false,
+                llm_provider: None,
             },
             Credential {
                 name: "github".to_string(),
@@ -554,6 +556,8 @@ mod tests {
                 dummy_token: None,
                 redact_response: false,
                 redact_paths: vec![],
+                extract_llm_metrics: false,
+                llm_provider: None,
             },
         ]
     }
@@ -1559,6 +1563,8 @@ mod tests {
             dummy_token: None,
             redact_response: true,
             redact_paths: vec![r"/oauth/token".to_string(), r"/token$".to_string()],
+            extract_llm_metrics: false,
+            llm_provider: None,
         }];
 
         let policy = NetworkPolicy { rules: vec![] };
@@ -1603,6 +1609,8 @@ mod tests {
             dummy_token: None,
             redact_response: false,
             redact_paths: vec![r"/oauth/token".to_string()],
+            extract_llm_metrics: false,
+            llm_provider: None,
         }];
 
         let policy = NetworkPolicy { rules: vec![] };

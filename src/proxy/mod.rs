@@ -7,6 +7,7 @@
 //! - Provides full visibility into job network activity
 
 pub mod certs;
+pub mod llm;
 pub mod mitm;
 pub mod policy;
 pub mod stats;
@@ -106,6 +107,7 @@ pub async fn run_proxy(
         proxy_username: config.proxy_username,
         proxy_password: config.proxy_password,
         request_log_path: config.request_log_path,
+        metrics: None, // LLM metrics disabled for standalone proxy
     });
 
     // Start MITM proxy server (CA cert is written after bind for reliable readiness signal)

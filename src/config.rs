@@ -39,6 +39,17 @@ pub enum CredentialType {
     Generic,
 }
 
+/// LLM provider type for API response parsing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmProvider {
+    /// Anthropic API (Claude)
+    #[default]
+    Anthropic,
+    /// OpenAI API (GPT models)
+    OpenAI,
+}
+
 /// A credential that can be injected into network requests
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credential {
@@ -73,6 +84,15 @@ pub struct Credential {
     /// Only used when redact_response is true
     #[serde(default)]
     pub redact_paths: Vec<String>,
+
+    /// Enable LLM API metrics extraction for this credential
+    /// When true, parses request/response bodies to extract token usage and tool calls
+    #[serde(default)]
+    pub extract_llm_metrics: bool,
+
+    /// LLM provider type for response parsing (required if extract_llm_metrics is true)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_provider: Option<LlmProvider>,
 }
 
 /// Source of a credential value

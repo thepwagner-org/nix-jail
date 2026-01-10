@@ -31,6 +31,14 @@ pub struct MetricsRegistry {
 
     // Proxy request counters
     pub proxy_requests_total: CounterVec,
+
+    // LLM API metrics
+    /// Token usage by host, model, type (input/output/cache_read), and credential
+    pub llm_tokens_total: CounterVec,
+    /// Tool invocations by host, tool name, and credential
+    pub llm_tool_calls_total: CounterVec,
+    /// LLM API requests by host, model, and credential
+    pub llm_requests_total: CounterVec,
 }
 
 impl MetricsRegistry {
@@ -119,6 +127,30 @@ impl MetricsRegistry {
         )?;
         registry.register(Box::new(proxy_requests_total.clone()))?;
 
+        // LLM API token usage counter
+        let llm_tokens_total = CounterVec::new(
+            Opts::new("nix_jail_llm_tokens_total", "LLM API token usage by type")
+                .namespace("nix_jail"),
+            &["host", "model", "token_type", "credential"],
+        )?;
+        registry.register(Box::new(llm_tokens_total.clone()))?;
+
+        // LLM API tool call counter
+        let llm_tool_calls_total = CounterVec::new(
+            Opts::new("nix_jail_llm_tool_calls_total", "LLM API tool invocations")
+                .namespace("nix_jail"),
+            &["host", "tool_name", "credential"],
+        )?;
+        registry.register(Box::new(llm_tool_calls_total.clone()))?;
+
+        // LLM API request counter
+        let llm_requests_total = CounterVec::new(
+            Opts::new("nix_jail_llm_requests_total", "LLM API requests by model")
+                .namespace("nix_jail"),
+            &["host", "model", "credential"],
+        )?;
+        registry.register(Box::new(llm_requests_total.clone()))?;
+
         // Register process collector for memory/CPU metrics (Linux only)
         #[cfg(target_os = "linux")]
         {
@@ -136,6 +168,9 @@ impl MetricsRegistry {
             closure_paths_total,
             active_jobs,
             proxy_requests_total,
+            llm_tokens_total,
+            llm_tool_calls_total,
+            llm_requests_total,
         })
     }
 
@@ -201,6 +236,50 @@ impl MetricsRegistry {
         self.proxy_requests_total
             .with_label_values(&[host, method, &status.to_string(), credential, decision])
             .inc_by(count as f64);
+    }
+
+    /// Record LLM API usage metrics
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_llm_usage(
+        &self,
+        host: &str,
+        credential: &str,
+        model: Option<&str>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        tool_calls: &[String],
+    ) {
+        let model_str = model.unwrap_or("unknown");
+
+        // Record request
+        self.llm_requests_total
+            .with_label_values(&[host, model_str, credential])
+            .inc();
+
+        // Record token usage
+        if let Some(input) = input_tokens {
+            self.llm_tokens_total
+                .with_label_values(&[host, model_str, "input", credential])
+                .inc_by(input as f64);
+        }
+        if let Some(output) = output_tokens {
+            self.llm_tokens_total
+                .with_label_values(&[host, model_str, "output", credential])
+                .inc_by(output as f64);
+        }
+        if let Some(cache) = cache_read_tokens {
+            self.llm_tokens_total
+                .with_label_values(&[host, model_str, "cache_read", credential])
+                .inc_by(cache as f64);
+        }
+
+        // Record tool calls
+        for tool_name in tool_calls {
+            self.llm_tool_calls_total
+                .with_label_values(&[host, tool_name, credential])
+                .inc();
+        }
     }
 }
 
