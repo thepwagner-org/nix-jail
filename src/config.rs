@@ -109,6 +109,10 @@ pub enum CredentialSource {
     Environment { source_env: String },
     /// Fetch from file (e.g., ~/.claude/.credentials.json)
     File { file_path: String },
+    /// Inline token (for ephemeral credentials)
+    /// SECURITY: Never serialized - serde(skip) prevents persistence
+    #[serde(skip)]
+    Inline { token: String },
 }
 
 /// Configuration for caching
@@ -152,6 +156,25 @@ impl Credential {
     }
 }
 
+impl From<&crate::jail::EphemeralCredential> for Credential {
+    fn from(ec: &crate::jail::EphemeralCredential) -> Self {
+        Credential {
+            name: ec.name.clone(),
+            credential_type: CredentialType::Generic,
+            source: CredentialSource::Inline {
+                token: ec.token.clone(),
+            },
+            allowed_host_patterns: ec.allowed_hosts.clone(),
+            header_format: ec.header_format.clone(),
+            dummy_token: None,
+            redact_response: false,
+            redact_paths: vec![],
+            extract_llm_metrics: false,
+            llm_provider: None,
+        }
+    }
+}
+
 /// Fetch token from a credential source (async wrapper for blocking operations)
 pub async fn fetch_credential_token(credential: &Credential) -> Result<String, String> {
     let source = credential.source.clone();
@@ -165,6 +188,7 @@ pub async fn fetch_credential_token(credential: &Credential) -> Result<String, S
 /// Fetch token from a credential source (synchronous implementation)
 fn fetch_credential_token_sync(source: &CredentialSource) -> Result<String, String> {
     match source {
+        CredentialSource::Inline { token } => Ok(token.clone()),
         CredentialSource::Keychain {
             keychain_service,
             keychain_account,

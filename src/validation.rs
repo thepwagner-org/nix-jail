@@ -4,7 +4,9 @@
 #![allow(clippy::result_large_err)] // tonic::Status is 176 bytes, acceptable for gRPC errors
 
 use crate::config::Credential;
-use crate::jail::{network_pattern, HostPattern, IpPattern, NetworkPolicy, NetworkRule};
+use crate::jail::{
+    network_pattern, EphemeralCredential, HostPattern, IpPattern, NetworkPolicy, NetworkRule,
+};
 use ipnetwork::IpNetwork;
 use regex::RegexBuilder;
 use std::collections::HashSet;
@@ -360,6 +362,147 @@ fn validate_ip_pattern(pattern: &IpPattern) -> Result<(), NetworkPolicyError> {
             error: e.to_string(),
         })?;
 
+    Ok(())
+}
+
+/// Ephemeral credential validation error
+#[derive(Debug)]
+pub enum EphemeralCredentialError {
+    EmptyName,
+    InvalidNameChars {
+        name: String,
+    },
+    EmptyToken {
+        name: String,
+    },
+    NoAllowedHosts {
+        name: String,
+    },
+    MissingTokenPlaceholder {
+        name: String,
+    },
+    InvalidHostPattern {
+        name: String,
+        pattern: String,
+        error: String,
+    },
+}
+
+impl std::fmt::Display for EphemeralCredentialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EphemeralCredentialError::EmptyName => {
+                write!(f, "ephemeral credential name cannot be empty")
+            }
+            EphemeralCredentialError::InvalidNameChars { name } => {
+                write!(
+                    f,
+                    "ephemeral credential '{}' has invalid characters (allowed: alphanumeric, -)",
+                    name
+                )
+            }
+            EphemeralCredentialError::EmptyToken { name } => {
+                write!(f, "ephemeral credential '{}' has empty token", name)
+            }
+            EphemeralCredentialError::NoAllowedHosts { name } => {
+                write!(f, "ephemeral credential '{}' has no allowed hosts", name)
+            }
+            EphemeralCredentialError::MissingTokenPlaceholder { name } => {
+                write!(
+                    f,
+                    "ephemeral credential '{}' header_format must contain {{token}}",
+                    name
+                )
+            }
+            EphemeralCredentialError::InvalidHostPattern {
+                name,
+                pattern,
+                error,
+            } => {
+                write!(
+                    f,
+                    "ephemeral credential '{}' has invalid host pattern '{}': {}",
+                    name, pattern, error
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EphemeralCredentialError {}
+
+impl From<EphemeralCredentialError> for Status {
+    fn from(err: EphemeralCredentialError) -> Self {
+        Status::invalid_argument(err.to_string())
+    }
+}
+
+/// Validate a single ephemeral credential
+///
+/// Security checks:
+/// - Name: non-empty, alphanumeric + hyphens only
+/// - Token: non-empty (NEVER log the value!)
+/// - At least one allowed host
+/// - Host patterns are valid regex (ReDoS protection)
+/// - Header format contains {token} placeholder
+pub fn validate_ephemeral_credential(
+    cred: &EphemeralCredential,
+) -> Result<(), EphemeralCredentialError> {
+    // Name: non-empty
+    if cred.name.is_empty() {
+        return Err(EphemeralCredentialError::EmptyName);
+    }
+
+    // Name: alphanumeric + hyphens only
+    if !cred.name.chars().all(|c| c.is_alphanumeric() || c == '-') {
+        return Err(EphemeralCredentialError::InvalidNameChars {
+            name: cred.name.clone(),
+        });
+    }
+
+    // Token: non-empty (NEVER log the value!)
+    if cred.token.is_empty() {
+        return Err(EphemeralCredentialError::EmptyToken {
+            name: cred.name.clone(),
+        });
+    }
+
+    // At least one allowed host
+    if cred.allowed_hosts.is_empty() {
+        return Err(EphemeralCredentialError::NoAllowedHosts {
+            name: cred.name.clone(),
+        });
+    }
+
+    // Validate each host pattern as valid regex (ReDoS protection)
+    for pattern in &cred.allowed_hosts {
+        let _ = RegexBuilder::new(pattern)
+            .size_limit(MAX_REGEX_SIZE)
+            .build()
+            .map_err(|e| EphemeralCredentialError::InvalidHostPattern {
+                name: cred.name.clone(),
+                pattern: pattern.clone(),
+                error: e.to_string(),
+            })?;
+    }
+
+    // Header format must contain {token}
+    if !cred.header_format.contains("{token}") {
+        return Err(EphemeralCredentialError::MissingTokenPlaceholder {
+            name: cred.name.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Validate all ephemeral credentials in a list
+pub fn validate_ephemeral_credentials(
+    creds: &[EphemeralCredential],
+) -> Result<(), EphemeralCredentialError> {
+    for cred in creds {
+        validate_ephemeral_credential(cred)?;
+    }
     Ok(())
 }
 
@@ -1026,5 +1169,192 @@ mod tests {
         assert!(validate_nixpkgs_version("nixos$(whoami)").is_err());
         // URL injection
         assert!(validate_nixpkgs_version("nixos/../../../etc/passwd").is_err());
+    }
+
+    // ========================================
+    // Ephemeral Credential Validation Tests
+    // ========================================
+
+    fn test_ephemeral_credential() -> EphemeralCredential {
+        EphemeralCredential {
+            name: "github-publish-abc123".to_string(),
+            token: "ghs_xxxxxxxxxxxx".to_string(),
+            allowed_hosts: vec!["github\\.com".to_string()],
+            header_format: "Bearer {token}".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_validate_ephemeral_credential_valid() {
+        let cred = test_ephemeral_credential();
+        assert!(validate_ephemeral_credential(&cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_ephemeral_credential_valid_multiple_hosts() {
+        let cred = EphemeralCredential {
+            name: "multi-host".to_string(),
+            token: "token123".to_string(),
+            allowed_hosts: vec!["github\\.com".to_string(), "api\\.github\\.com".to_string()],
+            header_format: "token {token}".to_string(),
+        };
+        assert!(validate_ephemeral_credential(&cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_ephemeral_credential_empty_name() {
+        let cred = EphemeralCredential {
+            name: "".to_string(),
+            token: "tok".to_string(),
+            allowed_hosts: vec!["github.com".to_string()],
+            header_format: "Bearer {token}".to_string(),
+        };
+        assert!(matches!(
+            validate_ephemeral_credential(&cred),
+            Err(EphemeralCredentialError::EmptyName)
+        ));
+    }
+
+    #[test]
+    fn test_validate_ephemeral_credential_invalid_name_spaces() {
+        let cred = EphemeralCredential {
+            name: "bad name".to_string(),
+            token: "tok".to_string(),
+            allowed_hosts: vec!["github.com".to_string()],
+            header_format: "Bearer {token}".to_string(),
+        };
+        assert!(matches!(
+            validate_ephemeral_credential(&cred),
+            Err(EphemeralCredentialError::InvalidNameChars { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_ephemeral_credential_invalid_name_special_chars() {
+        let cred = EphemeralCredential {
+            name: "bad!name@#$".to_string(),
+            token: "tok".to_string(),
+            allowed_hosts: vec!["github.com".to_string()],
+            header_format: "Bearer {token}".to_string(),
+        };
+        assert!(matches!(
+            validate_ephemeral_credential(&cred),
+            Err(EphemeralCredentialError::InvalidNameChars { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_ephemeral_credential_valid_name_with_hyphens() {
+        let cred = EphemeralCredential {
+            name: "github-publish-abc-123".to_string(),
+            token: "tok".to_string(),
+            allowed_hosts: vec!["github.com".to_string()],
+            header_format: "Bearer {token}".to_string(),
+        };
+        assert!(validate_ephemeral_credential(&cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_ephemeral_credential_empty_token() {
+        let cred = EphemeralCredential {
+            name: "test".to_string(),
+            token: "".to_string(),
+            allowed_hosts: vec!["github.com".to_string()],
+            header_format: "Bearer {token}".to_string(),
+        };
+        assert!(matches!(
+            validate_ephemeral_credential(&cred),
+            Err(EphemeralCredentialError::EmptyToken { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_ephemeral_credential_no_hosts() {
+        let cred = EphemeralCredential {
+            name: "test".to_string(),
+            token: "tok".to_string(),
+            allowed_hosts: vec![],
+            header_format: "Bearer {token}".to_string(),
+        };
+        assert!(matches!(
+            validate_ephemeral_credential(&cred),
+            Err(EphemeralCredentialError::NoAllowedHosts { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_ephemeral_credential_missing_token_placeholder() {
+        let cred = EphemeralCredential {
+            name: "test".to_string(),
+            token: "tok".to_string(),
+            allowed_hosts: vec!["github.com".to_string()],
+            header_format: "Bearer MISSING".to_string(),
+        };
+        assert!(matches!(
+            validate_ephemeral_credential(&cred),
+            Err(EphemeralCredentialError::MissingTokenPlaceholder { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_ephemeral_credential_invalid_host_regex() {
+        let cred = EphemeralCredential {
+            name: "test".to_string(),
+            token: "tok".to_string(),
+            allowed_hosts: vec!["[invalid".to_string()],
+            header_format: "Bearer {token}".to_string(),
+        };
+        assert!(matches!(
+            validate_ephemeral_credential(&cred),
+            Err(EphemeralCredentialError::InvalidHostPattern { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_ephemeral_credential_complex_valid_regex() {
+        let cred = EphemeralCredential {
+            name: "test".to_string(),
+            token: "tok".to_string(),
+            allowed_hosts: vec![
+                r".*\.github\.com".to_string(),
+                r"api\.anthropic\.com".to_string(),
+            ],
+            header_format: "Bearer {token}".to_string(),
+        };
+        assert!(validate_ephemeral_credential(&cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_ephemeral_credentials_empty_list() {
+        let creds: Vec<EphemeralCredential> = vec![];
+        assert!(validate_ephemeral_credentials(&creds).is_ok());
+    }
+
+    #[test]
+    fn test_validate_ephemeral_credentials_multiple_valid() {
+        let creds = vec![
+            test_ephemeral_credential(),
+            EphemeralCredential {
+                name: "other-cred".to_string(),
+                token: "other-token".to_string(),
+                allowed_hosts: vec!["api.example.com".to_string()],
+                header_format: "token {token}".to_string(),
+            },
+        ];
+        assert!(validate_ephemeral_credentials(&creds).is_ok());
+    }
+
+    #[test]
+    fn test_validate_ephemeral_credentials_one_invalid() {
+        let creds = vec![
+            test_ephemeral_credential(),
+            EphemeralCredential {
+                name: "".to_string(), // Invalid: empty name
+                token: "tok".to_string(),
+                allowed_hosts: vec!["example.com".to_string()],
+                header_format: "Bearer {token}".to_string(),
+            },
+        ];
+        assert!(validate_ephemeral_credentials(&creds).is_err());
     }
 }

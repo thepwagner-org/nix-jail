@@ -16,7 +16,7 @@ use tracing::Instrument;
 
 use crate::config::{Credential, CredentialType, ServerConfig};
 use crate::executor::{ExecutionConfig, Executor, HardeningProfile, ResolvedCacheMount};
-use crate::jail::{CacheRequest, CacheScope};
+use crate::jail::{CacheRequest, CacheScope, EphemeralCredential};
 use crate::jail::{LogEntry, LogSource, NetworkPolicy};
 use crate::job_dir::JobDirectory;
 use crate::job_workspace::JobWorkspace;
@@ -137,6 +137,31 @@ fn has_credential_with_type(credentials: &[&Credential], cred_type: CredentialTy
     credentials.iter().any(|c| c.credential_type == cred_type)
 }
 
+/// Merge ephemeral credentials with server credentials
+///
+/// Ephemeral credentials override server credentials with the same name.
+/// Logs a warning when an override occurs.
+fn merge_ephemeral_credentials(
+    server_credentials: &[Credential],
+    ephemeral: &[EphemeralCredential],
+) -> Vec<Credential> {
+    let mut credentials: Vec<Credential> = server_credentials.to_vec();
+
+    for ec in ephemeral {
+        // Check for override
+        if credentials.iter().any(|c| c.name == ec.name) {
+            tracing::warn!(
+                credential_name = %ec.name,
+                "ephemeral credential overrides server credential"
+            );
+            credentials.retain(|c| c.name != ec.name);
+        }
+        credentials.push(Credential::from(ec));
+    }
+
+    credentials
+}
+
 /// Serve stored logs for a completed job
 pub async fn serve_stored_logs(
     job_id: String,
@@ -230,7 +255,15 @@ impl Drop for JobMetricsGuard {
 /// This function is designed to be spawned as a background task by the caller.
 /// It uses a broadcast channel to allow multiple clients to subscribe to the same job's output.
 /// Note: This function is called from within an instrumented span created by the service layer.
-pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: bool) {
+///
+/// # Arguments
+/// * `ephemeral_credentials` - Client-provided credentials valid only for this job (not persisted)
+pub async fn execute_job(
+    job: JobMetadata,
+    ctx: ExecuteJobContext,
+    interactive: bool,
+    ephemeral_credentials: Vec<EphemeralCredential>,
+) {
     tracing::debug!(status = %job.status.to_string(), "executing job");
 
     let ExecuteJobContext {
@@ -358,12 +391,16 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
         (None, None)
     };
 
+    // Merge server credentials with ephemeral credentials (ephemeral overrides server)
+    let merged_credentials =
+        merge_ephemeral_credentials(&config.credentials, &ephemeral_credentials);
+
     // Phase 1: Create proxy config if network policy has rules
     let proxy_config_path = match configure_proxy(
         &job_id,
         &job_dir,
         job.network_policy.as_ref(),
-        &config.credentials,
+        &merged_credentials,
         executor.proxy_listen_addr(),
         &log_sink,
     )
@@ -618,7 +655,7 @@ pub async fn execute_job(job: JobMetadata, ctx: ExecuteJobContext, interactive: 
             job_id: &job_id,
             working_dir: &workspace_dir,
             job_dir: &job_dir,
-            credentials: &config.credentials,
+            credentials: &merged_credentials,
             network_policy: job.network_policy.as_ref(),
             log_sink: &log_sink,
             insecure_credentials: false,
@@ -2314,4 +2351,115 @@ pub async fn execute_local(
     }
 
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CredentialSource;
+
+    fn test_server_credential(name: &str) -> Credential {
+        Credential {
+            name: name.to_string(),
+            credential_type: CredentialType::Generic,
+            source: CredentialSource::Environment {
+                source_env: "TEST_TOKEN".to_string(),
+            },
+            allowed_host_patterns: vec!["api\\.example\\.com".to_string()],
+            header_format: "Bearer {token}".to_string(),
+            dummy_token: None,
+            redact_response: false,
+            redact_paths: vec![],
+            extract_llm_metrics: false,
+            llm_provider: None,
+        }
+    }
+
+    fn test_ephemeral_credential(name: &str) -> EphemeralCredential {
+        EphemeralCredential {
+            name: name.to_string(),
+            token: "ephemeral-secret-token".to_string(),
+            allowed_hosts: vec!["github\\.com".to_string()],
+            header_format: "token {token}".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_merge_ephemeral_credentials_empty() {
+        let server = vec![test_server_credential("github")];
+        let ephemeral: Vec<EphemeralCredential> = vec![];
+
+        let merged = merge_ephemeral_credentials(&server, &ephemeral);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "github");
+    }
+
+    #[test]
+    fn test_merge_ephemeral_credentials_additive() {
+        let server = vec![test_server_credential("github")];
+        let ephemeral = vec![test_ephemeral_credential("my-token")];
+
+        let merged = merge_ephemeral_credentials(&server, &ephemeral);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|c| c.name == "github"));
+        assert!(merged.iter().any(|c| c.name == "my-token"));
+    }
+
+    #[test]
+    fn test_merge_ephemeral_credentials_override() {
+        let server = vec![test_server_credential("github")];
+        let ephemeral = vec![test_ephemeral_credential("github")]; // Same name
+
+        let merged = merge_ephemeral_credentials(&server, &ephemeral);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "github");
+        // Verify it's the ephemeral one (Inline source)
+        assert!(matches!(merged[0].source, CredentialSource::Inline { .. }));
+    }
+
+    #[test]
+    fn test_merge_ephemeral_credentials_multiple_override() {
+        let server = vec![
+            test_server_credential("github"),
+            test_server_credential("anthropic"),
+        ];
+        let ephemeral = vec![
+            test_ephemeral_credential("github"),   // Override
+            test_ephemeral_credential("new-cred"), // Add
+        ];
+
+        let merged = merge_ephemeral_credentials(&server, &ephemeral);
+        assert_eq!(merged.len(), 3);
+
+        // anthropic should be from server (Environment source)
+        let anthropic = merged.iter().find(|c| c.name == "anthropic").unwrap();
+        assert!(matches!(
+            anthropic.source,
+            CredentialSource::Environment { .. }
+        ));
+
+        // github should be from ephemeral (Inline source)
+        let github = merged.iter().find(|c| c.name == "github").unwrap();
+        assert!(matches!(github.source, CredentialSource::Inline { .. }));
+
+        // new-cred should be from ephemeral (Inline source)
+        let new_cred = merged.iter().find(|c| c.name == "new-cred").unwrap();
+        assert!(matches!(new_cred.source, CredentialSource::Inline { .. }));
+    }
+
+    #[test]
+    fn test_ephemeral_credential_conversion() {
+        let ec = test_ephemeral_credential("test-cred");
+        let cred = Credential::from(&ec);
+
+        assert_eq!(cred.name, "test-cred");
+        assert_eq!(cred.credential_type, CredentialType::Generic);
+        assert!(
+            matches!(cred.source, CredentialSource::Inline { ref token } if token == "ephemeral-secret-token")
+        );
+        assert_eq!(cred.allowed_host_patterns, vec!["github\\.com".to_string()]);
+        assert_eq!(cred.header_format, "token {token}");
+        assert!(!cred.redact_response);
+        assert!(!cred.extract_llm_metrics);
+    }
 }

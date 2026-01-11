@@ -550,8 +550,9 @@ async fn exec_job(
         nixpkgs_version: Some(nixpkgs_version),
         hardening_profile,
         push: Some(push),
-        interactive: None, // Not interactive for exec mode
-        caches: vec![],    // Use server defaults
+        interactive: None,             // Not interactive for exec mode
+        caches: vec![],                // Use server defaults
+        ephemeral_credentials: vec![], // CLI doesn't support ephemeral credentials yet
     });
 
     let job_id = {

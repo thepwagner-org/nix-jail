@@ -143,6 +143,14 @@ impl JailService for JailServiceImpl {
         if let Some(ref nixpkgs_version) = req.nixpkgs_version {
             validation::validate_nixpkgs_version(nixpkgs_version)?;
         }
+        // Validate ephemeral credentials (never log token values!)
+        if !req.ephemeral_credentials.is_empty() {
+            validation::validate_ephemeral_credentials(&req.ephemeral_credentials)?;
+            tracing::debug!(
+                count = req.ephemeral_credentials.len(),
+                "validated ephemeral credentials"
+            );
+        }
 
         let job_id = Ulid::new().to_string();
         let interactive = req.interactive.unwrap_or(false);
@@ -189,6 +197,8 @@ impl JailService for JailServiceImpl {
         let job_root_for_exec = this.job_root.clone();
         let job_workspace_for_exec = this.job_workspace.clone();
         let metrics_for_exec = this.metrics.clone();
+        // Ephemeral credentials are NOT saved to JobMetadata (security: never persist)
+        let ephemeral_credentials_for_exec = req.ephemeral_credentials.clone();
 
         // Create broadcast channel for this job
         let (log_tx, _) = tokio::sync::broadcast::channel(1000);
@@ -239,6 +249,7 @@ impl JailService for JailServiceImpl {
                         metrics: metrics_for_exec,
                     },
                     interactive,
+                    ephemeral_credentials_for_exec,
                 )
                 .await;
             }

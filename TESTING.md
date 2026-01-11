@@ -106,6 +106,25 @@ nix-jail run -p curl -p jq \
   -- bash -c 'curl -s https://api.github.com/user | jq .login'
 ```
 
+### Test 5: Ephemeral credentials (gRPC only)
+
+Ephemeral credentials are client-provided, short-lived tokens passed in the JobRequest.
+They exist only in memory for the job's lifetime and are never persisted.
+
+**When testing features that use ephemeral credentials, verify:**
+
+1. The token is correctly injected into matching requests
+2. **The token value NEVER appears in streamed logs** - search all output carefully
+3. The token is not persisted in job metadata (check SQLite database)
+4. Ephemeral credentials with the same name override server credentials (warning logged)
+
+**Security verification checklist:**
+
+- Run a job with an ephemeral credential and capture all output
+- Search the output for any substring of the token value
+- Verify the token does not appear anywhere in logs, errors, or debug output
+- Check that `CredentialSource::Inline` cannot be serialized (serde skip)
+
 ## Disk Cache Testing
 
 Package resolution is cached to disk for CLI mode.

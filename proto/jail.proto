@@ -68,6 +68,27 @@ message JobRequest {
   // Each cache request specifies a bucket name (must match server config),
   // a key for cache lookup, and mount/env configuration.
   repeated CacheRequest caches = 11;
+
+  // Ephemeral credentials for this job only (not persisted)
+  // These are merged with server-configured credentials for the proxy.
+  // Useful for short-lived tokens (GitHub App, OAuth) that the client
+  // generates on-demand.
+  repeated EphemeralCredential ephemeral_credentials = 12;
+}
+
+// A credential provided by the client, valid only for this job
+message EphemeralCredential {
+  // Name to reference in network policy rules (e.g., "github-publish-abc123")
+  string name = 1;
+
+  // The actual token value (will be injected by proxy, never logged)
+  string token = 2;
+
+  // Host patterns this credential is allowed for (regex, e.g., ["github\\.com"])
+  repeated string allowed_hosts = 3;
+
+  // Header format template (e.g., "Bearer {token}", "token {token}")
+  string header_format = 4;
 }
 
 // Network policy controlling allowed/denied hosts and credential usage
