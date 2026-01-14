@@ -261,21 +261,7 @@ impl WorkspaceStorage for BtrfsStorage {
             warn!(src = %src.display(), stderr = %stderr, "btrfs snapshot failed, falling back to copy");
             let _ = copy_with_reflink(src, dest)?;
         } else {
-            // Verify snapshot has content
-            let nix_store = dest.join("nix/store");
-            if nix_store.exists() {
-                match std::fs::read_dir(&nix_store) {
-                    Ok(entries) => {
-                        let count = entries.count();
-                        debug!(dest = %dest.display(), store_paths = count, "btrfs snapshot created");
-                    }
-                    Err(e) => {
-                        warn!(dest = %dest.display(), error = %e, "btrfs snapshot created but cannot read nix/store");
-                    }
-                }
-            } else {
-                warn!(dest = %dest.display(), "btrfs snapshot created but nix/store missing");
-            }
+            debug!(dest = %dest.display(), "btrfs snapshot created");
         }
         Ok(())
     }
