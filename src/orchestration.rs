@@ -1514,9 +1514,9 @@ fn build_environment(
     let tmp_dir = working_dir.join("tmp");
     let _ = env.insert("TMPDIR".to_string(), tmp_dir.to_string_lossy().to_string());
 
-    // Set minimal locale to avoid locale warnings (sandbox doesn't have full locale data)
-    let _ = env.insert("LANG".to_string(), "C".to_string());
-    let _ = env.insert("LC_ALL".to_string(), "C".to_string());
+    // Set minimal locale with UTF-8 support (C.UTF-8 is available on most Linux systems)
+    let _ = env.insert("LANG".to_string(), "C.UTF-8".to_string());
+    let _ = env.insert("LC_ALL".to_string(), "C.UTF-8".to_string());
 
     // macOS: Set SDKROOT to avoid xcrun warnings during Rust builds
     #[cfg(target_os = "macos")]
