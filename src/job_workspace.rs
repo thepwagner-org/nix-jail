@@ -520,6 +520,7 @@ impl CachedJobWorkspace {
                     &temp_clone,
                     commit_sha,
                     &sparse_paths,
+                    storage,
                 )?;
 
                 // Move to cache

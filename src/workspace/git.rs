@@ -8,8 +8,10 @@
 //! - No shell command execution (uses git2 library directly)
 
 use super::WorkspaceError;
+use crate::cache::WorkspaceStorage;
 use git2::{build::RepoBuilder, Cred, FetchOptions, Oid, RemoteCallbacks, Repository};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Resolve a git ref (branch, tag, or HEAD) to a commit SHA
 ///
@@ -402,6 +404,7 @@ pub fn sparse_checkout_from_mirror(
     target_dir: &Path,
     commit_sha: &str,
     sparse_paths: &[&str],
+    storage: &Arc<dyn WorkspaceStorage>,
 ) -> Result<(), WorkspaceError> {
     use std::process::Command;
 
@@ -413,8 +416,10 @@ pub fn sparse_checkout_from_mirror(
         )));
     }
 
-    // Create target directory
-    std::fs::create_dir_all(target_dir)?;
+    // Create target directory as btrfs subvolume (if supported) for instant snapshots later
+    storage
+        .create_dir(target_dir)
+        .map_err(|e| WorkspaceError::IoError(std::io::Error::other(e.to_string())))?;
 
     // Step 1: Clone from remote with minimal object transfer
     // --depth 1: only fetch one commit (no history)

@@ -704,6 +704,7 @@ pub async fn execute_job(
             .partition(|c| c.populate_command.is_some());
 
         // Phase 1: Run populate commands sequentially, then snapshot
+        let workspace_storage = crate::cache::detect_storage(&config.cache_dir());
         let mut populated_mounts = Vec::new();
         for cache in &populate_caches {
             // SAFETY: Only called for caches where populate_command.is_some() from partition
@@ -714,8 +715,11 @@ pub async fn execute_job(
                 .expect("populate_command is Some");
             let cache_host_path = resolve_cache_host_path(cache, &config, repo_hash.as_deref());
 
-            // Ensure data directory exists
-            let data_path = match crate::cache::snapshots::ensure_data_dir(&cache_host_path) {
+            // Ensure data directory exists (as btrfs subvolume if supported)
+            let data_path = match crate::cache::snapshots::ensure_data_dir(
+                &cache_host_path,
+                &workspace_storage,
+            ) {
                 Ok(path) => path,
                 Err(e) => {
                     log_sink.error(
@@ -790,7 +794,6 @@ pub async fn execute_job(
             }
 
             // Create snapshot of the populated cache
-            let workspace_storage = crate::cache::detect_storage(&config.cache_dir());
             let snapshot_data_path = match crate::cache::snapshots::create_snapshot(
                 &cache_host_path,
                 populate_cmd,

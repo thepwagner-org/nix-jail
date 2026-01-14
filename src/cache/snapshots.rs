@@ -270,10 +270,21 @@ pub async fn cleanup_snapshots(
 /// Ensure the data directory exists for a cache path.
 ///
 /// Call this before running populate commands to ensure the cache has
-/// a proper data directory structure.
-pub fn ensure_data_dir(cache_path: &Path) -> Result<PathBuf, SnapshotError> {
+/// a proper data directory structure. Creates the data directory as a
+/// btrfs subvolume (if supported) to enable instant snapshots.
+pub fn ensure_data_dir(
+    cache_path: &Path,
+    storage: &Arc<dyn WorkspaceStorage>,
+) -> Result<PathBuf, SnapshotError> {
     let data = data_dir(cache_path);
-    std::fs::create_dir_all(&data)?;
+    // Create parent directories first (these don't need to be subvolumes)
+    if let Some(parent) = data.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Create the data directory as a btrfs subvolume for instant snapshots
+    if !data.exists() {
+        storage.create_dir(&data)?;
+    }
     Ok(data)
 }
 
@@ -305,7 +316,7 @@ mod tests {
         let storage = create_test_storage();
 
         // Create data directory with some content
-        let data = ensure_data_dir(&cache_path).unwrap();
+        let data = ensure_data_dir(&cache_path, &storage).unwrap();
         fs::write(data.join("test.txt"), "hello").unwrap();
 
         // Create snapshot
@@ -333,7 +344,7 @@ mod tests {
         let storage = create_test_storage();
 
         // Create data directory
-        let data = ensure_data_dir(&cache_path).unwrap();
+        let data = ensure_data_dir(&cache_path, &storage).unwrap();
         fs::write(data.join("test.txt"), "v1").unwrap();
 
         // Create snapshot with command A
@@ -371,7 +382,7 @@ mod tests {
         let storage = create_test_storage();
 
         // Create data directory
-        let data = ensure_data_dir(&cache_path).unwrap();
+        let data = ensure_data_dir(&cache_path, &storage).unwrap();
         fs::write(data.join("test.txt"), "content").unwrap();
 
         // Create multiple snapshots
