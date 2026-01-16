@@ -123,3 +123,63 @@ fn find_binary_in_closure(name: &str, closure: &[PathBuf]) -> Option<PathBuf> {
     }
     None
 }
+
+/// Creates /etc/hosts file for localhost resolution.
+///
+/// Many tools expect localhost to resolve (e.g., development servers binding to
+/// 127.0.0.1). Without /etc/hosts, gethostbyname("localhost") fails.
+///
+/// Creates a minimal /etc/hosts with only localhost entries:
+/// - 127.0.0.1 localhost
+/// - ::1 localhost
+///
+/// # Arguments
+/// * `root_dir` - The root directory for the chroot
+pub fn create_etc_hosts(root_dir: &Path) -> std::io::Result<()> {
+    let etc_dir = root_dir.join("etc");
+    std::fs::create_dir_all(&etc_dir)?;
+
+    let hosts_path = etc_dir.join("hosts");
+    let hosts_content = "127.0.0.1\tlocalhost\n::1\t\tlocalhost\n";
+
+    std::fs::write(&hosts_path, hosts_content)?;
+
+    tracing::debug!(hosts_path = %hosts_path.display(), "created /etc/hosts");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_create_etc_hosts() {
+        let root = tempdir().expect("failed to create temp dir");
+
+        create_etc_hosts(root.path()).expect("failed to create /etc/hosts");
+
+        let hosts_path = root.path().join("etc/hosts");
+        assert!(hosts_path.exists(), "/etc/hosts should exist");
+
+        let content = std::fs::read_to_string(&hosts_path).expect("failed to read /etc/hosts");
+        assert!(
+            content.contains("127.0.0.1"),
+            "should contain IPv4 localhost"
+        );
+        assert!(content.contains("::1"), "should contain IPv6 localhost");
+        assert!(content.contains("localhost"), "should contain 'localhost'");
+    }
+
+    #[test]
+    fn test_create_etc_hosts_idempotent() {
+        let root = tempdir().expect("failed to create temp dir");
+
+        // Create twice - should not error
+        create_etc_hosts(root.path()).expect("first call failed");
+        create_etc_hosts(root.path()).expect("second call failed");
+
+        let hosts_path = root.path().join("etc/hosts");
+        assert!(hosts_path.exists());
+    }
+}

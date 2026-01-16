@@ -539,6 +539,12 @@ pub async fn execute_job(
         // Non-fatal: continue execution, scripts might still work
     }
 
+    // Create /etc/hosts for localhost resolution
+    if let Err(e) = crate::executor::exec::create_etc_hosts(&job_dir.root) {
+        log_sink.error(&job_id, &format!("Failed to create /etc/hosts: {}", e));
+        // Non-fatal: continue execution
+    }
+
     // Phase 2: Start proxy now that root exists (proxy writes cert to root/etc/ssl/certs/)
     let mut proxy = match start_proxy_if_configured(
         &job_id,
@@ -2063,6 +2069,12 @@ pub async fn execute_local(
     if let Err(e) = crate::executor::exec::create_fhs_symlinks(&job_dir.root, &closure) {
         log_sink.error(&job_id, &format!("Failed to create FHS symlinks: {}", e));
         // Non-fatal: continue execution, scripts might still work
+    }
+
+    // Create /etc/hosts for localhost resolution
+    if let Err(e) = crate::executor::exec::create_etc_hosts(&job_dir.root) {
+        log_sink.error(&job_id, &format!("Failed to create /etc/hosts: {}", e));
+        // Non-fatal: continue execution
     }
 
     // Phase 4: Start proxy if configured
