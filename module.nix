@@ -204,12 +204,14 @@ in {
     '';
 
     # Create directories with proper permissions
-    systemd.tmpfiles.rules = [
-      "d /var/run/netns 0775 root nix-jail -"
-    ] ++ lib.optionals cfg.cache.enable [
-      # Base cache directory - buckets are created dynamically by the daemon
-      "d ${cfg.stateDirectory}/cache 0755 root root -"
-    ];
+    systemd.tmpfiles.rules =
+      [
+        "d /var/run/netns 0775 root nix-jail -"
+      ]
+      ++ lib.optionals cfg.cache.enable [
+        # Base cache directory - buckets are created dynamically by the daemon
+        "d ${cfg.stateDirectory}/cache 0755 root root -"
+      ];
 
     # Allow proxy port from nix-jail network namespaces (vp-* veth interfaces)
     networking.firewall.interfaces."vp-+".allowedTCPPorts = [3128];
