@@ -1,7 +1,3 @@
----
-created: 2025-11-16
-description: Sandboxed execution for Nix packages
----
 # nix-jail
 
 Sandboxed execution for Nix packages with network policy enforcement and credential injection.
