@@ -800,7 +800,7 @@ impl Executor for SystemdExecutor {
         }
 
         // Note: HTTP_PROXY and HTTPS_PROXY are already set correctly by build_environment
-        // with credentials embedded (http://user:pass@ip:port). Don't override them here.
+        // with credentials embedded (http://user:pass@ip:port). Don't override them here. (trufflehog:ignore)
 
         // Add the actual command to execute (use resolved paths)
         let _ = cmd.arg("--");

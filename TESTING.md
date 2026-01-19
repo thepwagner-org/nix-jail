@@ -164,12 +164,17 @@ nix-jail run -- bash -c 'echo "Using flake closure"'
 
 Test sparse checkout of remote repositories into Docker volumes.
 
+```bash
+# Set your repo URL
+REPO="https://user:TOKEN@git.example.com/org/repo.git"  # trufflehog:ignore
+```
+
 ### Test 1: Basic git workspace
 
 ```bash
 # Clone a subpath from a monorepo
 nix-jail run --executor docker --store-strategy docker-volume \
-  --repo "https://user:TOKEN@git.example.com/org/repo.git" \
+  --repo "$REPO" \
   --path "projects/nix-jail" \
   -p bash -p git \
   -- bash -c "pwd && ls -la"
@@ -180,7 +185,7 @@ nix-jail run --executor docker --store-strategy docker-volume \
 ```bash
 # Should show only the requested path, minimal objects
 nix-jail run --executor docker --store-strategy docker-volume \
-  --repo "https://user:TOKEN@git.example.com/org/repo.git" \
+  --repo "$REPO" \
   --path "projects/nix-jail" \
   -p bash -p git \
   -- bash -c '
@@ -197,13 +202,13 @@ git count-objects -v
 ```bash
 # First run - creates volume
 time nix-jail run --executor docker --store-strategy docker-volume \
-  --repo "https://user:TOKEN@git.example.com/org/repo.git" \
+  --repo "$REPO" \
   --path "projects/nix-jail" \
   -p bash -- echo "First run"
 
 # Second run - should be instant (volume cache hit)
 time nix-jail run --executor docker --store-strategy docker-volume \
-  --repo "https://user:TOKEN@git.example.com/org/repo.git" \
+  --repo "$REPO" \
   --path "projects/nix-jail" \
   -p bash -- echo "Second run (cached)"
 ```
@@ -213,7 +218,7 @@ time nix-jail run --executor docker --store-strategy docker-volume \
 ```bash
 # Checkout a specific commit
 nix-jail run --executor docker --store-strategy docker-volume \
-  --repo "https://user:TOKEN@git.example.com/org/repo.git" \
+  --repo "$REPO" \
   --path "projects/nix-jail" \
   --git-ref "main" \
   -p bash -p git \

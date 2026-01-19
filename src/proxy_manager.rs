@@ -234,7 +234,7 @@ impl ProxyManager {
     /// Get proxy URL for environment variables using the listen host
     ///
     /// Returns URL with embedded credentials if proxy authentication is enabled:
-    /// - With auth: `http://job-123:password@127.0.0.1:3128`
+    /// - With auth: `http://job-123:password@127.0.0.1:3128` (trufflehog:ignore)
     /// - Without auth: `http://127.0.0.1:3128`
     pub fn proxy_url(&self) -> String {
         self.proxy_url_with_host(&self.listen_host)
