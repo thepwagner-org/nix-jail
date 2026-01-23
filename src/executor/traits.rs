@@ -240,6 +240,18 @@ pub trait Executor: Send + Sync {
     ) -> Result<(), ExecutorError> {
         Ok(())
     }
+
+    /// Get the sandbox user/group for this executor
+    ///
+    /// Returns the (user, group) that jobs run as, or None if the executor
+    /// doesn't use user switching (e.g., macOS sandbox-exec runs as current user).
+    ///
+    /// When Some, the orchestration layer will:
+    /// - Create home directory at /home/{user}
+    /// - chown job directories to {user}:{group}
+    fn sandbox_user(&self) -> Option<(&'static str, &'static str)> {
+        None
+    }
 }
 
 #[cfg(test)]

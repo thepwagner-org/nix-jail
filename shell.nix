@@ -4,6 +4,8 @@ pkgs.mkShell {
     cargo
     rustfmt
     clippy
+    rust-analyzer
+
     protobuf
     pkg-config
     perl

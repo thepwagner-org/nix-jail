@@ -360,16 +360,15 @@ mod tests {
             .expect("Failed to write .envrc");
 
         let source = detect_flake_source(&project_dir);
-        match source {
-            Some(FlakeSource::Envrc {
-                flake_dir: dir,
-                output,
-            }) => {
-                assert_eq!(dir, flake_dir.canonicalize().unwrap());
-                assert_eq!(output, Some("my-project".to_string()));
-            }
-            other => panic!("Expected Envrc, got {:?}", other),
-        }
+        let Some(FlakeSource::Envrc {
+            flake_dir: dir,
+            output,
+        }) = source
+        else {
+            unreachable!("Expected Envrc, got {:?}", source);
+        };
+        assert_eq!(dir, flake_dir.canonicalize().unwrap());
+        assert_eq!(output, Some("my-project".to_string()));
     }
 
     #[test]
@@ -387,16 +386,15 @@ mod tests {
         fs::write(project_dir.join(".envrc"), "use flake ..").expect("Failed to write .envrc");
 
         let source = detect_flake_source(&project_dir);
-        match source {
-            Some(FlakeSource::Envrc {
-                flake_dir: dir,
-                output,
-            }) => {
-                assert_eq!(dir, flake_dir.canonicalize().unwrap());
-                assert_eq!(output, None);
-            }
-            other => panic!("Expected Envrc, got {:?}", other),
-        }
+        let Some(FlakeSource::Envrc {
+            flake_dir: dir,
+            output,
+        }) = source
+        else {
+            unreachable!("Expected Envrc, got {:?}", source);
+        };
+        assert_eq!(dir, flake_dir.canonicalize().unwrap());
+        assert_eq!(output, None);
     }
 
     #[test]
@@ -418,12 +416,10 @@ mod tests {
         .expect("Failed to write .envrc");
 
         let source = detect_flake_source(&project_dir);
-        match source {
-            Some(FlakeSource::Envrc { output, .. }) => {
-                assert_eq!(output, Some("proj".to_string()));
-            }
-            other => panic!("Expected Envrc, got {:?}", other),
-        }
+        let Some(FlakeSource::Envrc { output, .. }) = source else {
+            unreachable!("Expected Envrc, got {:?}", source);
+        };
+        assert_eq!(output, Some("proj".to_string()));
     }
 
     #[test]

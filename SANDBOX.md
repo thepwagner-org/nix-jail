@@ -458,8 +458,8 @@ The SystemdExecutor applies hardening properties across seven categories:
 
 | Category | Properties | Purpose |
 |----------|-----------|---------|
-| **Filesystem Isolation** | PrivateTmp, ProtectHome, ProtectSystem=strict, ProtectKernelTunables, ProtectKernelModules, ProtectKernelLogs, ProtectControlGroups, ProtectProc=invisible, ProcSubset=pid, PrivateDevices | Restrict filesystem access to minimal required paths |
-| **User & Privilege** | DynamicUser, PrivateUsers, NoNewPrivileges, RestrictSUIDSGID, CapabilityBoundingSet=, AmbientCapabilities= | Prevent privilege escalation and capability acquisition |
+| **Filesystem Isolation** | PrivateTmp, ProtectSystem=strict, ProtectKernelTunables, ProtectKernelModules, ProtectKernelLogs, ProtectControlGroups, ProtectProc=invisible, ProcSubset=pid, PrivateDevices | Restrict filesystem access to minimal required paths |
+| **User & Privilege** | User=nix-jail, Group=nix-jail, NoNewPrivileges, RestrictSUIDSGID, CapabilityBoundingSet=, AmbientCapabilities= | Prevent privilege escalation and capability acquisition |
 | **Syscall Filtering** | SystemCallFilter=@system-service, SystemCallErrorNumber=EPERM, SystemCallArchitectures=native, RestrictNamespaces=true | Allowlist safe syscalls, block dangerous operations |
 | **Memory/Execution** | MemoryDenyWriteExecute, LockPersonality, RestrictRealtime | Prevent W^X violations and memory exploits |
 | **Network Isolation** | RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 | Isolate network access to proxy-only communication |

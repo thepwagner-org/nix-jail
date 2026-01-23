@@ -101,14 +101,19 @@ impl CacheManager {
         self.workspace_storage.name()
     }
 
-    /// Get the storage backend
-    pub fn storage(&self) -> &std::sync::Arc<dyn WorkspaceStorage> {
+    /// Get the workspace storage backend (for btrfs/reflink operations)
+    pub fn workspace_storage(&self) -> &std::sync::Arc<dyn WorkspaceStorage> {
         &self.workspace_storage
     }
 
-    /// Get path for a cache entry by NAR hash
+    /// Get the job storage (database) for cache entry tracking
+    pub fn job_storage(&self) -> &JobStorage {
+        &self.storage
+    }
+
+    /// Get path for a nix closure cache entry by NAR hash
     pub fn cache_path(&self, nar_hash: &str) -> PathBuf {
-        self.cache_dir.join(nar_hash)
+        self.cache_dir.join("nix").join(nar_hash)
     }
 
     /// Check if a cache entry exists
@@ -168,11 +173,15 @@ impl CacheManager {
             "creating cache entry"
         );
 
+        // Ensure the nix/ parent directory exists
+        if let Some(parent) = snapshot_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
         // Create the snapshot directory
         self.workspace_storage.create_dir(&snapshot_path)?;
 
         // Copy closure paths into the snapshot
-        let mut total_size: i64 = 0;
         for src_path in closure_paths {
             let dest = snapshot_path.join("nix").join("store");
             std::fs::create_dir_all(&dest)?;
@@ -180,8 +189,7 @@ impl CacheManager {
             // Get the store path name (e.g., "abc123-package")
             if let Some(name) = src_path.file_name() {
                 let dest_path = dest.join(name);
-                total_size +=
-                    btrfs::copy_tree(src_path, &dest_path, &self.workspace_storage).await?;
+                let _ = btrfs::copy_tree(src_path, &dest_path, &self.workspace_storage).await?;
             }
         }
 
@@ -193,7 +201,6 @@ impl CacheManager {
                 .iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect(),
-            size_bytes: Some(total_size),
             created_at: now,
             last_used_at: now,
             use_count: 0,
@@ -203,7 +210,6 @@ impl CacheManager {
 
         info!(
             nar_hash,
-            size_bytes = total_size,
             closure_count = closure_paths.len(),
             "cache entry created"
         );
@@ -251,12 +257,10 @@ impl CacheManager {
 
     /// Get cache statistics
     pub fn stats(&self) -> Result<CacheStats, CacheError> {
-        let entry_count = self.storage.get_cache_entry_count()?;
-        let total_size = self.storage.get_cache_total_size()?;
+        let nix_entry_count = self.storage.get_cache_entry_count()?;
 
         Ok(CacheStats {
-            entry_count,
-            total_size_bytes: total_size,
+            nix_entry_count,
             storage_backend: self.workspace_storage.name(),
         })
     }
@@ -294,52 +298,62 @@ impl CacheManager {
         Ok(false) // cache miss
     }
 
-    /// Run garbage collection using LRU eviction
+    /// Run garbage collection - deletes all cache entries
     ///
-    /// Removes the oldest cache entries until the total size is below the target.
-    pub async fn gc(&self, target_size_bytes: i64) -> Result<usize, CacheError> {
-        let mut deleted = 0;
-        let mut current_size = self.storage.get_cache_total_size()?;
+    /// Removes all nix closure cache entries and workspace cache entries.
+    pub async fn gc(&self) -> Result<GcStats, CacheError> {
+        let mut stats = GcStats::default();
 
-        while current_size > target_size_bytes {
-            let entries = self.storage.list_cache_entries_lru(1)?;
-            if entries.is_empty() {
-                break;
+        // Delete all nix closure cache entries
+        let nix_entries = self.storage.list_cache_entries_lru(1000)?;
+        for entry in &nix_entries {
+            let path = PathBuf::from(&entry.snapshot_path);
+            if path.exists() {
+                if let Err(e) = self.workspace_storage.delete_dir(&path) {
+                    warn!(path = %path.display(), error = %e, "failed to delete nix cache dir");
+                }
             }
-
-            let entry = &entries[0];
-            let entry_size = entry.size_bytes.unwrap_or(0);
-
-            self.delete_entry(&entry.nar_hash)?;
-            deleted += 1;
-            current_size -= entry_size;
-
-            debug!(
-                nar_hash = entry.nar_hash,
-                size_bytes = entry_size,
-                remaining_size = current_size,
-                "gc: deleted cache entry"
-            );
         }
+        stats.nix_entries_deleted = self.storage.delete_all_cache_entries()?;
 
-        if deleted > 0 {
-            info!(
-                deleted,
-                final_size_bytes = current_size,
-                "garbage collection completed"
-            );
+        // Delete all workspace cache entries
+        let workspace_entries = self.storage.list_workspace_cache_entries_lru(1000)?;
+        for entry in &workspace_entries {
+            let subdir = match entry.cache_type {
+                crate::storage::WorkspaceCacheType::Sparse => "sparse",
+                crate::storage::WorkspaceCacheType::Clones => "clones",
+            };
+            let path = self.cache_dir.join(subdir).join(&entry.cache_key);
+            if path.exists() {
+                if let Err(e) = self.workspace_storage.delete_dir(&path) {
+                    warn!(path = %path.display(), error = %e, "failed to delete workspace cache dir");
+                }
+            }
         }
+        stats.workspace_entries_deleted = self.storage.delete_all_workspace_cache_entries()?;
 
-        Ok(deleted)
+        info!(
+            nix_deleted = stats.nix_entries_deleted,
+            workspace_deleted = stats.workspace_entries_deleted,
+            "garbage collection completed"
+        );
+
+        Ok(stats)
     }
 }
 
 /// Cache statistics
 #[derive(Debug, Clone)]
 pub struct CacheStats {
-    pub entry_count: usize,
-    pub total_size_bytes: i64,
+    pub nix_entry_count: usize,
     pub storage_backend: &'static str,
+}
+
+/// Statistics from garbage collection
+#[derive(Debug, Clone, Default)]
+pub struct GcStats {
+    pub nix_entries_deleted: usize,
+    pub workspace_entries_deleted: usize,
 }
 
 /// Compute a cache key from a list of store paths.

@@ -162,7 +162,7 @@ impl JobRoot for CachedJobRoot {
     fn cleanup(&self, root_dir: &Path) -> Result<(), RootError> {
         if root_dir.exists() {
             self.cache_manager
-                .storage()
+                .workspace_storage()
                 .delete_dir(root_dir)
                 .map_err(|e| RootError::Io(std::io::Error::other(e.to_string())))?;
         }

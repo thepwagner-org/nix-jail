@@ -11,7 +11,7 @@
 //! - Resource limits: CPU, memory, process constraints via container limits
 //! - Privilege dropping: Runs as non-root user with no capabilities
 
-use super::traits::{ExecutionConfig, ExecutionHandle, Executor, ExecutorError, HardeningProfile};
+use super::traits::{ExecutionConfig, ExecutionHandle, Executor, ExecutorError, IoHandle};
 use async_trait::async_trait;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -46,6 +46,190 @@ impl DockerExecutor {
         DockerExecutor {
             network_name: DOCKER_NETWORK.to_string(),
         }
+    }
+
+    /// Execute in interactive PTY mode using portable-pty
+    async fn execute_interactive(
+        &self,
+        docker_args: Vec<String>,
+        container_name: String,
+        pty_size: Option<(u16, u16)>,
+        timeout_duration: std::time::Duration,
+        job_id: String,
+        exit_tx: oneshot::Sender<i32>,
+    ) -> Result<IoHandle, ExecutorError> {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        let (rows, cols) = pty_size.unwrap_or((24, 80));
+        let pty_system = native_pty_system();
+        let pty_pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| ExecutorError::SpawnFailed(format!("failed to create pty: {}", e)))?;
+
+        // Build command for PTY: docker run -it ...
+        let mut cmd_builder = CommandBuilder::new("docker");
+        cmd_builder.args(&docker_args);
+
+        // Spawn docker process in PTY
+        let mut pty_child = pty_pair.slave.spawn_command(cmd_builder).map_err(|e| {
+            ExecutorError::SpawnFailed(format!("failed to spawn docker in pty: {}", e))
+        })?;
+
+        // Get reader and writer for PTY master
+        let mut pty_reader = pty_pair.master.try_clone_reader().map_err(|e| {
+            ExecutorError::SpawnFailed(format!("failed to clone pty reader: {}", e))
+        })?;
+        let mut pty_writer = pty_pair
+            .master
+            .take_writer()
+            .map_err(|e| ExecutorError::SpawnFailed(format!("failed to take pty writer: {}", e)))?;
+
+        let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(128);
+        let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
+
+        // Spawn task to handle PTY I/O and cleanup
+        drop(tokio::spawn(async move {
+            // Task to read from PTY and send to stdout channel (blocking I/O in spawn_blocking)
+            let read_task = {
+                let stdout_tx = stdout_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    use std::io::Read;
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match pty_reader.read(&mut buf) {
+                            Ok(0) => break, // EOF
+                            Ok(n) => {
+                                if stdout_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                                    break; // Receiver dropped
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+            };
+
+            // Task to read from stdin channel and write to PTY
+            let write_task = tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                while let Some(data) = stdin_rx.blocking_recv() {
+                    if pty_writer.write_all(&data).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            // Wait for process with timeout
+            let result = tokio::time::timeout(timeout_duration, async {
+                pty_child.wait().map_err(std::io::Error::other)
+            })
+            .await;
+
+            let exit_code = match result {
+                Ok(Ok(status)) => status.exit_code() as i32,
+                Ok(Err(e)) => {
+                    tracing::error!(job_id = %job_id, error = %e, "error waiting for docker container");
+                    -1
+                }
+                Err(_) => {
+                    tracing::warn!(job_id = %job_id, "execution timed out, stopping docker container");
+                    let _ = pty_child.kill();
+                    // Also try to stop the container
+                    let _ = std::process::Command::new("docker")
+                        .args(["stop", "-t", "5", &container_name])
+                        .status();
+                    -1
+                }
+            };
+
+            let _ = exit_tx.send(exit_code);
+
+            // Wait for I/O tasks
+            let _ = tokio::join!(read_task, write_task);
+        }));
+
+        Ok(IoHandle::Pty {
+            stdin: stdin_tx,
+            stdout: stdout_rx,
+        })
+    }
+
+    /// Execute in piped mode with separate stdout/stderr streams
+    async fn execute_piped(
+        &self,
+        docker_args: Vec<String>,
+        container_name: String,
+        timeout_duration: std::time::Duration,
+        job_id: String,
+        exit_tx: oneshot::Sender<i32>,
+    ) -> Result<IoHandle, ExecutorError> {
+        let mut cmd = Command::new("docker");
+        let _ = cmd.args(&docker_args);
+        let _ = cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ExecutorError::SpawnFailed(format!("failed to spawn docker: {}", e)))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ExecutorError::SpawnFailed("failed to capture stdout".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ExecutorError::SpawnFailed("failed to capture stderr".to_string()))?;
+
+        let (stdout_tx, stdout_rx) = mpsc::channel(100);
+        let (stderr_tx, stderr_rx) = mpsc::channel(100);
+
+        drop(tokio::spawn(async move {
+            let stdout_reader = BufReader::new(stdout);
+            let stderr_reader = BufReader::new(stderr);
+
+            let stdout_task = tokio::spawn(async move {
+                let mut lines = stdout_reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let _ = stdout_tx.send(line).await;
+                }
+            });
+
+            let stderr_task = tokio::spawn(async move {
+                let mut lines = stderr_reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let _ = stderr_tx.send(line).await;
+                }
+            });
+
+            let exit_code = match timeout(timeout_duration, child.wait()).await {
+                Ok(Ok(status)) => status.code().unwrap_or(-1),
+                Ok(Err(e)) => {
+                    tracing::error!(job_id = %job_id, error = %e, "failed to wait for docker container");
+                    -1
+                }
+                Err(_) => {
+                    tracing::warn!(job_id = %job_id, "execution timed out, stopping docker container");
+                    let _ = Command::new("docker")
+                        .args(["stop", "-t", "5", &container_name])
+                        .status()
+                        .await;
+                    -1
+                }
+            };
+
+            let _ = exit_tx.send(exit_code);
+            let _ = tokio::join!(stdout_task, stderr_task);
+        }));
+
+        Ok(IoHandle::Piped {
+            stdout: stdout_rx,
+            stderr: stderr_rx,
+        })
     }
 
     /// Ensure Docker network exists for proxy connectivity
@@ -111,63 +295,8 @@ impl DockerExecutor {
     }
 }
 
-/// Adds security options to the docker command
-///
-/// Maps systemd hardening properties to Docker equivalents:
-/// - Capabilities: --cap-drop=ALL
-/// - Privileges: --security-opt=no-new-privileges
-/// - Filesystem: --read-only, --tmpfs
-/// - User: --user nobody
-fn add_security_options(cmd: &mut Command, _profile: &HardeningProfile) {
-    // Drop all capabilities
-    let _ = cmd.arg("--cap-drop=ALL");
-
-    // Prevent privilege escalation
-    let _ = cmd.arg("--security-opt=no-new-privileges");
-
-    // Read-only root filesystem
-    let _ = cmd.arg("--read-only");
-
-    // Private tmpfs for /tmp (noexec, nosuid, limited size)
-    let _ = cmd.arg("--tmpfs=/tmp:noexec,nosuid,size=64m");
-
-    // Run as non-root user (nobody:nogroup = 65534:65534)
-    let _ = cmd.arg("--user=65534:65534");
-
-    // Note: Seccomp profiles for HardeningProfile::Default vs JitRuntime
-    // would require shipping custom seccomp JSON profiles. For now, we use
-    // Docker's default seccomp which provides good baseline security.
-    // TODO: Add custom seccomp profiles for full parity with systemd
-}
-
-/// Adds resource limits to the docker command
-fn add_resource_limits(cmd: &mut Command, config: &ExecutionConfig) {
-    // Memory limit (matches systemd MemoryMax=4G)
-    let _ = cmd.arg("--memory=4g");
-
-    // PID limit (matches systemd TasksMax=512)
-    let _ = cmd.arg("--pids-limit=512");
-
-    // File descriptor limit (matches systemd LimitNOFILE=1024)
-    let _ = cmd.arg("--ulimit=nofile=1024:1024");
-
-    // Stop timeout for cleanup
-    let _ = cmd.arg(format!("--stop-timeout={}", config.timeout.as_secs()));
-}
-
-/// Adds network configuration to the docker command
-fn add_network_config(cmd: &mut Command, config: &ExecutionConfig, network_name: &str) {
-    if config.proxy_port.is_some() {
-        // Connect to nix-jail network for proxy access
-        let _ = cmd.arg("--network").arg(network_name);
-    } else {
-        // No network access at all
-        let _ = cmd.arg("--network=none");
-    }
-}
-
-/// Adds filesystem mounts to the docker command
-fn add_filesystem_mounts(cmd: &mut Command, config: &ExecutionConfig) {
+/// Adds filesystem mounts to the docker command arguments
+fn add_filesystem_mounts_to_args(args: &mut Vec<String>, config: &ExecutionConfig) {
     // Workspace (read-write)
     // Check for special docker-volume: prefix (from DockerVolumeWorkspace)
     let working_dir_str = config.working_dir.to_string_lossy();
@@ -179,20 +308,19 @@ fn add_filesystem_mounts(cmd: &mut Command, config: &ExecutionConfig) {
 
         if subpath.is_empty() {
             // Mount volume root as workspace
-            let _ = cmd.arg("-v").arg(format!("{}:/workspace", volume_name));
+            args.extend(["-v".to_string(), format!("{}:/workspace", volume_name)]);
         } else {
             // Mount volume and set working directory to subpath
             // The wrapper script will cd to the subpath
-            let _ = cmd
-                .arg("-v")
-                .arg(format!("{}:/workspace-root", volume_name));
-            let _ = cmd.arg("-e").arg(format!("WORKSPACE_SUBPATH={}", subpath));
+            args.extend(["-v".to_string(), format!("{}:/workspace-root", volume_name)]);
+            args.extend(["-e".to_string(), format!("WORKSPACE_SUBPATH={}", subpath)]);
         }
     } else {
         // Standard bind-mount from host filesystem
-        let _ = cmd
-            .arg("-v")
-            .arg(format!("{}:/workspace", config.working_dir.display()));
+        args.extend([
+            "-v".to_string(),
+            format!("{}:/workspace", config.working_dir.display()),
+        ]);
     };
 
     // Nix store based on strategy
@@ -201,48 +329,53 @@ fn add_filesystem_mounts(cmd: &mut Command, config: &ExecutionConfig) {
             // Mount entire root's /nix/store
             let store_dir = config.root_dir.join("nix/store");
             if store_dir.exists() {
-                let _ = cmd
-                    .arg("-v")
-                    .arg(format!("{}:/nix/store:ro", store_dir.display()));
+                args.extend([
+                    "-v".to_string(),
+                    format!("{}:/nix/store:ro", store_dir.display()),
+                ]);
             }
         }
         crate::root::StoreSetup::BindMounts { paths } => {
             // Bind-mount each store path from host
             for path in paths {
-                let _ = cmd
-                    .arg("-v")
-                    .arg(format!("{}:{}:ro", path.display(), path.display()));
+                args.extend([
+                    "-v".to_string(),
+                    format!("{}:{}:ro", path.display(), path.display()),
+                ]);
             }
         }
         crate::root::StoreSetup::DockerVolume { name } => {
             // Mount named Docker volume containing Nix store
             // The volume was pre-populated by DockerVolumeJobRoot
-            let _ = cmd.arg("-v").arg(format!("{}:/nix:ro", name));
+            args.extend(["-v".to_string(), format!("{}:/nix:ro", name)]);
         }
     }
 
     // SSL certificates for proxy (CA cert is written to job root directory)
     let ca_cert_path = config.root_dir.join("etc/ssl/certs/ca-certificates.crt");
     if ca_cert_path.exists() {
-        let _ = cmd.arg("-v").arg(format!(
-            "{}:/etc/ssl/certs/ca-certificates.crt:ro",
-            ca_cert_path.display()
-        ));
+        args.extend([
+            "-v".to_string(),
+            format!(
+                "{}:/etc/ssl/certs/ca-certificates.crt:ro",
+                ca_cert_path.display()
+            ),
+        ]);
     }
 
     // Cache volumes from resolved cache mounts
     for mount in &config.cache_mounts {
         // For Docker, prefer named volumes if configured, else bind-mount host path
         if let Some(ref volume_name) = mount.docker_volume {
-            let _ = cmd
-                .arg("-v")
-                .arg(format!("{}:{}", volume_name, mount.mount_path));
+            args.extend([
+                "-v".to_string(),
+                format!("{}:{}", volume_name, mount.mount_path),
+            ]);
         } else {
-            let _ = cmd.arg("-v").arg(format!(
-                "{}:{}",
-                mount.host_path.display(),
-                mount.mount_path
-            ));
+            args.extend([
+                "-v".to_string(),
+                format!("{}:{}", mount.host_path.display(), mount.mount_path),
+            ]);
         }
     }
 }
@@ -315,77 +448,89 @@ impl Executor for DockerExecutor {
             _ => resolve_command_in_closure(command, &config.store_paths),
         };
 
-        // Build docker run command
+        // Build docker command arguments (shared between interactive and piped modes)
         let container_name = format!("nix-jail-{}", job_id);
-        let mut cmd = Command::new("docker");
-        let _ = cmd.arg("run");
+        let mut docker_args = vec![
+            "run".to_string(),
+            "--name".to_string(),
+            container_name.clone(),
+            "--rm".to_string(), // Auto-remove on exit
+        ];
 
-        // Container identification
-        let _ = cmd.arg("--name").arg(&container_name);
-        let _ = cmd.arg("--rm"); // Auto-remove on exit
+        // Add -it flags for interactive mode (allocates TTY and keeps stdin open)
+        if config.interactive {
+            docker_args.push("-it".to_string());
+        }
 
         // Security options
-        add_security_options(&mut cmd, &config.hardening_profile);
+        docker_args.extend([
+            "--cap-drop=ALL".to_string(),
+            "--security-opt=no-new-privileges".to_string(),
+            "--read-only".to_string(),
+            "--tmpfs=/tmp:noexec,nosuid,size=64m".to_string(),
+            "--user=65534:65534".to_string(),
+        ]);
 
         // Resource limits
-        add_resource_limits(&mut cmd, &config);
+        docker_args.extend([
+            "--memory=4g".to_string(),
+            "--pids-limit=512".to_string(),
+            "--ulimit=nofile=1024:1024".to_string(),
+            format!("--stop-timeout={}", config.timeout.as_secs()),
+        ]);
 
         // Network configuration
-        add_network_config(&mut cmd, &config, &self.network_name);
+        if config.proxy_port.is_some() {
+            docker_args.extend(["--network".to_string(), self.network_name.clone()]);
+        } else {
+            docker_args.push("--network=none".to_string());
+        }
 
         // Filesystem mounts
-        add_filesystem_mounts(&mut cmd, &config);
+        add_filesystem_mounts_to_args(&mut docker_args, &config);
 
         // Environment variables
-        // Set TERM=dumb to prevent ANSI escape codes
-        let _ = cmd.arg("-e").arg("TERM=dumb");
+        // Set TERM based on interactive mode
+        if config.interactive {
+            docker_args.extend(["-e".to_string(), "TERM=xterm-256color".to_string()]);
+        } else {
+            docker_args.extend(["-e".to_string(), "TERM=dumb".to_string()]);
+        }
 
         // Cache environment variables from resolved cache mounts
         for mount in &config.cache_mounts {
             if let Some(ref env_var) = mount.env_var {
-                let _ = cmd
-                    .arg("-e")
-                    .arg(format!("{}={}", env_var, mount.mount_path));
+                docker_args.extend([
+                    "-e".to_string(),
+                    format!("{}={}", env_var, mount.mount_path),
+                ]);
             }
         }
 
         for (key, value) in &config.env {
-            let _ = cmd.arg("-e").arg(format!("{}={}", key, value));
+            docker_args.extend(["-e".to_string(), format!("{}={}", key, value)]);
         }
 
         // Working directory inside container
-        let _ = cmd.arg("-w").arg("/workspace");
+        docker_args.extend(["-w".to_string(), "/workspace".to_string()]);
 
         // Choose base image based on store setup strategy
         let base_image = match &config.store_setup {
-            crate::root::StoreSetup::DockerVolume { .. } => {
-                // For DockerVolume, use busybox (minimal image, no package manager)
-                // Volume provides /nix/store/* and /nix/bin/* symlinks
-                // Can't use scratch directly with docker run - it's only for Dockerfiles
-                "busybox"
-            }
-            _ => {
-                // For other strategies, use nixos/nix which has Nix installed
-                "nixos/nix:latest"
-            }
+            crate::root::StoreSetup::DockerVolume { .. } => "busybox",
+            _ => "nixos/nix:latest",
         };
-        let _ = cmd.arg(base_image);
+        docker_args.push(base_image.to_string());
 
         // Command to execute
         // For DockerVolume, wrap in a shell that sets up PATH from /nix/store/*/bin
         match &config.store_setup {
             crate::root::StoreSetup::DockerVolume { .. } => {
-                // Run through busybox's /bin/sh to set PATH, then exec the Nix binary
                 // Shell-escape arguments by wrapping in single quotes and escaping single quotes
                 let escaped_cmd = resolved_command
                     .iter()
                     .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
                     .collect::<Vec<_>>()
                     .join(" ");
-                // Handle WORKSPACE_SUBPATH for DockerVolumeWorkspace (cd to subpath first)
-                // The subpath is set via WORKSPACE_SUBPATH env var in add_filesystem_mounts()
-                // Also mark /workspace-root as safe for git (ownership mismatch in Docker)
-                // We set GIT_CONFIG_COUNT to inject safe.directory config without needing git binary
                 let wrapper_script = format!(
                     r#"export PATH="/nix/bin:$PATH" && \
                     export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/workspace-root && \
@@ -393,94 +538,45 @@ impl Executor for DockerExecutor {
                     exec {}"#,
                     escaped_cmd
                 );
-                let _ = cmd.arg("/bin/sh").arg("-c").arg(wrapper_script);
+                docker_args.extend(["/bin/sh".to_string(), "-c".to_string(), wrapper_script]);
             }
             _ => {
-                for arg in &resolved_command {
-                    let _ = cmd.arg(arg);
-                }
+                docker_args.extend(resolved_command.iter().cloned());
             }
         }
 
-        // Configure stdio
-        let _ = cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        tracing::debug!(args = ?docker_args, container = %container_name, interactive = config.interactive, "spawning docker container");
 
-        tracing::debug!(command = ?cmd, container = %container_name, "spawning docker container");
-
-        // Spawn the process
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ExecutorError::SpawnFailed(format!("failed to spawn docker: {}", e)))?;
-
-        // Capture stdout and stderr
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ExecutorError::SpawnFailed("failed to capture stdout".to_string()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| ExecutorError::SpawnFailed("failed to capture stderr".to_string()))?;
-
-        // Create channels for streaming output
-        let (stdout_tx, stdout_rx) = mpsc::channel(100);
-        let (stderr_tx, stderr_rx) = mpsc::channel(100);
+        // Branch based on interactive mode
         let (exit_tx, exit_rx) = oneshot::channel();
-
-        let container_name_clone = container_name.clone();
         let timeout_duration = config.timeout;
         let job_id_clone = job_id.to_string();
 
-        // Spawn task to handle process execution and output streaming
-        drop(tokio::spawn(async move {
-            let stdout_reader = BufReader::new(stdout);
-            let stderr_reader = BufReader::new(stderr);
-
-            // Spawn tasks for stdout and stderr streaming
-            let stdout_task = tokio::spawn(async move {
-                let mut lines = stdout_reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = stdout_tx.send(line).await;
-                }
-            });
-
-            let stderr_task = tokio::spawn(async move {
-                let mut lines = stderr_reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = stderr_tx.send(line).await;
-                }
-            });
-
-            // Wait for process with timeout
-            let exit_code = match timeout(timeout_duration, child.wait()).await {
-                Ok(Ok(status)) => status.code().unwrap_or(-1),
-                Ok(Err(e)) => {
-                    tracing::error!(job_id = %job_id_clone, error = %e, "failed to wait for docker container");
-                    -1
-                }
-                Err(_) => {
-                    tracing::warn!(job_id = %job_id_clone, "execution timed out, stopping docker container");
-                    // Timeout - stop the container
-                    let _ = Command::new("docker")
-                        .args(["stop", "-t", "5", &container_name_clone])
-                        .status()
-                        .await;
-                    -1
-                }
-            };
-
-            // Send exit code
-            let _ = exit_tx.send(exit_code);
-
-            // Wait for output tasks to complete
-            let _ = tokio::join!(stdout_task, stderr_task);
-        }));
+        let io_handle = if config.interactive {
+            // PTY mode: use portable-pty for interactive terminal
+            self.execute_interactive(
+                docker_args,
+                container_name,
+                config.pty_size,
+                timeout_duration,
+                job_id_clone,
+                exit_tx,
+            )
+            .await?
+        } else {
+            // Piped mode: separate stdout/stderr with line-based streaming
+            self.execute_piped(
+                docker_args,
+                container_name,
+                timeout_duration,
+                job_id_clone,
+                exit_tx,
+            )
+            .await?
+        };
 
         Ok(ExecutionHandle {
-            io: super::traits::IoHandle::Piped {
-                stdout: stdout_rx,
-                stderr: stderr_rx,
-            },
+            io: io_handle,
             exit_code: exit_rx,
         })
     }
@@ -579,13 +675,11 @@ mod tests {
 
         let executor = DockerExecutor::new();
         let result = executor.execute(config).await;
-        assert!(result.is_err());
-        match result {
-            Err(ExecutorError::SpawnFailed(msg)) => {
-                assert!(msg.contains("root directory not found"));
-            }
-            _ => panic!("expected SpawnFailed error for missing root directory"),
-        }
+        assert!(
+            matches!(&result, Err(ExecutorError::SpawnFailed(msg)) if msg.contains("root directory not found")),
+            "expected SpawnFailed error for missing root directory, got {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -598,13 +692,11 @@ mod tests {
 
         let executor = DockerExecutor::new();
         let result = executor.execute(config).await;
-        assert!(result.is_err());
-        match result {
-            Err(ExecutorError::SpawnFailed(msg)) => {
-                assert!(msg.contains("command cannot be empty"));
-            }
-            _ => panic!("expected SpawnFailed error for empty command"),
-        }
+        assert!(
+            matches!(&result, Err(ExecutorError::SpawnFailed(msg)) if msg.contains("command cannot be empty")),
+            "expected SpawnFailed error for empty command, got {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -718,5 +810,33 @@ mod tests {
             return;
         }
         executor_tests::test_empty_command_error(&DockerExecutor::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_docker_interactive_mode() {
+        use crate::executor::test_helpers::{collect_pty_output, TestConfigBuilder};
+
+        if !docker_available().await {
+            return;
+        }
+
+        let executor = DockerExecutor::new();
+        let config = TestConfigBuilder::new("test-interactive")
+            .command(vec!["echo", "hello from pty"])
+            .interactive(true)
+            .pty_size(24, 80)
+            .build();
+
+        let handle = executor.execute(config).await.expect("execution failed");
+        let output = collect_pty_output(handle).await;
+
+        // Convert PTY output to string (may contain ANSI codes)
+        let output_str = String::from_utf8_lossy(&output.output);
+        assert!(
+            output_str.contains("hello from pty"),
+            "expected 'hello from pty' in output, got: {}",
+            output_str
+        );
+        assert_eq!(output.exit_code, 0, "expected exit code 0");
     }
 }

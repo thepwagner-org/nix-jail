@@ -234,3 +234,83 @@ impl<T: LogSink + ?Sized> LogSink for Arc<T> {
         (**self).done(job_id, exit_code)
     }
 }
+
+#[cfg(test)]
+pub mod test_helpers {
+    use super::*;
+
+    /// A log sink that captures messages for testing
+    #[derive(Debug, Default)]
+    pub struct CapturingLogSink {
+        messages: Mutex<Vec<(String, LogSource, String)>>,
+    }
+
+    impl CapturingLogSink {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Get all captured messages
+        pub fn messages(&self) -> Vec<(String, LogSource, String)> {
+            self.messages.lock().unwrap().clone()
+        }
+
+        /// Check if any message contains the given substring
+        pub fn contains(&self, substring: &str) -> bool {
+            self.messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, msg)| msg.contains(substring))
+        }
+    }
+
+    impl LogSink for CapturingLogSink {
+        fn log(&self, job_id: &str, source: LogSource, message: &str) {
+            self.messages
+                .lock()
+                .unwrap()
+                .push((job_id.to_string(), source, message.to_string()));
+        }
+
+        fn done(&self, job_id: &str, exit_code: i32) {
+            self.log(
+                job_id,
+                LogSource::System,
+                &format!("job completed exit_code={}", exit_code),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_info_contains_nix_jail() {
+        let formatted = format_info("test message");
+        assert!(formatted.contains("nix_jail:"));
+        assert!(formatted.contains("INFO"));
+        assert!(formatted.contains("test message"));
+    }
+
+    #[test]
+    fn test_format_error_contains_error_level() {
+        let formatted = format_error("error message");
+        assert!(formatted.contains("nix_jail:"));
+        assert!(formatted.contains("ERROR"));
+        assert!(formatted.contains("error message"));
+    }
+
+    #[test]
+    fn test_capturing_log_sink() {
+        let sink = test_helpers::CapturingLogSink::new();
+        sink.info("job-1", "hello world");
+
+        assert!(sink.contains("hello world"));
+        let messages = sink.messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, "job-1");
+    }
+}

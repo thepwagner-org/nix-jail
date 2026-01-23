@@ -258,11 +258,13 @@ impl Drop for JobMetricsGuard {
 ///
 /// # Arguments
 /// * `ephemeral_credentials` - Client-provided credentials valid only for this job (not persisted)
+/// * `job_env` - Client-provided environment variables for this job (merged with server defaults, server wins)
 pub async fn execute_job(
     job: JobMetadata,
     ctx: ExecuteJobContext,
     interactive: bool,
     ephemeral_credentials: Vec<EphemeralCredential>,
+    job_env: HashMap<String, String>,
 ) {
     tracing::debug!(status = %job.status.to_string(), "executing job");
 
@@ -287,10 +289,17 @@ pub async fn execute_job(
     let log_sink: Arc<dyn LogSink> = Arc::new(StorageLogSink::new(storage.clone(), tx.clone()));
 
     let job_id = job.id.clone();
+
+    // Log job start with version info for debugging (visible in job output)
+    log_sink.info(
+        &job_id,
+        &format!("nix-jail v{} job={}", env!("NIX_JAIL_VERSION"), job_id),
+    );
     let packages = job.packages.clone();
     let script = job.script.clone();
     let repo = job.repo.clone();
     let path = job.path.clone();
+    let extra_paths = job.extra_paths.clone();
     let git_ref = job.git_ref.clone();
     let is_exec_mode = !packages.is_empty();
     // Fetch GitHub token if needed for git cloning
@@ -357,6 +366,7 @@ pub async fn execute_job(
                 &repo,
                 git_ref.as_deref(),
                 Some(&path),
+                &extra_paths,
                 github_token.as_deref(),
             )
             .instrument(tracing::info_span!("setup_workspace"))
@@ -545,6 +555,13 @@ pub async fn execute_job(
         // Non-fatal: continue execution
     }
 
+    // Create sandbox home directory (/home/{user} with XDG subdirs)
+    let sandbox_user = executor.sandbox_user();
+    if let Err(e) = crate::executor::exec::create_home_directory(&job_dir.root, sandbox_user) {
+        log_sink.error(&job_id, &format!("Failed to create home directory: {}", e));
+        // Non-fatal: continue execution
+    }
+
     // Phase 2: Start proxy now that root exists (proxy writes cert to root/etc/ssl/certs/)
     let mut proxy = match start_proxy_if_configured(
         &job_id,
@@ -569,12 +586,14 @@ pub async fn execute_job(
     let tmp_dir = workspace_dir.join("tmp");
     let _ = std::fs::create_dir_all(&tmp_dir);
 
-    // Chown job directory to nix-jail so jobs can write to it
-    // (daemon runs as root, jobs run as nix-jail user)
-    {
+    // Chown job directory to sandbox user so jobs can write to it
+    // (daemon runs as root, jobs run as sandbox user)
+    // Skip chown when sandbox_user is None (e.g., macOS sandbox-exec runs as current user)
+    if let Some((user, group)) = sandbox_user {
         let _span = tracing::info_span!("chown_job_dir").entered();
+        let owner = format!("{}:{}", user, group);
         if let Err(e) = std::process::Command::new("chown")
-            .args(["-R", "nix-jail:nix-jail", &job_dir.base.to_string_lossy()])
+            .args(["-R", &owner, &job_dir.base.to_string_lossy()])
             .output()
         {
             tracing::warn!(job_id = %job_id, error = %e, "failed to chown job directory");
@@ -582,17 +601,33 @@ pub async fn execute_job(
     }
 
     // Configure execution environment
-    // In server mode, workspace_dir is already isolated, so HOME=workspace_dir is fine
+    // Paths inside the chroot:
+    // - HOME = /home/{user} (isolated from workspace)
+    // - workspace root = /workspace (where .git lives)
+    // - working dir = /workspace/projects/foo (where commands run)
     let mut env = {
         let _span = tracing::info_span!("build_environment").entered();
+        // Use chroot-relative paths when using chroot, else host paths
+        let (home_dir_for_env, workspace_root_for_env) = if executor.uses_chroot() {
+            let user = sandbox_user.map(|(u, _)| u).unwrap_or("sandbox");
+            (
+                PathBuf::from(format!("/home/{}", user)),
+                PathBuf::from("/workspace"),
+            )
+        } else {
+            // Local mode: use workspace as home (matches existing behavior)
+            (workspace_dir.clone(), job_dir.workspace.clone())
+        };
         build_environment(
             proxy.as_ref(),
             &workspace_dir,
-            &workspace_dir, // home_dir = workspace_dir in server mode (isolated chroot)
+            &home_dir_for_env,
+            &workspace_root_for_env,
             executor.proxy_connect_host(),
             executor.uses_chroot(),
             &job_dir.root,
-            &[], // Server path doesn't support extra env vars
+            &job_env,
+            &config.default_env,
         )
     };
 
@@ -1471,14 +1506,17 @@ async fn run_populate_phase(
     Ok(exit_code)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_environment(
     proxy: Option<&ProxyManager>,
     working_dir: &Path,
     home_dir: &Path,
+    workspace_root: &Path,
     proxy_connect_host: &str,
     uses_chroot: bool,
     root_dir: &Path,
-    extra_env: &[(String, String)],
+    job_env: &HashMap<String, String>,
+    server_env: &[(String, String)],
 ) -> HashMap<String, String> {
     let mut env = HashMap::new();
 
@@ -1511,13 +1549,35 @@ fn build_environment(
 
     // Sandbox isolation - HOME is separate from working_dir in local mode
     // to avoid project's .claude/ shadowing user config
-    let _ = env.insert("HOME".to_string(), home_dir.to_string_lossy().to_string());
+    let home_str = home_dir.to_string_lossy().to_string();
+    let _ = env.insert("HOME".to_string(), home_str.clone());
 
     let _ = env.insert("USER".to_string(), "sbc-admin".to_string());
     let _ = env.insert("LOGNAME".to_string(), "sbc-admin".to_string());
 
-    // Temp directory within workspace (writable)
-    let tmp_dir = working_dir.join("tmp");
+    // XDG Base Directory Specification - isolate application data within sandbox home
+    // This ensures tools like OpenCode store their data in the sandbox, not on the host
+    let _ = env.insert(
+        "XDG_DATA_HOME".to_string(),
+        format!("{}/.local/share", home_str),
+    );
+    let _ = env.insert(
+        "XDG_CONFIG_HOME".to_string(),
+        format!("{}/.config", home_str),
+    );
+    let _ = env.insert("XDG_CACHE_HOME".to_string(), format!("{}/.cache", home_str));
+    let _ = env.insert(
+        "XDG_STATE_HOME".to_string(),
+        format!("{}/.local/state", home_str),
+    );
+
+    // Temp directory - use /tmp which is isolated by systemd's PrivateTmp=true
+    // In chroot mode, /tmp is a private mount; in local mode, use workspace/tmp
+    let tmp_dir = if uses_chroot {
+        PathBuf::from("/tmp")
+    } else {
+        working_dir.join("tmp")
+    };
     let _ = env.insert("TMPDIR".to_string(), tmp_dir.to_string_lossy().to_string());
 
     // Set minimal locale with UTF-8 support (C.UTF-8 is available on most Linux systems)
@@ -1533,9 +1593,19 @@ fn build_environment(
         }
     }
 
-    // Merge user-provided environment variables (overrides defaults)
-    for (key, value) in extra_env {
-        let _ = env.insert(key.clone(), value.clone());
+    // Interpolate placeholders in env var values
+    let workspace_root_str = workspace_root.to_string_lossy();
+    let interpolate =
+        |value: &str| -> String { value.replace("${WORKSPACE_ROOT}", &workspace_root_str) };
+
+    // Merge environment variables with proper precedence:
+    // 1. Job-specific env (from request) - applied first, with interpolation
+    for (key, value) in job_env {
+        let _ = env.insert(key.clone(), interpolate(value));
+    }
+    // 2. Server defaults (from config) - override job env ("server wins")
+    for (key, value) in server_env {
+        let _ = env.insert(key.clone(), interpolate(value));
     }
 
     env
@@ -2077,6 +2147,13 @@ pub async fn execute_local(
         // Non-fatal: continue execution
     }
 
+    // Create sandbox home directory (/home/{user} with XDG subdirs)
+    let sandbox_user = executor.sandbox_user();
+    if let Err(e) = crate::executor::exec::create_home_directory(&job_dir.root, sandbox_user) {
+        log_sink.error(&job_id, &format!("Failed to create home directory: {}", e));
+        // Non-fatal: continue execution
+    }
+
     // Phase 4: Start proxy if configured
     let mut proxy = start_proxy_if_configured(
         &job_id,
@@ -2096,23 +2173,29 @@ pub async fn execute_local(
     let home_dir = job_dir.base.join("home");
     let _ = std::fs::create_dir_all(&home_dir);
 
-    // Chown job directory to nix-jail so jobs can write to it
-    // (daemon runs as root, jobs run as nix-jail user)
-    if let Err(e) = std::process::Command::new("chown")
-        .args(["-R", "nix-jail:nix-jail", &job_dir.base.to_string_lossy()])
-        .output()
-    {
-        tracing::warn!(job_id = %job_id, error = %e, "failed to chown job directory");
+    // Chown job directory to sandbox user so jobs can write to it
+    // (daemon runs as root, jobs run as sandbox user)
+    // Skip chown when sandbox_user is None (e.g., macOS sandbox-exec runs as current user)
+    if let Some((user, group)) = sandbox_user {
+        let owner = format!("{}:{}", user, group);
+        if let Err(e) = std::process::Command::new("chown")
+            .args(["-R", &owner, &job_dir.base.to_string_lossy()])
+            .output()
+        {
+            tracing::warn!(job_id = %job_id, error = %e, "failed to chown job directory");
+        }
     }
 
     let mut env = build_environment(
         proxy.as_ref(),
         &config.working_dir,
         &home_dir, // Separate home directory to avoid project .claude/ shadowing user config
+        &config.working_dir, // workspace_root = working_dir in local mode
         executor.proxy_connect_host(),
         executor.uses_chroot(),
         &job_dir.root,
-        &config.env,
+        &HashMap::new(), // No job-specific env in local mode
+        &config.env,     // Local config env acts as server defaults
     );
 
     // Update PATH, NIX_LDFLAGS, NIX_CFLAGS_COMPILE with package paths
@@ -2476,5 +2559,218 @@ mod tests {
         assert_eq!(cred.header_format, "token {token}");
         assert!(!cred.redact_response);
         assert!(!cred.extract_llm_metrics);
+    }
+
+    #[test]
+    fn test_build_environment_xdg_vars() {
+        let working_dir = PathBuf::from("/workspace");
+        let home_dir = PathBuf::from("/sandbox/home");
+        let workspace_root = PathBuf::from("/workspace");
+        let root_dir = PathBuf::from("/sandbox/root");
+
+        let env = build_environment(
+            None, // No proxy
+            &working_dir,
+            &home_dir,
+            &workspace_root,
+            "127.0.0.1",
+            false, // No chroot
+            &root_dir,
+            &HashMap::new(),
+            &[],
+        );
+
+        // Verify XDG vars are set relative to home_dir
+        assert_eq!(
+            env.get("XDG_DATA_HOME").unwrap(),
+            "/sandbox/home/.local/share"
+        );
+        assert_eq!(env.get("XDG_CONFIG_HOME").unwrap(), "/sandbox/home/.config");
+        assert_eq!(env.get("XDG_CACHE_HOME").unwrap(), "/sandbox/home/.cache");
+        assert_eq!(
+            env.get("XDG_STATE_HOME").unwrap(),
+            "/sandbox/home/.local/state"
+        );
+
+        // Verify HOME is set
+        assert_eq!(env.get("HOME").unwrap(), "/sandbox/home");
+    }
+
+    #[test]
+    fn test_build_environment_env_merging_server_wins() {
+        let working_dir = PathBuf::from("/workspace");
+        let home_dir = PathBuf::from("/sandbox/home");
+        let root_dir = PathBuf::from("/sandbox/root");
+
+        // Job env: set both a unique var and one that conflicts with server
+        let mut job_env = HashMap::new();
+        let _ = job_env.insert("JOB_SPECIFIC".to_string(), "from-job".to_string());
+        let _ = job_env.insert("SHARED_VAR".to_string(), "from-job".to_string());
+
+        // Server env: set a server-specific var and override the shared one
+        let server_env = vec![
+            ("SERVER_SPECIFIC".to_string(), "from-server".to_string()),
+            ("SHARED_VAR".to_string(), "from-server".to_string()),
+        ];
+
+        let env = build_environment(
+            None,
+            &working_dir,
+            &home_dir,
+            &working_dir,
+            "127.0.0.1",
+            false,
+            &root_dir,
+            &job_env,
+            &server_env,
+        );
+
+        // Job-specific var should be present
+        assert_eq!(env.get("JOB_SPECIFIC").unwrap(), "from-job");
+
+        // Server-specific var should be present
+        assert_eq!(env.get("SERVER_SPECIFIC").unwrap(), "from-server");
+
+        // Shared var should be from server (server wins)
+        assert_eq!(env.get("SHARED_VAR").unwrap(), "from-server");
+    }
+
+    #[test]
+    fn test_build_environment_opencode_sandbox_vars() {
+        let working_dir = PathBuf::from("/workspace");
+        let home_dir = PathBuf::from("/sandbox/home");
+        let root_dir = PathBuf::from("/sandbox/root");
+
+        // Simulate OpenCode sandbox configuration
+        let server_env = vec![
+            (
+                "OPENCODE_DISABLE_LSP_DOWNLOAD".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "OPENCODE_DISABLE_AUTOUPDATE".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "OPENCODE_DISABLE_MODELS_FETCH".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "ANTHROPIC_API_KEY".to_string(),
+                "opencode-anthropic-dummy".to_string(),
+            ),
+        ];
+
+        let env = build_environment(
+            None,
+            &working_dir,
+            &home_dir,
+            &working_dir,
+            "127.0.0.1",
+            false,
+            &root_dir,
+            &HashMap::new(),
+            &server_env,
+        );
+
+        // Verify OpenCode sandbox vars are set
+        assert_eq!(env.get("OPENCODE_DISABLE_LSP_DOWNLOAD").unwrap(), "true");
+        assert_eq!(env.get("OPENCODE_DISABLE_AUTOUPDATE").unwrap(), "true");
+        assert_eq!(env.get("OPENCODE_DISABLE_MODELS_FETCH").unwrap(), "true");
+        assert_eq!(
+            env.get("ANTHROPIC_API_KEY").unwrap(),
+            "opencode-anthropic-dummy"
+        );
+
+        // Verify XDG vars are also set (for OpenCode data isolation)
+        assert!(env.contains_key("XDG_DATA_HOME"));
+        assert!(env.contains_key("XDG_CONFIG_HOME"));
+    }
+
+    #[test]
+    fn test_build_environment_workspace_root_interpolation() {
+        let working_dir = PathBuf::from("/workspace/project");
+        let home_dir = PathBuf::from("/sandbox/home");
+        let workspace_root = PathBuf::from("/workspace");
+        let root_dir = PathBuf::from("/sandbox/root");
+
+        // Job env with ${WORKSPACE_ROOT} placeholder
+        let mut job_env = HashMap::new();
+        let _ = job_env.insert(
+            "MEOW_REPO_PATH".to_string(),
+            "${WORKSPACE_ROOT}".to_string(),
+        );
+        let _ = job_env.insert(
+            "SOME_PATH".to_string(),
+            "${WORKSPACE_ROOT}/subdir".to_string(),
+        );
+        let _ = job_env.insert("NORMAL_VAR".to_string(), "unchanged".to_string());
+
+        let env = build_environment(
+            None,
+            &working_dir,
+            &home_dir,
+            &workspace_root,
+            "127.0.0.1",
+            false,
+            &root_dir,
+            &job_env,
+            &[],
+        );
+
+        // ${WORKSPACE_ROOT} should be replaced with actual path
+        assert_eq!(env.get("MEOW_REPO_PATH").unwrap(), "/workspace");
+        assert_eq!(env.get("SOME_PATH").unwrap(), "/workspace/subdir");
+
+        // Normal vars should be unchanged
+        assert_eq!(env.get("NORMAL_VAR").unwrap(), "unchanged");
+    }
+
+    #[test]
+    fn test_version_info_available_at_compile_time() {
+        // Verify the build.rs env var is set and contains a reasonable value
+        let version = env!("NIX_JAIL_VERSION");
+
+        // Version should look like semver (e.g., "0.15.6")
+        assert!(
+            version.contains('.'),
+            "version should contain dots: {}",
+            version
+        );
+
+        // Format string should work
+        let formatted = format!("nix-jail v{} job=test", version);
+        assert!(formatted.starts_with("nix-jail v"));
+        assert!(formatted.contains("job="));
+    }
+
+    #[test]
+    fn test_version_logged_via_log_sink() {
+        use crate::log_sink::test_helpers::CapturingLogSink;
+
+        let sink = CapturingLogSink::new();
+        let job_id = "test-job-123";
+
+        // Simulate what execute_job does
+        sink.info(
+            job_id,
+            &format!("nix-jail v{} job={}", env!("NIX_JAIL_VERSION"), job_id),
+        );
+
+        // Verify the message was logged
+        assert!(
+            sink.contains("nix-jail v"),
+            "version prefix not found in logs"
+        );
+        assert!(
+            sink.contains(env!("NIX_JAIL_VERSION")),
+            "version number not found in logs"
+        );
+        assert!(sink.contains("job="), "job_id not found in logs");
+
+        // Check it's the first message
+        let messages = sink.messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, job_id);
     }
 }

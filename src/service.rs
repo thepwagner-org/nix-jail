@@ -180,6 +180,7 @@ impl JailService for JailServiceImpl {
             hardening_profile: req.hardening_profile.clone(),
             push: req.push.unwrap_or(false),
             caches: req.caches.clone(),
+            extra_paths: req.extra_paths.clone(),
             status: JobStatus::Running,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -199,6 +200,8 @@ impl JailService for JailServiceImpl {
         let metrics_for_exec = this.metrics.clone();
         // Ephemeral credentials are NOT saved to JobMetadata (security: never persist)
         let ephemeral_credentials_for_exec = req.ephemeral_credentials.clone();
+        // Job-specific env vars (not saved to JobMetadata, merged with server defaults)
+        let job_env_for_exec = req.env.clone();
 
         // Create broadcast channel for this job
         let (log_tx, _) = tokio::sync::broadcast::channel(1000);
@@ -250,6 +253,7 @@ impl JailService for JailServiceImpl {
                     },
                     interactive,
                     ephemeral_credentials_for_exec,
+                    job_env_for_exec,
                 )
                 .await;
             }
@@ -529,28 +533,22 @@ impl JailService for JailServiceImpl {
 
         tracing::info!("gc requested");
 
-        // Get stats before GC to calculate bytes freed
-        let stats_before = self
+        // Run GC to delete all cache entries
+        let stats = self
             .cache_manager
-            .stats()
-            .map_err(|e| Status::internal(format!("failed to get cache stats: {}", e)))?;
-
-        // Run GC with target of 0 bytes (delete everything)
-        let deleted_count = self
-            .cache_manager
-            .gc(0)
+            .gc()
             .await
             .map_err(|e| Status::internal(format!("gc failed: {}", e)))?;
 
+        let total_deleted = stats.nix_entries_deleted + stats.workspace_entries_deleted;
         tracing::info!(
-            deleted_count,
-            bytes_freed = stats_before.total_size_bytes,
+            nix_deleted = stats.nix_entries_deleted,
+            workspace_deleted = stats.workspace_entries_deleted,
             "gc completed"
         );
 
         Ok(Response::new(crate::jail::GcResponse {
-            deleted_count: deleted_count as u32,
-            bytes_freed: stats_before.total_size_bytes,
+            deleted_count: total_deleted as u32,
         }))
     }
 }

@@ -74,6 +74,17 @@ message JobRequest {
   // Useful for short-lived tokens (GitHub App, OAuth) that the client
   // generates on-demand.
   repeated EphemeralCredential ephemeral_credentials = 12;
+
+  // Environment variables for this job (optional)
+  // These are merged with server defaults (server wins on conflicts).
+  // Useful for passing job-specific configuration.
+  map<string, string> env = 13;
+
+  // Additional paths to include in sparse checkout (for cross-project dependencies)
+  // These paths are checked out alongside the main `path` to support projects
+  // that reference other projects in the monorepo (e.g., shell.nix with `projects.foo`).
+  // Example: ["projects/meow", "projects/shared-lib"]
+  repeated string extra_paths = 14;
 }
 
 // A credential provided by the client, valid only for this job
@@ -295,9 +306,6 @@ message GcRequest {}
 message GcResponse {
   // Number of cache entries deleted
   uint32 deleted_count = 1;
-
-  // Total bytes freed
-  int64 bytes_freed = 2;
 }
 
 // The jail service for managing sandboxed jobs

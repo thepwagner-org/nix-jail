@@ -515,6 +515,37 @@ pub fn sparse_checkout_from_mirror(
         ))));
     }
 
+    // Step 4: Remove extensions.worktreeConfig to make libgit2 happy
+    // Sparse checkout sets this extension, but libgit2 doesn't support it and fails
+    // with "unsupported extension name extensions.worktreeconfig"
+    let unset_output = Command::new("git")
+        .args([
+            "-C",
+            &target_dir.to_string_lossy(),
+            "config",
+            "--unset",
+            "extensions.worktreeConfig",
+        ])
+        .output();
+
+    match unset_output {
+        Ok(output) if output.status.success() => {
+            tracing::debug!("removed extensions.worktreeConfig for libgit2 compatibility");
+        }
+        Ok(output) => {
+            // Exit code 5 means the key doesn't exist, which is fine
+            if output.status.code() != Some(5) {
+                tracing::warn!(
+                    stderr = %String::from_utf8_lossy(&output.stderr),
+                    "failed to unset extensions.worktreeConfig"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to run git config --unset");
+        }
+    }
+
     tracing::info!(
         repo = %repo_url,
         reference = ?reference_path.map(|p| p.display().to_string()),

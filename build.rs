@@ -1,4 +1,14 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Read version from version.toml
+    let version_toml = std::fs::read_to_string("version.toml").unwrap_or_default();
+    let version = version_toml
+        .lines()
+        .find(|l| l.starts_with("version"))
+        .and_then(|l| l.split('"').nth(1))
+        .unwrap_or("unknown");
+    println!("cargo:rustc-env=NIX_JAIL_VERSION={}", version);
+    println!("cargo:rerun-if-changed=version.toml");
+
     tonic_prost_build::configure()
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         // Skip serializing timestamp field in LogEntry since prost_types::Timestamp doesn't implement serde traits

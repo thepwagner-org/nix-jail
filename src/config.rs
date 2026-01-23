@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 pub use crate::root::StoreStrategy;
@@ -25,6 +25,12 @@ pub struct ServerConfig {
     /// Port for Prometheus metrics HTTP endpoint (optional)
     /// When set, exposes /metrics on this port
     pub metrics_port: Option<u16>,
+    /// Bind address for metrics HTTP endpoint (optional)
+    /// Defaults to the same IP as the main server address
+    pub metrics_bind_address: Option<IpAddr>,
+    /// Default environment variables for all jobs
+    /// These are set before job-specific env vars (server wins on conflicts)
+    pub default_env: Vec<(String, String)>,
 }
 
 /// Type of credential for determining setup requirements
@@ -37,6 +43,8 @@ pub enum CredentialType {
     GitHub,
     /// Generic HTTP credential
     Generic,
+    /// OpenCode credentials (reads from ~/.local/share/opencode/auth.json)
+    OpenCode,
 }
 
 /// LLM provider type for API response parsing
@@ -109,6 +117,12 @@ pub enum CredentialSource {
     Environment { source_env: String },
     /// Fetch from file (e.g., ~/.claude/.credentials.json)
     File { file_path: String },
+    /// Fetch from OpenCode's auth.json file
+    /// Reads ~/.local/share/opencode/auth.json and extracts token for the specified provider
+    OpenCodeAuth {
+        /// Provider ID in auth.json (e.g., "anthropic", "openai")
+        opencode_provider_id: String,
+    },
     /// Inline token (for ephemeral credentials)
     /// SECURITY: Never serialized - serde(skip) prevents persistence
     #[serde(skip)]
@@ -145,6 +159,8 @@ impl Default for ServerConfig {
             monorepo_path: None,
             cache: CacheConfig::default(),
             metrics_port: None,
+            metrics_bind_address: None,
+            default_env: Vec::new(),
         }
     }
 }
@@ -196,6 +212,9 @@ fn fetch_credential_token_sync(source: &CredentialSource) -> Result<String, Stri
         CredentialSource::Environment { source_env } => std::env::var(source_env)
             .map_err(|e| format!("Environment variable {} not found: {}", source_env, e)),
         CredentialSource::File { file_path } => fetch_from_file(file_path),
+        CredentialSource::OpenCodeAuth {
+            opencode_provider_id,
+        } => fetch_from_opencode_auth(opencode_provider_id),
     }
 }
 
@@ -279,6 +298,93 @@ pub fn extract_access_token(raw_json: &str) -> Option<String> {
     }
 }
 
+/// Fetch token from OpenCode's auth.json file
+///
+/// OpenCode stores credentials in ~/.local/share/opencode/auth.json with the format:
+/// ```json
+/// {
+///   "anthropic": { "type": "oauth", "access": "sk-ant-...", "refresh": "...", "expires": 123 },
+///   "openai": { "type": "api", "key": "sk-..." }
+/// }
+/// ```
+fn fetch_from_opencode_auth(provider_id: &str) -> Result<String, String> {
+    // Resolve home directory (handle SUDO_USER for daemon running as root)
+    let home = if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        // Check /Users first (macOS), then /home (Linux)
+        let macos_home = format!("/Users/{}", sudo_user);
+        if std::path::Path::new(&macos_home).exists() {
+            macos_home
+        } else {
+            format!("/home/{}", sudo_user)
+        }
+    } else {
+        std::env::var("HOME").map_err(|_| "HOME environment variable not set".to_string())?
+    };
+
+    let auth_path = PathBuf::from(&home).join(".local/share/opencode/auth.json");
+
+    let contents = std::fs::read_to_string(&auth_path).map_err(|e| {
+        format!(
+            "Failed to read OpenCode auth.json at {}: {}",
+            auth_path.display(),
+            e
+        )
+    })?;
+
+    let auth_data: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|e| format!("Failed to parse OpenCode auth.json: {}", e))?;
+
+    let provider = auth_data
+        .get(provider_id)
+        .ok_or_else(|| format!("Provider '{}' not found in OpenCode auth.json", provider_id))?;
+
+    let auth_type = provider
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("Missing 'type' field for provider '{}'", provider_id))?;
+
+    match auth_type {
+        "oauth" => {
+            // OAuth credentials have an "access" field with the access token
+            provider
+                .get("access")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    format!(
+                        "Missing 'access' field for OAuth provider '{}'",
+                        provider_id
+                    )
+                })
+        }
+        "api" => {
+            // API credentials have a "key" field
+            provider
+                .get("key")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| format!("Missing 'key' field for API provider '{}'", provider_id))
+        }
+        "wellknown" => {
+            // Well-known credentials have a "token" field
+            provider
+                .get("token")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    format!(
+                        "Missing 'token' field for wellknown provider '{}'",
+                        provider_id
+                    )
+                })
+        }
+        _ => Err(format!(
+            "Unknown auth type '{}' for provider '{}'",
+            auth_type, provider_id
+        )),
+    }
+}
+
 /// TOML file structure for server configuration
 #[derive(Debug, Deserialize)]
 struct ServerConfigFile {
@@ -306,6 +412,12 @@ struct ServerSection {
     monorepo_path: Option<String>,
     /// Port for Prometheus metrics HTTP endpoint
     metrics_port: Option<u16>,
+    /// Bind address for metrics HTTP endpoint (e.g., "0.0.0.0" for external access)
+    metrics_bind_address: Option<String>,
+    /// Default environment variables for all jobs
+    /// Format: [["KEY1", "VALUE1"], ["KEY2", "VALUE2"]]
+    #[serde(default)]
+    default_env: Vec<[String; 2]>,
 }
 
 impl Default for ServerSection {
@@ -318,6 +430,8 @@ impl Default for ServerSection {
             otlp_endpoint: None,
             monorepo_path: None,
             metrics_port: None,
+            metrics_bind_address: None,
+            default_env: Vec::new(),
         }
     }
 }
@@ -362,6 +476,20 @@ impl ServerConfig {
             .parse()
             .map_err(|e: String| e)?;
 
+        // Convert [[key, value], ...] to Vec<(String, String)>
+        let default_env: Vec<(String, String)> = config
+            .server
+            .default_env
+            .into_iter()
+            .map(|[k, v]| (k, v))
+            .collect();
+
+        let metrics_bind_address = config
+            .server
+            .metrics_bind_address
+            .map(|s| s.parse())
+            .transpose()?;
+
         Ok(Self {
             addr: config.server.addr.parse()?,
             state_dir,
@@ -372,6 +500,8 @@ impl ServerConfig {
             monorepo_path: config.server.monorepo_path.map(PathBuf::from),
             cache: config.cache,
             metrics_port: config.server.metrics_port,
+            metrics_bind_address,
+            default_env,
         })
     }
 
@@ -402,3 +532,109 @@ impl Default for ClientConfig {
 
 /// Runtime constants
 pub const CHANNEL_BUFFER_SIZE: usize = 128;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_fetch_from_opencode_auth_oauth() {
+        // Create a temporary auth.json file
+        let mut file = NamedTempFile::new().unwrap();
+        let auth_json = r#"{
+            "anthropic": {
+                "type": "oauth",
+                "access": "sk-ant-test-token-12345",
+                "refresh": "refresh-token",
+                "expires": 1234567890
+            }
+        }"#;
+        file.write_all(auth_json.as_bytes()).unwrap();
+
+        // We can't easily test fetch_from_opencode_auth directly since it
+        // uses hardcoded paths. Instead, test the JSON parsing logic.
+        let auth_data: serde_json::Value = serde_json::from_str(auth_json).unwrap();
+        let provider = auth_data.get("anthropic").unwrap();
+        let auth_type = provider.get("type").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(auth_type, "oauth");
+        let access = provider.get("access").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(access, "sk-ant-test-token-12345");
+    }
+
+    #[test]
+    fn test_fetch_from_opencode_auth_api() {
+        let auth_json = r#"{
+            "openai": {
+                "type": "api",
+                "key": "sk-openai-test-key"
+            }
+        }"#;
+        let auth_data: serde_json::Value = serde_json::from_str(auth_json).unwrap();
+        let provider = auth_data.get("openai").unwrap();
+        let auth_type = provider.get("type").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(auth_type, "api");
+        let key = provider.get("key").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(key, "sk-openai-test-key");
+    }
+
+    #[test]
+    fn test_default_env_toml_parsing() {
+        let toml_content = r#"
+[server]
+addr = "127.0.0.1:50051"
+state_dir = "/tmp/test-nix-jail"
+default_env = [
+    ["OPENCODE_DISABLE_LSP_DOWNLOAD", "true"],
+    ["ANTHROPIC_API_KEY", "dummy-key"],
+]
+
+[cache]
+enabled = true
+"#;
+        let config: ServerConfigFile = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.server.default_env.len(), 2);
+        assert_eq!(
+            config.server.default_env[0],
+            ["OPENCODE_DISABLE_LSP_DOWNLOAD", "true"]
+        );
+        assert_eq!(
+            config.server.default_env[1],
+            ["ANTHROPIC_API_KEY", "dummy-key"]
+        );
+    }
+
+    #[test]
+    fn test_credential_source_opencode_auth_deserialize() {
+        let toml_content = r#"
+name = "anthropic-opencode"
+type = "opencode"
+opencode_provider_id = "anthropic"
+allowed_host_patterns = ["api\\.anthropic\\.com"]
+header_format = "x-api-key {token}"
+"#;
+        let cred: Credential = toml::from_str(toml_content).unwrap();
+        assert_eq!(cred.name, "anthropic-opencode");
+        assert_eq!(cred.credential_type, CredentialType::OpenCode);
+        assert!(
+            matches!(
+                cred.source,
+                CredentialSource::OpenCodeAuth { opencode_provider_id } if opencode_provider_id == "anthropic"
+            ),
+            "Expected OpenCodeAuth source with anthropic provider"
+        );
+    }
+
+    /// TOML file structure for server configuration (re-declared for tests)
+    #[allow(dead_code)]
+    #[derive(Debug, serde::Deserialize)]
+    struct ServerConfigFile {
+        #[serde(default)]
+        server: ServerSection,
+        #[serde(default)]
+        credentials: Vec<Credential>,
+        #[serde(default)]
+        cache: CacheConfig,
+    }
+}

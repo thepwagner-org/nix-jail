@@ -66,6 +66,7 @@
     ${lib.optionalString (cfg.monorepoPath != null) ''monorepo_path = "${cfg.monorepoPath}"''}
     ${lib.optionalString (cfg.otlpEndpoint != null) ''otlp_endpoint = "${cfg.otlpEndpoint}"''}
     ${lib.optionalString (cfg.metricsPort != null) ''metrics_port = ${toString cfg.metricsPort}''}
+    ${lib.optionalString (cfg.metricsPort != null) ''metrics_bind_address = "${cfg.metricsBindAddress}"''}
 
     ${lib.concatMapStringsSep "\n" (cred: ''
       [[credentials]]
@@ -174,6 +175,12 @@ in {
       type = lib.types.nullOr lib.types.port;
       default = null;
       description = "Port for Prometheus metrics HTTP endpoint (e.g., 9102). When set, exposes /metrics.";
+    };
+
+    metricsBindAddress = lib.mkOption {
+      type = lib.types.str;
+      default = "127.0.0.1";
+      description = "Bind address for metrics HTTP endpoint. Set to 0.0.0.0 for external access.";
     };
 
     openMetricsFirewall = lib.mkOption {

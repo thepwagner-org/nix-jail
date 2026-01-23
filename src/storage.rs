@@ -70,6 +70,9 @@ pub struct JobMetadata {
     /// Cache mount requests from the client
     #[serde(default)]
     pub caches: Vec<CacheRequest>,
+    /// Additional paths to include in sparse checkout (for cross-project dependencies)
+    #[serde(default)]
+    pub extra_paths: Vec<String>,
     pub status: JobStatus,
     pub created_at: SystemTime,
     pub completed_at: Option<SystemTime>,
@@ -91,8 +94,53 @@ pub struct CacheEntry {
     pub snapshot_path: String,
     /// Nix store paths included in this closure
     pub closure_paths: Vec<String>,
-    /// Size of the snapshot in bytes (if known)
-    pub size_bytes: Option<i64>,
+    /// When this cache entry was created
+    pub created_at: SystemTime,
+    /// When this cache entry was last used
+    pub last_used_at: SystemTime,
+    /// Number of times this cache entry has been used
+    pub use_count: i64,
+}
+
+/// Type of workspace cache entry
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceCacheType {
+    /// Sparse checkout (only specific paths from repo)
+    Sparse,
+    /// Full clone of repository
+    Clones,
+}
+
+impl WorkspaceCacheType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorkspaceCacheType::Sparse => "sparse",
+            WorkspaceCacheType::Clones => "clones",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "sparse" => Some(WorkspaceCacheType::Sparse),
+            "clones" => Some(WorkspaceCacheType::Clones),
+            _ => None,
+        }
+    }
+}
+
+/// Metadata for a cached workspace (git clone or sparse checkout)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceCacheEntry {
+    /// SHA256 hash identifying this cache entry
+    pub cache_key: String,
+    /// Type of cache (sparse or clones)
+    pub cache_type: WorkspaceCacheType,
+    /// Git repository URL
+    pub repo: String,
+    /// Git commit SHA
+    pub commit_sha: String,
+    /// Sparse checkout path (None for full clones)
+    pub path: Option<String>,
     /// When this cache entry was created
     pub created_at: SystemTime,
     /// When this cache entry was last used
@@ -191,6 +239,26 @@ impl JobStorage {
 
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_cache_last_used ON cache_entries(last_used_at)",
+            [],
+        )?;
+
+        // Create workspace_cache_entries table for git clone/sparse checkout caching
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS workspace_cache_entries (
+                cache_key TEXT PRIMARY KEY,
+                cache_type TEXT NOT NULL,
+                repo TEXT NOT NULL,
+                commit_sha TEXT NOT NULL,
+                path TEXT,
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL,
+                use_count INTEGER NOT NULL DEFAULT 0
+            )",
+            [],
+        )?;
+
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_workspace_cache_last_used ON workspace_cache_entries(last_used_at)",
             [],
         )?;
 
@@ -322,7 +390,8 @@ impl JobStorage {
                     git_ref,
                     hardening_profile,
                     push,
-                    caches: vec![], // Legacy jobs don't have cache requests
+                    caches: vec![],      // Legacy jobs don't have cache requests
+                    extra_paths: vec![], // Legacy jobs don't have extra paths
                     status: JobStatus::from_string(&status_str)?,
                     created_at: SystemTime::UNIX_EPOCH
                         + std::time::Duration::from_secs(created_at_secs as u64),
@@ -546,7 +615,8 @@ impl JobStorage {
             git_ref,
             hardening_profile,
             push,
-            caches: vec![], // Legacy jobs don't have cache requests
+            caches: vec![],      // Legacy jobs don't have cache requests
+            extra_paths: vec![], // Legacy jobs don't have extra paths
             status,
             created_at,
             completed_at,
@@ -579,13 +649,12 @@ impl JobStorage {
 
         let _ = conn.execute(
             "INSERT OR REPLACE INTO cache_entries
-             (nar_hash, snapshot_path, closure_paths, size_bytes, created_at, last_used_at, use_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (nar_hash, snapshot_path, closure_paths, created_at, last_used_at, use_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 entry.nar_hash,
                 entry.snapshot_path,
                 closure_paths_json,
-                entry.size_bytes,
                 created_at,
                 last_used_at,
                 entry.use_count,
@@ -603,7 +672,7 @@ impl JobStorage {
             .map_err(|e| StorageError::LockError(e.to_string()))?;
 
         let mut stmt = conn.prepare(
-            "SELECT nar_hash, snapshot_path, closure_paths, size_bytes, created_at, last_used_at, use_count
+            "SELECT nar_hash, snapshot_path, closure_paths, created_at, last_used_at, use_count
              FROM cache_entries WHERE nar_hash = ?1",
         )?;
 
@@ -615,19 +684,18 @@ impl JobStorage {
                 let closure_paths: Vec<String> = serde_json::from_str(&closure_paths_json)
                     .map_err(|e| StorageError::SerializationError(e.to_string()))?;
 
-                let created_at_secs: i64 = row.get(4)?;
-                let last_used_at_secs: i64 = row.get(5)?;
+                let created_at_secs: i64 = row.get(3)?;
+                let last_used_at_secs: i64 = row.get(4)?;
 
                 Ok(Some(CacheEntry {
                     nar_hash: row.get(0)?,
                     snapshot_path: row.get(1)?,
                     closure_paths,
-                    size_bytes: row.get(3)?,
                     created_at: SystemTime::UNIX_EPOCH
                         + std::time::Duration::from_secs(created_at_secs as u64),
                     last_used_at: SystemTime::UNIX_EPOCH
                         + std::time::Duration::from_secs(last_used_at_secs as u64),
-                    use_count: row.get(6)?,
+                    use_count: row.get(5)?,
                 }))
             }
             None => Ok(None),
@@ -681,7 +749,7 @@ impl JobStorage {
             .map_err(|e| StorageError::LockError(e.to_string()))?;
 
         let mut stmt = conn.prepare(
-            "SELECT nar_hash, snapshot_path, closure_paths, size_bytes, created_at, last_used_at, use_count
+            "SELECT nar_hash, snapshot_path, closure_paths, created_at, last_used_at, use_count
              FROM cache_entries ORDER BY last_used_at ASC LIMIT ?1",
         )?;
 
@@ -691,40 +759,23 @@ impl JobStorage {
                 let closure_paths: Vec<String> =
                     serde_json::from_str(&closure_paths_json).unwrap_or_default();
 
-                let created_at_secs: i64 = row.get(4)?;
-                let last_used_at_secs: i64 = row.get(5)?;
+                let created_at_secs: i64 = row.get(3)?;
+                let last_used_at_secs: i64 = row.get(4)?;
 
                 Ok(CacheEntry {
                     nar_hash: row.get(0)?,
                     snapshot_path: row.get(1)?,
                     closure_paths,
-                    size_bytes: row.get(3)?,
                     created_at: SystemTime::UNIX_EPOCH
                         + std::time::Duration::from_secs(created_at_secs as u64),
                     last_used_at: SystemTime::UNIX_EPOCH
                         + std::time::Duration::from_secs(last_used_at_secs as u64),
-                    use_count: row.get(6)?,
+                    use_count: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(entries)
-    }
-
-    /// Get total cache size in bytes
-    pub fn get_cache_total_size(&self) -> Result<i64, StorageError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StorageError::LockError(e.to_string()))?;
-
-        let total: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(size_bytes), 0) FROM cache_entries",
-            [],
-            |row| row.get(0),
-        )?;
-
-        Ok(total)
     }
 
     /// Get count of cache entries
@@ -737,6 +788,150 @@ impl JobStorage {
         let count: usize =
             conn.query_row("SELECT COUNT(*) FROM cache_entries", [], |row| row.get(0))?;
 
+        Ok(count)
+    }
+
+    // ==================== Workspace Cache Entry Methods ====================
+
+    /// Save or update a workspace cache entry
+    pub fn save_workspace_cache_entry(
+        &self,
+        entry: &WorkspaceCacheEntry,
+    ) -> Result<(), StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::LockError(e.to_string()))?;
+
+        let created_at = entry
+            .created_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| StorageError::TimeError(e.to_string()))?
+            .as_secs() as i64;
+
+        let last_used_at = entry
+            .last_used_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| StorageError::TimeError(e.to_string()))?
+            .as_secs() as i64;
+
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO workspace_cache_entries
+             (cache_key, cache_type, repo, commit_sha, path, created_at, last_used_at, use_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                entry.cache_key,
+                entry.cache_type.as_str(),
+                entry.repo,
+                entry.commit_sha,
+                entry.path,
+                created_at,
+                last_used_at,
+                entry.use_count,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// Touch a workspace cache entry (update last_used_at and increment use_count)
+    pub fn touch_workspace_cache_entry(&self, cache_key: &str) -> Result<(), StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::LockError(e.to_string()))?;
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| StorageError::TimeError(e.to_string()))?
+            .as_secs() as i64;
+
+        let rows_affected = conn.execute(
+            "UPDATE workspace_cache_entries SET last_used_at = ?1, use_count = use_count + 1 WHERE cache_key = ?2",
+            params![now, cache_key],
+        )?;
+
+        if rows_affected == 0 {
+            return Err(StorageError::CacheEntryNotFound(cache_key.to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Delete a workspace cache entry by cache key
+    pub fn delete_workspace_cache_entry(&self, cache_key: &str) -> Result<(), StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::LockError(e.to_string()))?;
+
+        let _ = conn.execute(
+            "DELETE FROM workspace_cache_entries WHERE cache_key = ?1",
+            params![cache_key],
+        )?;
+
+        Ok(())
+    }
+
+    /// List workspace cache entries ordered by last_used_at (oldest first, for LRU eviction)
+    pub fn list_workspace_cache_entries_lru(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceCacheEntry>, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::LockError(e.to_string()))?;
+
+        let mut stmt = conn.prepare(
+            "SELECT cache_key, cache_type, repo, commit_sha, path, created_at, last_used_at, use_count
+             FROM workspace_cache_entries ORDER BY last_used_at ASC LIMIT ?1",
+        )?;
+
+        let entries = stmt
+            .query_map(params![limit as i64], |row| {
+                let cache_type_str: String = row.get(1)?;
+                let created_at_secs: i64 = row.get(5)?;
+                let last_used_at_secs: i64 = row.get(6)?;
+
+                Ok(WorkspaceCacheEntry {
+                    cache_key: row.get(0)?,
+                    cache_type: WorkspaceCacheType::parse(&cache_type_str)
+                        .unwrap_or(WorkspaceCacheType::Clones),
+                    repo: row.get(2)?,
+                    commit_sha: row.get(3)?,
+                    path: row.get(4)?,
+                    created_at: SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(created_at_secs as u64),
+                    last_used_at: SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(last_used_at_secs as u64),
+                    use_count: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(entries)
+    }
+
+    /// Delete all workspace cache entries and return count deleted
+    pub fn delete_all_workspace_cache_entries(&self) -> Result<usize, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::LockError(e.to_string()))?;
+
+        let count = conn.execute("DELETE FROM workspace_cache_entries", [])?;
+        Ok(count)
+    }
+
+    /// Delete all nix cache entries and return count deleted
+    pub fn delete_all_cache_entries(&self) -> Result<usize, StorageError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::LockError(e.to_string()))?;
+
+        let count = conn.execute("DELETE FROM cache_entries", [])?;
         Ok(count)
     }
 }
@@ -800,6 +995,7 @@ mod tests {
             hardening_profile: None,
             push: false,
             caches: vec![],
+            extra_paths: vec![],
             status: JobStatus::Pending,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -837,6 +1033,7 @@ mod tests {
             hardening_profile: None,
             push: false,
             caches: vec![],
+            extra_paths: vec![],
             status: JobStatus::Pending,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -870,6 +1067,7 @@ mod tests {
             hardening_profile: None,
             push: false,
             caches: vec![],
+            extra_paths: vec![],
             status: JobStatus::Running,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -917,6 +1115,7 @@ mod tests {
             hardening_profile: None,
             push: false,
             caches: vec![],
+            extra_paths: vec![],
             status: JobStatus::Running,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -963,6 +1162,7 @@ mod tests {
             hardening_profile: None,
             push: false,
             caches: vec![],
+            extra_paths: vec![],
             status: JobStatus::Pending,
             created_at: SystemTime::now(),
             completed_at: None,

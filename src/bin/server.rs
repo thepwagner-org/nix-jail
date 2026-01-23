@@ -78,10 +78,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_port = addr.port() + 1;
     let ws_addr = std::net::SocketAddr::new(addr.ip(), ws_port);
 
-    // Calculate metrics port if configured
-    let metrics_addr = config
-        .metrics_port
-        .map(|port| std::net::SocketAddr::new(addr.ip(), port));
+    // Calculate metrics address if configured
+    // Uses metrics_bind_address if set, otherwise inherits from main server address
+    let metrics_addr = config.metrics_port.map(|port| {
+        let ip = config.metrics_bind_address.unwrap_or_else(|| addr.ip());
+        std::net::SocketAddr::new(ip, port)
+    });
 
     tracing::info!(
         grpc_address = %addr,

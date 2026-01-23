@@ -97,6 +97,18 @@ impl TestConfigBuilder {
         self
     }
 
+    /// Enable interactive (PTY) mode
+    pub fn interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
+        self
+    }
+
+    /// Set PTY size (rows, cols)
+    pub fn pty_size(mut self, rows: u16, cols: u16) -> Self {
+        self.pty_size = Some((rows, cols));
+        self
+    }
+
     /// Build the ExecutionConfig
     pub fn build(self) -> ExecutionConfig {
         ExecutionConfig {
@@ -130,6 +142,7 @@ pub struct ExecutionOutput {
 ///
 /// Drains stdout and stderr channels and waits for the exit code.
 /// Panics if the handle is in PTY mode (use `collect_pty_output` instead).
+#[allow(clippy::panic)]
 pub async fn collect_output(handle: ExecutionHandle) -> ExecutionOutput {
     match handle.io {
         IoHandle::Piped {
@@ -171,6 +184,42 @@ pub async fn collect_output(handle: ExecutionHandle) -> ExecutionOutput {
         }
         IoHandle::Pty { .. } => {
             panic!("collect_output does not support PTY mode");
+        }
+    }
+}
+
+/// Collected output from a PTY-mode job execution
+#[derive(Debug)]
+pub struct PtyOutput {
+    /// Raw bytes received from the PTY (may include ANSI escape codes)
+    pub output: Vec<u8>,
+    pub exit_code: i32,
+}
+
+/// Collect all output from a PTY-mode ExecutionHandle
+///
+/// Drains the PTY stdout channel and waits for the exit code.
+/// Panics if the handle is in Piped mode.
+#[allow(clippy::panic)]
+pub async fn collect_pty_output(handle: ExecutionHandle) -> PtyOutput {
+    match handle.io {
+        IoHandle::Pty { stdin, mut stdout } => {
+            // Drop stdin to signal EOF to the PTY write task
+            drop(stdin);
+
+            let mut output = Vec::new();
+
+            // Drain output channel
+            while let Some(data) = stdout.recv().await {
+                output.extend(data);
+            }
+
+            let exit_code = handle.exit_code.await.expect("failed to get exit code");
+
+            PtyOutput { output, exit_code }
+        }
+        IoHandle::Piped { .. } => {
+            panic!("collect_pty_output does not support Piped mode");
         }
     }
 }

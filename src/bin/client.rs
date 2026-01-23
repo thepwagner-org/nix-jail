@@ -550,9 +550,11 @@ async fn exec_job(
         nixpkgs_version: Some(nixpkgs_version),
         hardening_profile,
         push: Some(push),
-        interactive: None,             // Not interactive for exec mode
-        caches: vec![],                // Use server defaults
-        ephemeral_credentials: vec![], // CLI doesn't support ephemeral credentials yet
+        interactive: None,                     // Not interactive for exec mode
+        caches: vec![],                        // Use server defaults
+        ephemeral_credentials: vec![],         // CLI doesn't support ephemeral credentials yet
+        env: std::collections::HashMap::new(), // Use server defaults
+        extra_paths: vec![],                   // CLI doesn't support extra paths yet
     });
 
     let job_id = {
@@ -745,10 +747,7 @@ async fn gc_cache(
     let request = Request::new(GcRequest {});
     let response = client.gc(inject_trace_context(request)).await?.into_inner();
 
-    println!(
-        "Cleared {} cache entries ({} bytes freed)",
-        response.deleted_count, response.bytes_freed
-    );
+    println!("Cleared {} cache entries", response.deleted_count);
 
     Ok(())
 }
@@ -891,6 +890,7 @@ git checkout"#,
                     repo_url,
                     git_ref.as_deref(),
                     path.as_deref(),
+                    &[],  // No extra paths for local dev
                     None, // No token (could load from config)
                 )
                 .await

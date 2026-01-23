@@ -19,6 +19,8 @@ pub trait JobWorkspace: Send + Sync + std::fmt::Debug {
     /// If repo is empty, creates an empty workspace directory.
     /// Otherwise, clones the repository and optionally navigates to a subpath.
     ///
+    /// * `extra_paths` - Additional paths to include in sparse checkout (for cross-project dependencies)
+    ///
     /// Returns the resolved workspace directory path.
     async fn setup(
         &self,
@@ -26,6 +28,7 @@ pub trait JobWorkspace: Send + Sync + std::fmt::Debug {
         repo: &str,
         git_ref: Option<&str>,
         path: Option<&str>,
+        extra_paths: &[String],
         github_token: Option<&str>,
     ) -> Result<PathBuf, WorkspaceError>;
 
@@ -53,6 +56,7 @@ impl JobWorkspace for StandardJobWorkspace {
         repo: &str,
         git_ref: Option<&str>,
         path: Option<&str>,
+        _extra_paths: &[String],
         github_token: Option<&str>,
     ) -> Result<PathBuf, WorkspaceError> {
         if repo.is_empty() {
@@ -121,7 +125,10 @@ impl JobWorkspace for StandardJobWorkspace {
 #[derive(Debug, Clone)]
 pub enum WorkspaceBackend {
     /// Filesystem-based storage using btrfs snapshots or reflinks
-    Filesystem { storage: Arc<dyn WorkspaceStorage> },
+    Filesystem {
+        storage: Arc<dyn WorkspaceStorage>,
+        job_storage: crate::storage::JobStorage,
+    },
     /// Docker volume-based storage (for macOS performance optimization)
     DockerVolume,
 }
@@ -146,7 +153,8 @@ impl CachedJobWorkspace {
             cache_dir: cache_manager.cache_dir().to_path_buf(),
             mirror: None,
             backend: WorkspaceBackend::Filesystem {
-                storage: cache_manager.storage().clone(),
+                storage: cache_manager.workspace_storage().clone(),
+                job_storage: cache_manager.job_storage().clone(),
             },
         }
     }
@@ -340,6 +348,7 @@ impl JobWorkspace for CachedJobWorkspace {
         repo: &str,
         git_ref: Option<&str>,
         path: Option<&str>,
+        extra_paths: &[String],
         github_token: Option<&str>,
     ) -> Result<PathBuf, WorkspaceError> {
         // Handle empty repo case
@@ -367,16 +376,21 @@ impl JobWorkspace for CachedJobWorkspace {
 
         // Step 3: Backend-specific setup
         match &self.backend {
-            WorkspaceBackend::Filesystem { storage } => {
+            WorkspaceBackend::Filesystem {
+                storage,
+                job_storage,
+            } => {
                 self.setup_filesystem(
                     workspace_dir,
                     repo,
                     &commit_sha,
                     path,
+                    extra_paths,
                     github_token,
                     &cache_key,
                     use_sparse,
                     storage,
+                    job_storage,
                 )
                 .await
             }
@@ -389,7 +403,7 @@ impl JobWorkspace for CachedJobWorkspace {
 
     fn cleanup(&self, workspace_dir: &Path) -> Result<(), WorkspaceError> {
         match &self.backend {
-            WorkspaceBackend::Filesystem { storage } => {
+            WorkspaceBackend::Filesystem { storage, .. } => {
                 // Delete workspace subvolume first (if it exists)
                 if workspace_dir.exists() {
                     storage.delete_dir(workspace_dir).map_err(|e| {
@@ -423,7 +437,7 @@ impl CachedJobWorkspace {
     /// Setup empty workspace (no git repo)
     async fn setup_empty_workspace(&self, workspace_dir: &Path) -> Result<PathBuf, WorkspaceError> {
         match &self.backend {
-            WorkspaceBackend::Filesystem { storage } => {
+            WorkspaceBackend::Filesystem { storage, .. } => {
                 storage
                     .create_dir(workspace_dir)
                     .map_err(|e| WorkspaceError::IoError(std::io::Error::other(e.to_string())))?;
@@ -445,10 +459,12 @@ impl CachedJobWorkspace {
         repo: &str,
         commit_sha: &str,
         path: Option<&str>,
+        extra_paths: &[String],
         github_token: Option<&str>,
         cache_key: &str,
         use_sparse: bool,
         storage: &Arc<dyn WorkspaceStorage>,
+        job_storage: &crate::storage::JobStorage,
     ) -> Result<PathBuf, WorkspaceError> {
         // Determine cache directory based on clone strategy
         let cache_dir = if use_sparse {
@@ -482,6 +498,11 @@ impl CachedJobWorkspace {
                 "cache hit - creating snapshot"
             );
 
+            // Update LRU tracking
+            if let Err(e) = job_storage.touch_workspace_cache_entry(cache_key) {
+                tracing::debug!(error = %e, "failed to touch workspace cache entry (may not exist in db)");
+            }
+
             crate::cache::snapshot_or_copy(&cached_clone, &target_dir, storage)
                 .await
                 .map_err(|e| WorkspaceError::IoError(std::io::Error::other(e.to_string())))?;
@@ -506,13 +527,19 @@ impl CachedJobWorkspace {
                 })?;
                 let mirror_path = mirror.sync(repo, github_token)?;
 
-                // Include both the project path and nix/ for flake support
-                // (root flake.nix often imports nix/lib.nix)
+                // Include the project path, nix/ for flake support, and any extra paths
+                // (root flake.nix often imports nix/lib.nix, and projects may depend on each other)
                 let mut sparse_paths: Vec<&str> = path
                     .filter(|p| !p.is_empty() && *p != ".")
                     .into_iter()
                     .collect();
                 sparse_paths.push("nix");
+                // Add extra paths (for cross-project dependencies like projects.meow)
+                for extra in extra_paths {
+                    if !extra.is_empty() && extra != "." {
+                        sparse_paths.push(extra.as_str());
+                    }
+                }
 
                 git::sparse_checkout_from_mirror(
                     repo,
@@ -561,6 +588,31 @@ impl CachedJobWorkspace {
                 }
 
                 let _ = std::fs::remove_dir_all(&temp_clone);
+            }
+
+            // Track the new cache entry for LRU eviction
+            let now = std::time::SystemTime::now();
+            let cache_type = if use_sparse {
+                crate::storage::WorkspaceCacheType::Sparse
+            } else {
+                crate::storage::WorkspaceCacheType::Clones
+            };
+            let entry = crate::storage::WorkspaceCacheEntry {
+                cache_key: cache_key.to_string(),
+                cache_type,
+                repo: repo.to_string(),
+                commit_sha: commit_sha.to_string(),
+                path: if use_sparse {
+                    path.map(String::from)
+                } else {
+                    None
+                },
+                created_at: now,
+                last_used_at: now,
+                use_count: 1,
+            };
+            if let Err(e) = job_storage.save_workspace_cache_entry(&entry) {
+                tracing::warn!(error = %e, "failed to save workspace cache entry");
             }
 
             // Snapshot from cache to workspace
@@ -673,7 +725,7 @@ mod tests {
 
         let ws = StandardJobWorkspace::new();
         let result_dir = ws
-            .setup(&workspace_dir, "", None, None, None)
+            .setup(&workspace_dir, "", None, None, &[], None)
             .await
             .expect("Failed to setup workspace");
 
@@ -722,10 +774,15 @@ mod tests {
         let cache_dir = temp.path().join("cache");
 
         let storage: Arc<dyn WorkspaceStorage> = Arc::new(StandardStorage);
+        let job_storage =
+            crate::storage::JobStorage::new(":memory:").expect("Failed to create job storage");
         let ws = CachedJobWorkspace {
             cache_dir,
             mirror: Some(RepoMirror::new(&repo_root)),
-            backend: WorkspaceBackend::Filesystem { storage },
+            backend: WorkspaceBackend::Filesystem {
+                storage,
+                job_storage,
+            },
         };
 
         // Setup with sparse checkout of just this project
@@ -736,6 +793,7 @@ mod tests {
                 &remote_url,
                 Some(&commit),
                 Some("projects/nix-jail"),
+                &[],
                 None,
             )
             .await
