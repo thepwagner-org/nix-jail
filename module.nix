@@ -221,7 +221,10 @@ in {
       ];
 
     # Allow proxy port from nix-jail network namespaces (vp-* veth interfaces)
+    # and Docker bridge networks (br-* for custom networks, docker0 for default)
     networking.firewall.interfaces."vp-+".allowedTCPPorts = [3128];
+    networking.firewall.interfaces."br-+".allowedTCPPorts = [3128];
+    networking.firewall.interfaces."docker0".allowedTCPPorts = [3128];
 
     # Open metrics port if configured
     networking.firewall.allowedTCPPorts = lib.mkIf (cfg.metricsPort != null && cfg.openMetricsFirewall) [cfg.metricsPort];

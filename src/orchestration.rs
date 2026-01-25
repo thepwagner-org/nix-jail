@@ -14,7 +14,7 @@ use tokio::sync::{broadcast, mpsc};
 use tonic::Status;
 use tracing::Instrument;
 
-use crate::config::{Credential, CredentialType, ServerConfig};
+use crate::config::{Credential, CredentialSource, CredentialType, ServerConfig};
 use crate::executor::{ExecutionConfig, Executor, HardeningProfile, ResolvedCacheMount};
 use crate::jail::{CacheRequest, CacheScope, EphemeralCredential};
 use crate::jail::{LogEntry, LogSource, NetworkPolicy};
@@ -1019,6 +1019,15 @@ pub async fn execute_job(
                 return;
             }
         }
+        crate::executor::IoHandle::Direct => {
+            // Direct mode: stdio inherited, no channel forwarding needed
+            // This shouldn't happen in server mode, but handle gracefully
+            tracing::warn!(job_id = %job_id, "direct io mode in server context");
+            (
+                tokio::spawn(async {}), // dummy task
+                tokio::spawn(async {}), // dummy task
+            )
+        }
     };
 
     let proxy_tasks = if let Some(ref mut proxy) = proxy {
@@ -1465,9 +1474,9 @@ async fn run_populate_phase(
     let mut output_lines = Vec::new();
     let (mut stdout_rx, mut stderr_rx) = match handle.io {
         crate::executor::IoHandle::Piped { stdout, stderr } => (stdout, stderr),
-        crate::executor::IoHandle::Pty { .. } => {
-            // PTY mode shouldn't happen for populate phase (interactive=false)
-            unreachable!("populate phase should never use PTY mode");
+        crate::executor::IoHandle::Pty { .. } | crate::executor::IoHandle::Direct => {
+            // PTY/Direct mode shouldn't happen for populate phase (interactive=false)
+            unreachable!("populate phase should never use PTY or Direct mode");
         }
     };
 
@@ -1889,6 +1898,31 @@ fn setup_credentials_env(ctx: &CredentialsSetupContext<'_>, env: &mut HashMap<St
             }
         }
     }
+
+    // Generic/OpenCode credentials with env var source - inject dummy token
+    for cred in filtered_credentials.iter() {
+        tracing::info!(
+            name = %cred.name,
+            credential_type = ?cred.credential_type,
+            source = ?cred.source,
+            has_dummy = cred.dummy_token.is_some(),
+            "checking credential for env injection"
+        );
+        if matches!(
+            cred.credential_type,
+            CredentialType::Generic | CredentialType::OpenCode
+        ) {
+            if let CredentialSource::Environment { source_env } = &cred.source {
+                if let Some(ref dummy_token) = cred.dummy_token {
+                    let _ = env.insert(source_env.clone(), dummy_token.clone());
+                    log_sink.info(
+                        job_id,
+                        &format!("{} configured (proxy will inject real token)", source_env),
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn spawn_stream_task(
@@ -2168,11 +2202,6 @@ pub async fn execute_local(
     let tmp_dir = config.working_dir.join("tmp");
     let _ = std::fs::create_dir_all(&tmp_dir);
 
-    // Create separate home directory in job to avoid project's .claude/ shadowing user config
-    // In local mode, working_dir is the actual project directory which may have its own .claude/
-    let home_dir = job_dir.base.join("home");
-    let _ = std::fs::create_dir_all(&home_dir);
-
     // Chown job directory to sandbox user so jobs can write to it
     // (daemon runs as root, jobs run as sandbox user)
     // Skip chown when sandbox_user is None (e.g., macOS sandbox-exec runs as current user)
@@ -2186,11 +2215,28 @@ pub async fn execute_local(
         }
     }
 
+    // Configure execution environment
+    // Home directory is always under root/home/{user}/, but path representation differs:
+    // - Chroot mode: $HOME=/home/{user} (relative to chroot)
+    // - Non-chroot mode: $HOME={job_dir.root}/home/{user} (absolute host path)
+    let user = sandbox_user.map(|(u, _)| u).unwrap_or("sandbox");
+    let (home_dir_for_env, workspace_root_for_env) = if executor.uses_chroot() {
+        (
+            PathBuf::from(format!("/home/{}", user)),
+            PathBuf::from("/workspace"),
+        )
+    } else {
+        (
+            job_dir.root.join(format!("home/{}", user)),
+            config.working_dir.clone(),
+        )
+    };
+
     let mut env = build_environment(
         proxy.as_ref(),
         &config.working_dir,
-        &home_dir, // Separate home directory to avoid project .claude/ shadowing user config
-        &config.working_dir, // workspace_root = working_dir in local mode
+        &home_dir_for_env,
+        &workspace_root_for_env,
         executor.proxy_connect_host(),
         executor.uses_chroot(),
         &job_dir.root,
@@ -2235,10 +2281,11 @@ pub async fn execute_local(
         let _ = env.insert("OPENSSL_NO_VENDOR".to_string(), "1".to_string());
     }
 
-    // Configure credentials in home_dir (where $HOME points)
+    // Configure credentials in home directory (host filesystem path for writing files)
+    let home_dir_host = job_dir.root.join(format!("home/{}", user));
     let ctx = CredentialsSetupContext {
         job_id: &job_id,
-        working_dir: &home_dir,
+        working_dir: &home_dir_host,
         job_dir: &job_dir,
         credentials: &config.credentials,
         network_policy: config.network_policy.as_ref(),
@@ -2348,6 +2395,15 @@ pub async fn execute_local(
             // Return (stdin_task, stdout_task, true) - stdin needs to be aborted on exit
             // since it blocks forever on user input
             (stdin_task, stdout_task, true)
+        }
+        crate::executor::IoHandle::Direct => {
+            // Direct mode: stdio inherited by child process, no forwarding needed
+            // systemd-run --pty handles terminal I/O directly
+            (
+                tokio::spawn(async {}), // dummy task
+                tokio::spawn(async {}), // dummy task
+                false,                  // no stdin task to abort
+            )
         }
     };
 

@@ -154,11 +154,13 @@ enum Commands {
         /// Store strategy for making Nix packages available
         ///
         /// Available options:
-        ///   - "cached"        - Cache closures with btrfs snapshots/reflinks (default)
+        ///   - "cached"        - Cache closures with btrfs snapshots/reflinks
         ///   - "bind-mount"    - Bind-mount store paths directly
-        ///   - "docker-volume" - Use Docker volumes (requires --executor docker)
-        #[arg(long, default_value = "cached")]
-        store_strategy: String,
+        ///   - "docker-volume" - Use Docker volumes (default for --executor docker)
+        ///
+        /// Default: "docker-volume" when using --executor docker, otherwise "cached"
+        #[arg(long)]
+        store_strategy: Option<String>,
 
         /// Enable automatic pull request creation for git repositories
         /// After successful execution, commits will be pushed to a new branch (job-${jobID})
@@ -277,11 +279,13 @@ enum Commands {
         /// Store strategy for making Nix packages available
         ///
         /// Available options:
-        ///   - "cached"        - Cache closures with btrfs snapshots/reflinks (default)
+        ///   - "cached"        - Cache closures with btrfs snapshots/reflinks
         ///   - "bind-mount"    - Bind-mount store paths directly
-        ///   - "docker-volume" - Use Docker volumes (requires --executor docker)
-        #[arg(long, default_value = "cached")]
-        store_strategy: String,
+        ///   - "docker-volume" - Use Docker volumes (default for --executor docker)
+        ///
+        /// Default: "docker-volume" when using --executor docker, otherwise "cached"
+        #[arg(long)]
+        store_strategy: Option<String>,
 
         /// Environment variables to set (can be specified multiple times)
         ///
@@ -336,6 +340,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         command,
     } = cli.command
     {
+        // Default store_strategy based on executor
+        let store_strategy = store_strategy.unwrap_or_else(|| {
+            if executor == "docker" {
+                "docker-volume".to_string()
+            } else {
+                "cached".to_string()
+            }
+        });
+
         let exit_code = run_local(
             package,
             policy,
@@ -392,6 +405,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             push,
             output,
         } => {
+            // Default store_strategy based on executor
+            let store_strategy = store_strategy.unwrap_or_else(|| {
+                if executor == "docker" {
+                    "docker-volume".to_string()
+                } else {
+                    "cached".to_string()
+                }
+            });
+
             exec_job(
                 &mut client,
                 package,

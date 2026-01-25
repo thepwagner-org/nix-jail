@@ -26,6 +26,12 @@ Each job gets an isolated directory structure with clear security boundaries:
 └── root/                             # job_dir.root (INSIDE sandbox, becomes /)
     ├── etc/ssl/certs/
     │   └── ca-certificates.crt       # Proxy CA cert (created when proxy is used)
+    ├── home/{user}/                  # Sandbox home directory ($HOME)
+    │   ├── .config/                  # XDG_CONFIG_HOME
+    │   ├── .cache/                   # XDG_CACHE_HOME
+    │   └── .local/
+    │       ├── share/                # XDG_DATA_HOME
+    │       └── state/                # XDG_STATE_HOME
     └── nix/store/                    # Nix closure (cached strategy only, not bind-mount)
 ```
 
@@ -34,6 +40,13 @@ Each job gets an isolated directory structure with clear security boundaries:
 - For empty workspaces or scripts, `workspace/` is used directly without the `src/` subdirectory
 - The workspace is bind-mounted directly to `/workspace` in the chroot (no symlink)
 - `bin/` directory is only created when using keychain-based credentials (setup_claude_config)
+- `home/{user}/` is `home/nix-jail/` on Linux (systemd), `home/sandbox/` on macOS (sandbox-exec)
+
+**Environment variables:**
+- **Chroot mode** (systemd, docker): `$HOME=/home/{user}` (chroot-relative path)
+- **Non-chroot mode** (macOS sandbox-exec): `$HOME={job_dir.root}/home/{user}` (absolute host path)
+
+Both modes use the same physical location under `root/home/`, ensuring consistent behavior and a single source of truth for home directory contents.
 
 **Security boundaries:**
 - **Outside sandbox** (`job_dir.base`): Contains sensitive configuration that sandboxed code cannot access (proxy credentials, network policy)

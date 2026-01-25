@@ -2,128 +2,98 @@
 
 Complete guide to testing nix-jail across all supported platforms and executors.
 
+## Setup
+
+```fish
+cargo build && alias nj target/debug/client
+```
+
 ## Supported Executors
 
 | Platform | Executor | Command |
 |----------|----------|---------|
-| macOS | sandbox-exec (default) | `nix-jail run ...` |
-| macOS | Docker | `nix-jail run --executor docker ...` |
-| Linux | systemd-run (default) | `nix-jail run ...` |
-| Linux | Docker | `nix-jail run --executor docker ...` |
+| macOS | sandbox-exec (default) | `nj run ...` |
+| macOS | Docker | `nj run --executor docker ...` |
+| Linux | systemd-run (default) | `nj run ...` |
+| Linux | Docker | `nj run --executor docker ...` |
 
 ## Quick Smoke Test
 
-The simplest test to verify nix-jail works:
+The simplest test to verify nj works:
 
 ```bash
 # Should print a cow saying "moo"
-nix-jail run -p cowsay -- cowsay moo
+nj run -p cowsay -- cowsay moo
+
+# Multiple packages
+nj run -p cowsay -p figlet -- bash -c 'figlet "moo" | cowsay -n'
+
+# No network by default
+nj run -p curl -- curl -v https://httpbin.org/get
+
+# Allow a specific host - that certificate sure looks fresh!
+# (network access uses namespaces and requires sudo)
+nj run -p curl --allow-host httpbin.org -- curl -v https://httpbin.org/get
+
+# Real token not leaked to environment (shows dummy value from config)
+FAKE_TOKEN_WILL_BE_LEAKED=hunter2 nj run -p coreutils \
+  --config examples/credentials/httpbin-demo.toml \
+  --policy examples/network-policies/httpbin-demo.toml -- env
+
+# Proxy injects real token into requests
+FAKE_TOKEN_WILL_BE_LEAKED=hunter2 nj run -p curl -p bash \
+  --config examples/credentials/httpbin-demo.toml \
+  --policy examples/network-policies/httpbin-demo.toml \
+  -- bash -c 'curl -s -H "Authorization: Bearer $FAKE_TOKEN_WILL_BE_LEAKED" https://httpbin.org/headers'
+
+# Only if the request included the dummy token
+FAKE_TOKEN_WILL_BE_LEAKED=hunter2 nj run -p curl \
+  --config examples/credentials/httpbin-demo.toml \
+  --policy examples/network-policies/httpbin-demo.toml \
+  -- curl -s -H "Authorization: just-trust-me-bro" https://httpbin.org/headers
+
+# Wow this is cool I want to poke around
+nj run -p coreutils -p zsh -i -- zsh
 ```
 
-## Testing Each Executor
+## Testing Executors
 
-### macOS + sandbox-exec (default)
+### macOS (sandbox-exec)
 
 ```bash
-# Basic execution
-nix-jail run -p cowsay -- cowsay "Hello from sandbox-exec"
+# Current directory is readable
+nj run -p coreutils -- ls -l
 
-# With multiple packages
-nix-jail run -p cowsay -p figlet -- bash -c 'figlet "Hi" | cowsay -n'
+# Rest of the system is not
+nj run -p coreutils -- ls /nix/store/
+nj run -p coreutils -- ls ~
 
-# Verify sandbox isolation (should fail to access home directory)
-nix-jail run -p coreutils -- ls ~/
+# Only the relevant paths of the nix store are available
+nj run -p coreutils -p which -- which ls
 ```
 
-### macOS + Docker
-
-macOS requires `--store-strategy docker-volume` because /nix/store can't be bind-mounted into Docker.
+### Linux (systemd-run)
 
 ```bash
-# Basic execution (uses busybox container with Nix closure in Docker volume)
-nix-jail run --executor docker --store-strategy docker-volume -p cowsay -- cowsay "Hello from Docker"
+# Current directory is readable
+nj run -p coreutils -- ls -l
 
-# Verify Docker volume caching (second run should be faster)
-time nix-jail run --executor docker --store-strategy docker-volume -p cowsay -- cowsay "First run"
-time nix-jail run --executor docker --store-strategy docker-volume -p cowsay -- cowsay "Second run (cached)"
+# Chroot-ed from rest of the system
+nj run -p coreutils -- ls ~
+
+# Nix store is listable, but trimmed to only required paths
+nj run -p coreutils -- ls /nix/store/
 ```
 
-### Linux + systemd-run (default)
+### Docker
 
 ```bash
-# Basic execution
-nix-jail run -p cowsay -- cowsay "Hello from systemd"
+# Current directory is readable
+nj run --executor docker -p coreutils -- ls -l
 
-# With JIT runtime (for Node.js, Python, etc.)
-nix-jail run -p nodejs --hardening-profile jit-runtime -- node -e 'console.log("Hello from Node")'
-
-# Running as non-root (requires polkit configuration)
-# See NixOS setup below
+# Nix store is listable, but trimmed to only required paths
+nj run --executor docker -p coreutils -- ls /nix/store/
 ```
-
-### Linux + Docker
-
-```bash
-# Basic execution
-nix-jail run --executor docker -p cowsay -- cowsay "Hello from Docker on Linux"
-```
-
-## Network Policy Testing
-
-Network access is denied by default. Use policies to allow specific hosts.
-
-### Test 1: Default deny
-
-```bash
-# Should fail with connection error
-nix-jail run -p curl -- curl -s https://httpbin.org/get
-```
-
-### Test 2: Allow specific host
-
-```bash
-# Should succeed
-nix-jail run -p curl --allow-host "httpbin.org" -- curl -s https://httpbin.org/get
-```
-
-### Test 3: Policy file with path filtering
-
-```bash
-# examples/network-policies/httpbin-allow.toml allows only /get path
-nix-jail run -p curl --policy examples/network-policies/httpbin-allow.toml \
-  -- curl -s https://httpbin.org/get    # allowed
-
-nix-jail run -p curl --policy examples/network-policies/httpbin-allow.toml \
-  -- curl -s https://httpbin.org/post   # blocked
-```
-
-### Test 4: Credential injection
-
-```bash
-# GitHub API with token injection
-nix-jail run -p curl -p jq \
-  --policy examples/network-policies/github-allow.toml \
-  -- bash -c 'curl -s https://api.github.com/user | jq .login'
-```
-
-### Test 5: Ephemeral credentials (gRPC only)
-
-Ephemeral credentials are client-provided, short-lived tokens passed in the JobRequest.
-They exist only in memory for the job's lifetime and are never persisted.
-
-**When testing features that use ephemeral credentials, verify:**
-
-1. The token is correctly injected into matching requests
-2. **The token value NEVER appears in streamed logs** - search all output carefully
-3. The token is not persisted in job metadata (check SQLite database)
-4. Ephemeral credentials with the same name override server credentials (warning logged)
-
-**Security verification checklist:**
-
-- Run a job with an ephemeral credential and capture all output
-- Search the output for any substring of the token value
-- Verify the token does not appear anywhere in logs, errors, or debug output
-- Check that `CredentialSource::Inline` cannot be serialized (serde skip)
 
 ## Disk Cache Testing
 
@@ -131,11 +101,11 @@ Package resolution is cached to disk for CLI mode.
 
 ```bash
 # First run - cache miss, runs nix-build (~330ms)
-RUST_LOG=debug nix-jail run -p cowsay -- cowsay "First"
+RUST_LOG=debug nj run -p cowsay -- cowsay "First"
 # Look for: "cache miss - resolving packages"
 
 # Second run - L2 cache hit (~1ms)
-RUST_LOG=debug nix-jail run -p cowsay -- cowsay "Second"
+RUST_LOG=debug nj run -p cowsay -- cowsay "Second"
 # Look for: "L2 cache hit (disk) - promoting to L1"
 
 # Cache location
@@ -144,12 +114,40 @@ ls ~/.local/share/nix-jail/packages/
 
 ## Interactive Mode Testing
 
+Interactive mode (`-i` flag) allocates a PTY, letting you "be inside" the sandbox.
+
+### macOS + sandbox-exec
+
 ```bash
-# Interactive shell
-nix-jail run -p bash -p coreutils -it -- bash
+# Interactive zsh shell
+nj run -p zsh -p coreutils -i -- zsh
 
 # With working directory
-nix-jail run -p bash -p coreutils -it -w /path/to/project -- bash
+nj run -p zsh -p coreutils -i -w /path/to/project -- zsh
+```
+
+### macOS + Docker
+
+```bash
+# Interactive shell in Docker
+nj run --executor docker -p zsh -p coreutils -i -- zsh
+```
+
+### Linux + systemd
+
+```bash
+# Interactive zsh shell (requires root for systemd-run)
+sudo nj run -p zsh -p coreutils -i -- zsh
+
+# Or with bash
+sudo nj run -p bash -p coreutils -i -- bash
+```
+
+### Linux + Docker
+
+```bash
+# Interactive shell in Docker
+nj run --executor docker -p zsh -p coreutils -i -- zsh
 ```
 
 ## Flake Support
@@ -157,7 +155,7 @@ nix-jail run -p bash -p coreutils -it -w /path/to/project -- bash
 ```bash
 # Project with flake.nix - closure computed from devShell
 cd /path/to/flake-project
-nix-jail run -- bash -c 'echo "Using flake closure"'
+nj run -- bash -c 'echo "Using flake closure"'
 ```
 
 ## Git Workspace Testing
@@ -173,7 +171,7 @@ REPO="https://user:TOKEN@git.example.com/org/repo.git"  # trufflehog:ignore
 
 ```bash
 # Clone a subpath from a monorepo
-nix-jail run --executor docker --store-strategy docker-volume \
+nj run --executor docker \
   --repo "$REPO" \
   --path "projects/nix-jail" \
   -p bash -p git \
@@ -184,7 +182,7 @@ nix-jail run --executor docker --store-strategy docker-volume \
 
 ```bash
 # Should show only the requested path, minimal objects
-nix-jail run --executor docker --store-strategy docker-volume \
+nj run --executor docker \
   --repo "$REPO" \
   --path "projects/nix-jail" \
   -p bash -p git \
@@ -201,13 +199,13 @@ git count-objects -v
 
 ```bash
 # First run - creates volume
-time nix-jail run --executor docker --store-strategy docker-volume \
+time nj run --executor docker \
   --repo "$REPO" \
   --path "projects/nix-jail" \
   -p bash -- echo "First run"
 
 # Second run - should be instant (volume cache hit)
-time nix-jail run --executor docker --store-strategy docker-volume \
+time nj run --executor docker \
   --repo "$REPO" \
   --path "projects/nix-jail" \
   -p bash -- echo "Second run (cached)"
@@ -217,7 +215,7 @@ time nix-jail run --executor docker --store-strategy docker-volume \
 
 ```bash
 # Checkout a specific commit
-nix-jail run --executor docker --store-strategy docker-volume \
+nj run --executor docker \
   --repo "$REPO" \
   --path "projects/nix-jail" \
   --git-ref "main" \

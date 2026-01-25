@@ -14,8 +14,9 @@ pub use crate::root::{get_job_root, JobRoot, RootError, StoreSetup, StoreStrateg
 /// Holds paths for the job's filesystem layout:
 /// ```text
 /// {state_dir}/jobs/{job_id}/
-/// ├── workspace/     # Working directory (git clone or empty)
-/// └── root/          # Chroot root
+/// ├── workspace/           # Working directory (git clone or empty)
+/// └── root/                # Chroot root (becomes / in sandbox)
+///     └── home/{user}/     # Sandbox home directory ($HOME)
 /// ```
 ///
 /// This is a simple container - the orchestrator handles setup and cleanup.

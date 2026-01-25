@@ -185,6 +185,9 @@ pub async fn collect_output(handle: ExecutionHandle) -> ExecutionOutput {
         IoHandle::Pty { .. } => {
             panic!("collect_output does not support PTY mode");
         }
+        IoHandle::Direct => {
+            panic!("collect_output does not support Direct mode");
+        }
     }
 }
 
@@ -220,6 +223,9 @@ pub async fn collect_pty_output(handle: ExecutionHandle) -> PtyOutput {
         }
         IoHandle::Piped { .. } => {
             panic!("collect_pty_output does not support Piped mode");
+        }
+        IoHandle::Direct => {
+            panic!("collect_pty_output does not support Direct mode");
         }
     }
 }

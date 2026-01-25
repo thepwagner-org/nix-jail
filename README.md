@@ -22,13 +22,9 @@ cargo run --bin client -- exec -p curl -s examples/scripts/curl.sh \
 ## How it works
 
 The server spawns jobs through a pipeline: resolve Nix packages, set up workspace, start a per-job MITM proxy, execute in platform sandbox, cleanup.
-
 **macOS:** Apple sandbox-exec with SBPL profiles. Localhost-only network forces proxy usage.
-
 **Linux (systemd):** systemd transient units with 33 hardening properties. Network namespaces with veth pairs provide kernel-enforced proxy-only communication.
-
 **Docker:** Container isolation with capability dropping, read-only root, and resource limits. Cross-platform (Linux, macOS with Docker Desktop, WSL2).
-
 The proxy intercepts HTTPS traffic, enforces host+path policies, and injects credentials from the host keychain. Code in the sandbox cannot access the real tokens.
 
 ## Features

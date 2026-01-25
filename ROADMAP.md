@@ -22,7 +22,6 @@ macOS SandboxExecutor could enforce resource limits using ulimit-based restricti
 - Memory: 4 GB
 - Disk: 10 GB workspace
 - Processes: 100
-
 Linux SystemdExecutor already has these via systemd properties (CPUQuota, MemoryMax, TasksMax, RuntimeMaxSec).
 
 ## Testing & Validation

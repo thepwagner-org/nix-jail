@@ -151,7 +151,7 @@ pub struct ExecutionConfig {
 
 /// I/O handle for job execution
 ///
-/// Differentiates between piped (line-based) and PTY (raw byte) modes.
+/// Differentiates between piped (line-based), PTY (raw byte), and direct (inherited) modes.
 #[derive(Debug)]
 pub enum IoHandle {
     /// Piped mode: separate stdout/stderr channels with line-based streaming
@@ -168,6 +168,11 @@ pub enum IoHandle {
         /// Channel receiving output bytes from the PTY
         stdout: mpsc::Receiver<Vec<u8>>,
     },
+    /// Direct mode: stdio inherited from parent process
+    ///
+    /// Used when the executor handles terminal I/O directly (e.g., systemd-run --pty).
+    /// No channel forwarding needed - the process connects to the terminal directly.
+    Direct,
 }
 
 /// Handle to a running job execution

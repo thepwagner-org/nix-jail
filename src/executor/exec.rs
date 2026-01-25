@@ -151,6 +151,7 @@ pub fn create_home_directory(
 
     // Chown to sandbox user if specified (daemon runs as root, jobs run as sandbox user)
     // Skip chown when sandbox_user is None (e.g., macOS sandbox-exec runs as current user)
+    // Note: chown will fail when not root, which is expected for local development
     if let Some((user, group)) = sandbox_user {
         let owner = format!("{}:{}", user, group);
         let output = std::process::Command::new("chown")
@@ -158,9 +159,10 @@ pub fn create_home_directory(
             .output()?;
 
         if !output.status.success() {
-            tracing::warn!(
+            // Debug level: chown failure is expected when not running as root
+            tracing::debug!(
                 stderr = %String::from_utf8_lossy(&output.stderr),
-                "failed to chown home directory"
+                "chown home directory failed (expected when not root)"
             );
         }
     }

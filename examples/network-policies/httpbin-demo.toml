@@ -1,0 +1,7 @@
+# Policy for httpbin demo - references "demo" credential
+
+[[rules]]
+action = "allow"
+credential = "demo"
+[rules.pattern]
+host = "httpbin\\.org"

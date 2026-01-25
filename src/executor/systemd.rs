@@ -674,217 +674,106 @@ impl SystemdExecutor {
         let _ = allocated.remove(&counter);
         tracing::debug!(counter = counter, "deallocated ip subnet");
     }
-}
 
-#[async_trait]
-impl Executor for SystemdExecutor {
-    async fn execute(&self, config: ExecutionConfig) -> Result<ExecutionHandle, ExecutorError> {
-        let job_id = &config.job_id;
-        let command = &config.command;
-
-        if command.is_empty() {
-            return Err(ExecutorError::SpawnFailed(
-                "Command cannot be empty".to_string(),
-            ));
-        }
-
-        // Use pre-prepared root directory from orchestration (contains /nix/store closure)
-        let root_dir = &config.root_dir;
-        if !root_dir.exists() {
-            return Err(ExecutorError::SpawnFailed(format!(
-                "Root directory not found: {}",
-                root_dir.display()
-            )));
-        }
-
-        // store_paths is the pre-computed closure for command resolution
-        let closure = &config.store_paths;
-        tracing::debug!(job_id = %job_id, root_dir = %root_dir.display(), closure_size = closure.len(), "using pre-prepared root");
-
-        // Resolve command paths from closure (e.g., "bash" -> "/nix/store/.../bin/bash")
-        let resolved_command = super::exec::resolve_command_paths(command, closure);
-
-        // Network setup depends on whether proxy is configured
-        // - With proxy: allocate IP subnet and create veth-based network namespace
-        // - Without proxy: use PrivateNetwork=yes for simpler loopback-only isolation
-        let network_setup = if config.proxy_port.is_some() {
-            let (proxy_ip, job_ip, subnet_counter) = self.allocate_subnet()?;
-            create_network_namespace(job_id, proxy_ip, job_ip).await?;
-            let netns_path = format!("/var/run/netns/nix-jail-{}", job_id);
-            NetworkSetup::Namespace {
-                subnet_counter,
-                netns_path,
-            }
-        } else {
-            tracing::debug!(job_id = %job_id, "no proxy configured, using PrivateNetwork isolation");
-            NetworkSetup::PrivateNetwork
-        };
-
-        // Generate all hardening properties
-        // Bind the workspace root (where .git lives) at /workspace, not the subpath
-        let workspace_root = config.job_dir.join("workspace");
-        // unwrap is safe: SystemdExecutor always returns Some for sandbox_user
-        #[allow(clippy::unwrap_used)]
-        let sandbox_user = self.sandbox_user().unwrap();
-        let properties = generate_hardening_properties(
-            root_dir,
-            &workspace_root,
-            job_id,
-            &config,
-            config.hardening_profile,
-            sandbox_user,
-        );
-
-        // Build systemd-run command
-        let unit_name = format!("nix-jail-{}", job_id);
+    /// Execute in interactive PTY mode
+    ///
+    /// Unlike Docker/sandbox executors, systemd-run --pty handles its own PTY allocation.
+    /// Wrapping it in portable-pty causes conflicts, so we inherit stdio directly and let
+    /// systemd-run connect to the user's terminal.
+    async fn execute_interactive(
+        &self,
+        systemd_args: Vec<String>,
+        unit_name: String,
+        _pty_size: Option<(u16, u16)>,
+        timeout_duration: std::time::Duration,
+        job_id: String,
+        cleanup_tx: Option<oneshot::Sender<i32>>,
+    ) -> Result<ExecutionHandle, ExecutorError> {
+        // systemd-run --pty already handles PTY allocation and connects to the terminal.
+        // We just need to inherit stdio and let it do its thing.
         let mut cmd = Command::new("systemd-run");
+        let _ = cmd.args(&systemd_args);
+
+        // Inherit stdio so systemd-run --pty can connect directly to the terminal
         let _ = cmd
-            .arg("--unit")
-            .arg(&unit_name)
-            .arg("--quiet") // Don't print unit name to stderr
-            .arg("--wait"); // Wait for unit to finish
-
-        // Use --pty for interactive sessions, --pipe for batch jobs
-        // --pty connects to a PTY (required for interactive terminals)
-        // --pipe connects stdout/stderr for streaming (required for log capture)
-        if config.interactive {
-            let _ = cmd.arg("--pty");
-        } else {
-            let _ = cmd.arg("--pipe");
-        }
-
-        // Add all hardening properties
-        for prop in properties {
-            let _ = cmd.arg(prop);
-        }
-
-        // Add network isolation, working directory, and TERM
-        // Set TERM=dumb to prevent ANSI escape codes in non-interactive mode
-        match &network_setup {
-            NetworkSetup::Namespace { netns_path, .. } => {
-                // Join the pre-configured namespace with veth pair for proxy access
-                let _ = cmd.arg(format!("--property=NetworkNamespacePath={}", netns_path));
-            }
-            NetworkSetup::PrivateNetwork => {
-                // Simple isolation: loopback only, no external network access
-                let _ = cmd.arg("--property=PrivateNetwork=yes");
-            }
-        }
-        // Convert host working_dir to chroot-relative path
-        // e.g., /var/lib/nix-jail/jobs/{id}/workspace/projects/knowledge -> /workspace/projects/knowledge
-        // The workspace root (where .git lives) is at job_dir/workspace
-        let workspace_root = config.job_dir.join("workspace");
-        let chroot_working_dir = workspace_to_chroot_path(&config.working_dir, &workspace_root);
-        let _ = cmd
-            .arg(format!(
-                "--property=WorkingDirectory={}",
-                chroot_working_dir.display()
-            ))
-            .arg("--setenv")
-            .arg("TERM=dumb");
-
-        // Add environment variables, normalizing workspace paths to chroot-relative paths
-        for (key, value) in &config.env {
-            // Normalize host workspace paths to chroot paths for certain env vars
-            // Skip if already an absolute chroot path (starts with /)
-            let normalized_value = if matches!(
-                key.as_str(),
-                "SSL_CERT_FILE" | "NODE_EXTRA_CA_CERTS" | "REQUESTS_CA_BUNDLE"
-            ) && !value.starts_with('/')
-            {
-                // Convert host workspace paths to chroot-relative paths
-                let path = PathBuf::from(value);
-                workspace_to_chroot_path(&path, &workspace_root)
-                    .to_string_lossy()
-                    .to_string()
-            } else {
-                // HOME, TMPDIR, and other vars are already set to chroot-relative paths
-                value.clone()
-            };
-            let _ = cmd
-                .arg("--setenv")
-                .arg(format!("{}={}", key, normalized_value));
-        }
-
-        // Cache environment variables from resolved cache mounts
-        for mount in &config.cache_mounts {
-            if let Some(ref env_var) = mount.env_var {
-                let _ = cmd
-                    .arg("--setenv")
-                    .arg(format!("{}={}", env_var, mount.mount_path));
-            }
-        }
-
-        // Note: HTTP_PROXY and HTTPS_PROXY are already set correctly by build_environment
-        // with credentials embedded (http://user:pass@ip:port). Don't override them here. (trufflehog:ignore)
-
-        // Add the actual command to execute (use resolved paths)
-        let _ = cmd.arg("--");
-        for arg in &resolved_command {
-            let _ = cmd.arg(arg);
-        }
-
-        // Configure stdio
-        let _ = cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-        // Debug log the full command
-        match &network_setup {
-            NetworkSetup::Namespace { netns_path, .. } => {
-                tracing::debug!(command = ?cmd, netns_path = %netns_path, "spawning systemd-run with network namespace");
-            }
-            NetworkSetup::PrivateNetwork => {
-                tracing::debug!(command = ?cmd, "spawning systemd-run with PrivateNetwork");
-            }
-        }
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
 
         // Spawn the process
         let mut child = cmd.spawn().map_err(|e| {
-            ExecutorError::SpawnFailed(format!("Failed to spawn systemd-run: {}", e))
+            ExecutorError::SpawnFailed(format!("failed to spawn systemd-run: {}", e))
+        })?;
+
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let unit_name_clone = unit_name.clone();
+
+        // Spawn task to wait for process and handle cleanup
+        drop(tokio::spawn(async move {
+            let exit_code = match timeout(timeout_duration, child.wait()).await {
+                Ok(Ok(status)) => status.code().unwrap_or(-1),
+                Ok(Err(e)) => {
+                    tracing::error!(job_id = %job_id, error = %e, "error waiting for systemd-run process");
+                    -1
+                }
+                Err(_) => {
+                    tracing::warn!(job_id = %job_id, "execution timed out, stopping systemd unit");
+                    let _ = child.kill().await;
+                    let _ = Command::new("systemctl")
+                        .args(["stop", &unit_name_clone])
+                        .status()
+                        .await;
+                    -1
+                }
+            };
+
+            let _ = exit_tx.send(exit_code);
+            if let Some(cleanup_tx) = cleanup_tx {
+                let _ = cleanup_tx.send(exit_code);
+            }
+        }));
+
+        // Return Direct mode - stdio is inherited, no channel forwarding needed
+        Ok(ExecutionHandle {
+            io: super::traits::IoHandle::Direct,
+            exit_code: exit_rx,
+        })
+    }
+
+    /// Execute in piped mode with separate stdout/stderr streams
+    async fn execute_piped(
+        &self,
+        systemd_args: Vec<String>,
+        unit_name: String,
+        timeout_duration: std::time::Duration,
+        job_id: String,
+        cleanup_tx: Option<oneshot::Sender<i32>>,
+    ) -> Result<ExecutionHandle, ExecutorError> {
+        let mut cmd = Command::new("systemd-run");
+        let _ = cmd.args(&systemd_args);
+        let _ = cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        // Spawn the process
+        let mut child = cmd.spawn().map_err(|e| {
+            ExecutorError::SpawnFailed(format!("failed to spawn systemd-run: {}", e))
         })?;
 
         // Capture stdout and stderr
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| ExecutorError::SpawnFailed("Failed to capture stdout".to_string()))?;
+            .ok_or_else(|| ExecutorError::SpawnFailed("failed to capture stdout".to_string()))?;
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| ExecutorError::SpawnFailed("Failed to capture stderr".to_string()))?;
+            .ok_or_else(|| ExecutorError::SpawnFailed("failed to capture stderr".to_string()))?;
 
         // Create channels for streaming output
         let (stdout_tx, stdout_rx) = mpsc::channel(100);
         let (stderr_tx, stderr_rx) = mpsc::channel(100);
         let (exit_tx, exit_rx) = oneshot::channel();
 
-        // Only create cleanup channel if we have a network namespace to clean up
-        let cleanup_tx = if let NetworkSetup::Namespace { subnet_counter, .. } = &network_setup {
-            let (cleanup_tx, cleanup_rx) = oneshot::channel();
-            let executor_clone = Self {
-                allocated_subnets: Arc::clone(&self.allocated_subnets),
-            };
-            let job_id_clone = config.job_id.clone();
-            let subnet_counter = *subnet_counter;
-
-            // Spawn cleanup task that runs after job completes
-            // Intentionally detached: performs async cleanup after job finishes
-            drop(tokio::spawn(async move {
-                let _ = cleanup_rx.await;
-                tracing::debug!(job_id = %job_id_clone, "cleaning up network namespace");
-                if let Err(e) = cleanup_network_namespace(&job_id_clone).await {
-                    tracing::warn!(job_id = %job_id_clone, error = %e, "failed to cleanup network namespace");
-                }
-                executor_clone.deallocate_subnet(subnet_counter);
-            }));
-
-            Some(cleanup_tx)
-        } else {
-            None // PrivateNetwork mode has no cleanup needed
-        };
-
         let unit_name_clone = unit_name.clone();
-        let timeout_duration = config.timeout;
-        let job_id = job_id.to_string();
 
         // Spawn task to handle process execution and output streaming
         // Intentionally detached: this task manages the lifetime of stdout/stderr channels
@@ -944,6 +833,237 @@ impl Executor for SystemdExecutor {
             },
             exit_code: exit_rx,
         })
+    }
+}
+
+#[async_trait]
+impl Executor for SystemdExecutor {
+    async fn execute(&self, config: ExecutionConfig) -> Result<ExecutionHandle, ExecutorError> {
+        let job_id = &config.job_id;
+        let command = &config.command;
+
+        if command.is_empty() {
+            return Err(ExecutorError::SpawnFailed(
+                "Command cannot be empty".to_string(),
+            ));
+        }
+
+        // Use pre-prepared root directory from orchestration (contains /nix/store closure)
+        let root_dir = &config.root_dir;
+        if !root_dir.exists() {
+            return Err(ExecutorError::SpawnFailed(format!(
+                "Root directory not found: {}",
+                root_dir.display()
+            )));
+        }
+
+        // store_paths is the pre-computed closure for command resolution
+        let closure = &config.store_paths;
+        tracing::debug!(job_id = %job_id, root_dir = %root_dir.display(), closure_size = closure.len(), "using pre-prepared root");
+
+        // Resolve command paths from closure (e.g., "bash" -> "/nix/store/.../bin/bash")
+        let resolved_command = super::exec::resolve_command_paths(command, closure);
+
+        // Network setup depends on whether proxy is configured
+        // - With proxy: allocate IP subnet and create veth-based network namespace
+        // - Without proxy: use PrivateNetwork=yes for simpler loopback-only isolation
+        let network_setup = if config.proxy_port.is_some() {
+            let (proxy_ip, job_ip, subnet_counter) = self.allocate_subnet()?;
+            create_network_namespace(job_id, proxy_ip, job_ip).await?;
+            let netns_path = format!("/var/run/netns/nix-jail-{}", job_id);
+            NetworkSetup::Namespace {
+                subnet_counter,
+                netns_path,
+            }
+        } else {
+            tracing::debug!(job_id = %job_id, "no proxy configured, using PrivateNetwork isolation");
+            NetworkSetup::PrivateNetwork
+        };
+
+        // Generate all hardening properties
+        // Determine workspace bind source:
+        // - Server mode: job_dir/workspace (populated by git clone)
+        // - Local mode: config.working_dir (user's actual directory)
+        let job_workspace = config.job_dir.join("workspace");
+        let workspace_bind_source = if job_workspace.exists() {
+            // Server mode: workspace was created by JobWorkspace::setup()
+            job_workspace.clone()
+        } else {
+            // Local mode: bind user's working directory directly
+            config.working_dir.clone()
+        };
+        // unwrap is safe: SystemdExecutor always returns Some for sandbox_user
+        #[allow(clippy::unwrap_used)]
+        let sandbox_user = self.sandbox_user().unwrap();
+        let properties = generate_hardening_properties(
+            root_dir,
+            &workspace_bind_source,
+            job_id,
+            &config,
+            config.hardening_profile,
+            sandbox_user,
+        );
+
+        // Build systemd-run arguments as a Vec so we can use them with either
+        // tokio::process::Command (piped mode) or portable_pty::CommandBuilder (PTY mode)
+        let unit_name = format!("nix-jail-{}", job_id);
+        let mut systemd_args: Vec<String> = vec![
+            "--unit".to_string(),
+            unit_name.clone(),
+            "--quiet".to_string(), // Don't print unit name to stderr
+            "--wait".to_string(),  // Wait for unit to finish
+        ];
+
+        // Use --pty for interactive sessions, --pipe for batch jobs
+        // --pty connects to a PTY (required for interactive terminals)
+        // --pipe connects stdout/stderr for streaming (required for log capture)
+        if config.interactive {
+            systemd_args.push("--pty".to_string());
+        } else {
+            systemd_args.push("--pipe".to_string());
+        }
+
+        // Add all hardening properties
+        for prop in properties {
+            systemd_args.push(prop);
+        }
+
+        // Add network isolation
+        match &network_setup {
+            NetworkSetup::Namespace { netns_path, .. } => {
+                // Join the pre-configured namespace with veth pair for proxy access
+                systemd_args.push(format!("--property=NetworkNamespacePath={}", netns_path));
+            }
+            NetworkSetup::PrivateNetwork => {
+                // Simple isolation: loopback only, no external network access
+                systemd_args.push("--property=PrivateNetwork=yes".to_string());
+            }
+        }
+
+        // Set working directory inside chroot
+        // - Server mode: working_dir is under job_dir/workspace, convert to /workspace/subpath
+        // - Local mode: working_dir is user's directory bound directly at /workspace
+        let chroot_working_dir = if config.working_dir.starts_with(&job_workspace) {
+            // Server mode: convert host path to chroot-relative path
+            // e.g., /var/lib/nix-jail/jobs/{id}/workspace/projects/foo -> /workspace/projects/foo
+            workspace_to_chroot_path(&config.working_dir, &job_workspace)
+        } else {
+            // Local mode: user's directory is bound at /workspace
+            PathBuf::from("/workspace")
+        };
+        systemd_args.push(format!(
+            "--property=WorkingDirectory={}",
+            chroot_working_dir.display()
+        ));
+
+        // Set TERM based on mode
+        let term_value = if config.interactive {
+            "xterm-256color"
+        } else {
+            "dumb"
+        };
+        systemd_args.push("--setenv".to_string());
+        systemd_args.push(format!("TERM={}", term_value));
+
+        // Add environment variables, normalizing workspace paths to chroot-relative paths
+        for (key, value) in &config.env {
+            // Normalize host workspace paths to chroot paths for certain env vars
+            // Skip if already an absolute chroot path (starts with /)
+            let normalized_value = if matches!(
+                key.as_str(),
+                "SSL_CERT_FILE" | "NODE_EXTRA_CA_CERTS" | "REQUESTS_CA_BUNDLE"
+            ) && !value.starts_with('/')
+            {
+                // Convert host workspace paths to chroot-relative paths
+                let path = PathBuf::from(value);
+                workspace_to_chroot_path(&path, &workspace_bind_source)
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                // HOME, TMPDIR, and other vars are already set to chroot-relative paths
+                value.clone()
+            };
+            systemd_args.push("--setenv".to_string());
+            systemd_args.push(format!("{}={}", key, normalized_value));
+        }
+
+        // Cache environment variables from resolved cache mounts
+        for mount in &config.cache_mounts {
+            if let Some(ref env_var) = mount.env_var {
+                systemd_args.push("--setenv".to_string());
+                systemd_args.push(format!("{}={}", env_var, mount.mount_path));
+            }
+        }
+
+        // Note: HTTP_PROXY and HTTPS_PROXY are already set correctly by build_environment
+        // with credentials embedded (http://user:pass@ip:port). Don't override them here. (trufflehog:ignore)
+
+        // Add the actual command to execute (use resolved paths)
+        systemd_args.push("--".to_string());
+        for arg in &resolved_command {
+            systemd_args.push(arg.clone());
+        }
+
+        // Debug log the full command
+        match &network_setup {
+            NetworkSetup::Namespace { netns_path, .. } => {
+                tracing::debug!(args = ?systemd_args, netns_path = %netns_path, "spawning systemd-run with network namespace");
+            }
+            NetworkSetup::PrivateNetwork => {
+                tracing::debug!(args = ?systemd_args, "spawning systemd-run with PrivateNetwork");
+            }
+        }
+
+        // Set up cleanup task for network namespace (shared by both modes)
+        let cleanup_tx = if let NetworkSetup::Namespace { subnet_counter, .. } = &network_setup {
+            let (cleanup_tx, cleanup_rx) = oneshot::channel();
+            let executor_clone = Self {
+                allocated_subnets: Arc::clone(&self.allocated_subnets),
+            };
+            let job_id_clone = config.job_id.clone();
+            let subnet_counter = *subnet_counter;
+
+            // Spawn cleanup task that runs after job completes
+            // Intentionally detached: performs async cleanup after job finishes
+            drop(tokio::spawn(async move {
+                let _ = cleanup_rx.await;
+                tracing::debug!(job_id = %job_id_clone, "cleaning up network namespace");
+                if let Err(e) = cleanup_network_namespace(&job_id_clone).await {
+                    tracing::warn!(job_id = %job_id_clone, error = %e, "failed to cleanup network namespace");
+                }
+                executor_clone.deallocate_subnet(subnet_counter);
+            }));
+
+            Some(cleanup_tx)
+        } else {
+            None // PrivateNetwork mode has no cleanup needed
+        };
+
+        let timeout_duration = config.timeout;
+        let job_id = job_id.to_string();
+
+        if config.interactive {
+            // PTY mode: use portable-pty for interactive terminal sessions
+            self.execute_interactive(
+                systemd_args,
+                unit_name,
+                config.pty_size,
+                timeout_duration,
+                job_id,
+                cleanup_tx,
+            )
+            .await
+        } else {
+            // Piped mode: separate stdout/stderr with line-based streaming
+            self.execute_piped(
+                systemd_args,
+                unit_name,
+                timeout_duration,
+                job_id,
+                cleanup_tx,
+            )
+            .await
+        }
     }
 
     fn proxy_listen_addr(&self) -> &'static str {
