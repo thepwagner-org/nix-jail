@@ -141,7 +141,9 @@ pub fn generate_profile_with_cache(
     ));
 
     // Allow home directory access (for tool config files like .claude.json)
-    let home = job_dir.join("home");
+    // Home is at job_dir/root/home/sandbox per JobDirectory layout
+    // macOS sandbox-exec always uses "sandbox" user (no user switching)
+    let home = job_dir.join("root").join("home").join("sandbox");
     profile.push_str(";; Home directory (tool configuration files)\n");
     profile.push_str(&format!(
         "(allow file-read* file-write* (subpath \"{}\"))\n",
@@ -324,7 +326,7 @@ mod tests {
         assert!(profile.contains("/tmp/root"));
 
         // Should allow home and bin directories
-        assert!(profile.contains("/tmp/job/home"));
+        assert!(profile.contains("/tmp/job/root/home/sandbox"));
         assert!(profile.contains("/tmp/job/bin"));
     }
 

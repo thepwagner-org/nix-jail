@@ -58,6 +58,21 @@ pub enum LlmProvider {
     OpenAI,
 }
 
+/// Default for redact_response - true for security by default
+fn default_redact_response() -> bool {
+    true
+}
+
+/// Default OAuth paths to redact - only actual token refresh endpoints
+fn default_redact_paths() -> Vec<String> {
+    vec![r"/oauth/token".to_string(), r"/token$".to_string()]
+}
+
+/// Default for extract_llm_metrics - true to capture usage stats
+fn default_extract_llm_metrics() -> bool {
+    true
+}
+
 /// A credential that can be injected into network requests
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credential {
@@ -85,20 +100,23 @@ pub struct Credential {
 
     /// Redact OAuth tokens from responses for this credential
     /// When true, responses matching redact_paths will have tokens replaced with dummies
-    #[serde(default)]
+    /// Defaults to true for security - set to false to disable
+    #[serde(default = "default_redact_response")]
     pub redact_response: bool,
 
     /// Path patterns that trigger response redaction (e.g., ["/oauth/token", "/token"])
-    /// Only used when redact_response is true
-    #[serde(default)]
+    /// Defaults to common OAuth paths - override to customize
+    #[serde(default = "default_redact_paths")]
     pub redact_paths: Vec<String>,
 
     /// Enable LLM API metrics extraction for this credential
     /// When true, parses request/response bodies to extract token usage and tool calls
-    #[serde(default)]
+    /// Defaults to true - set to false to disable
+    #[serde(default = "default_extract_llm_metrics")]
     pub extract_llm_metrics: bool,
 
-    /// LLM provider type for response parsing (required if extract_llm_metrics is true)
+    /// LLM provider type for response parsing
+    /// Auto-detected from host patterns if not specified
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_provider: Option<LlmProvider>,
 }
@@ -183,8 +201,8 @@ impl From<&crate::jail::EphemeralCredential> for Credential {
             allowed_host_patterns: ec.allowed_hosts.clone(),
             header_format: ec.header_format.clone(),
             dummy_token: None,
-            redact_response: false,
-            redact_paths: vec![],
+            redact_response: default_redact_response(),
+            redact_paths: default_redact_paths(),
             extract_llm_metrics: false,
             llm_provider: None,
         }

@@ -56,6 +56,24 @@ FAKE_TOKEN_WILL_BE_LEAKED=hunter2 nj run -p curl \
 nj run -p coreutils -p zsh -i -- zsh
 ```
 
+## Running Claude Code
+
+The primary use case - run Claude Code sandboxed with credential injection:
+
+```bash
+# Interactive Claude session with API key injected by proxy
+# (macOS: reads from Keychain via osx-claude-code.toml)
+nj run -p claude-code -p zsh -p coreutils -p git -i \
+  --config examples/credentials/osx-claude-code.toml \
+  --policy examples/network-policies/anthropic-allow.toml \
+  -- claude
+```
+
+The sandbox:
+- Exposes only the current directory and nix closure
+- Injects your real API key via MITM proxy (read from Keychain, never visible to Claude)
+- Allows only `api.anthropic.com` and `console.anthropic.com` through the network filter
+
 ## Testing Executors
 
 ### macOS (sandbox-exec)

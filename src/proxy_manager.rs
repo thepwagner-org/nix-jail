@@ -15,11 +15,15 @@
 
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
+use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Default proxy port (standard HTTP proxy port)
 pub const DEFAULT_PROXY_PORT: u16 = 3128;
@@ -152,6 +156,22 @@ impl ProxyManager {
 
         let mut proxy_cmd = Command::new(&proxy_bin);
         let _ = proxy_cmd.arg("--config").arg(&proxy_config_path);
+
+        // Propagate trace context to child process for distributed tracing
+        // Extract current span context and inject as W3C Trace Context env vars
+        let propagator = TraceContextPropagator::new();
+        let mut carrier: HashMap<String, String> = HashMap::new();
+        let cx = tracing::Span::current().context();
+        propagator.inject_context(&cx, &mut carrier);
+
+        if let Some(traceparent) = carrier.get("traceparent") {
+            let _ = proxy_cmd.env("TRACEPARENT", traceparent);
+            tracing::debug!(traceparent = %traceparent, "propagating trace context to proxy");
+        }
+        if let Some(tracestate) = carrier.get("tracestate") {
+            let _ = proxy_cmd.env("TRACESTATE", tracestate);
+        }
+
         tracing::debug!(
             job_id = %job_id,
             config_path = %proxy_config_path.display(),
@@ -350,6 +370,7 @@ mod tests {
             &empty_creds,
             None,
             None,
+            None, // otlp_endpoint
         )
         .expect("Failed to write proxy config");
 

@@ -184,7 +184,6 @@ pub fn validate_nixpkgs_version(version: &str) -> Result<(), Status> {
 #[derive(Debug)]
 pub enum CredentialValidationError {
     InvalidRedactPath { path: String, error: String },
-    EmptyRedactPaths { credential: String },
 }
 
 impl std::fmt::Display for CredentialValidationError {
@@ -192,13 +191,6 @@ impl std::fmt::Display for CredentialValidationError {
         match self {
             CredentialValidationError::InvalidRedactPath { path, error } => {
                 write!(f, "Invalid redact_path pattern '{}': {}", path, error)
-            }
-            CredentialValidationError::EmptyRedactPaths { credential } => {
-                write!(
-                    f,
-                    "Credential '{}' has redact_response=true but no redact_paths",
-                    credential
-                )
             }
         }
     }
@@ -215,9 +207,13 @@ pub fn validate_credential_redact_paths(
     }
 
     if credential.redact_paths.is_empty() {
-        return Err(CredentialValidationError::EmptyRedactPaths {
-            credential: credential.name.clone(),
-        });
+        // User explicitly set empty redact_paths with redact_response=true
+        // This is probably a mistake, but we allow it with a warning
+        tracing::warn!(
+            credential = %credential.name,
+            "redact_response=true but redact_paths is empty, no responses will be redacted"
+        );
+        return Ok(());
     }
 
     for path in &credential.redact_paths {
@@ -622,8 +618,8 @@ mod tests {
             allowed_host_patterns: vec!["api\\.anthropic\\.com".to_string()],
             header_format: "Bearer {token}".to_string(),
             dummy_token: None,
-            redact_response: false,
-            redact_paths: vec![],
+            redact_response: true,
+            redact_paths: vec![r"/oauth/token".to_string(), r"/token$".to_string()],
             extract_llm_metrics: false,
             llm_provider: None,
         }]
@@ -669,6 +665,8 @@ mod tests {
 
     #[test]
     fn test_validate_credential_redact_enabled_empty_paths() {
+        // Empty redact_paths with redact_response=true now warns but allows
+        // (user explicitly chose this configuration)
         let cred = Credential {
             name: "oauth".to_string(),
             credential_type: CredentialType::Generic,
@@ -679,14 +677,12 @@ mod tests {
             header_format: "Bearer {token}".to_string(),
             dummy_token: None,
             redact_response: true,
-            redact_paths: vec![], // Error: redact_response=true but no paths
+            redact_paths: vec![], // Warning logged, but allowed
             extract_llm_metrics: false,
             llm_provider: None,
         };
-        assert!(matches!(
-            validate_credential_redact_paths(&cred),
-            Err(CredentialValidationError::EmptyRedactPaths { .. })
-        ));
+        // Should succeed with a warning (warning is logged, not returned)
+        assert!(validate_credential_redact_paths(&cred).is_ok());
     }
 
     #[test]

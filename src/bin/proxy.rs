@@ -1,6 +1,7 @@
 use clap::Parser;
 use nix_jail::proxy::{run_proxy, ProxyConfig};
 use std::path::PathBuf;
+use tracing::Instrument;
 
 /// nix-jail MITM Proxy
 ///
@@ -23,15 +24,33 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
 
-    // Initialize logging from RUST_LOG environment variable
-    let _tracing_guard = nix_jail::init_tracing("nix-jail-proxy", "info", false, None);
+    // Load config first to get OTLP endpoint (before tracing is initialized)
+    let config = ProxyConfig::from_file(&args.config)?;
+
+    // Initialize logging with optional OpenTelemetry export
+    let _tracing_guard = nix_jail::init_tracing(
+        "nix-jail-proxy",
+        "info",
+        false,
+        config.otlp_endpoint.as_deref(),
+    );
 
     // Initialize rustls crypto provider for MITM TLS connections
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    tracing::debug!("loading proxy config from: {}", args.config.display());
-    let config = ProxyConfig::from_file(&args.config)?;
+    // Log diagnostic info about OTel configuration
+    if let Ok(traceparent) = std::env::var("TRACEPARENT") {
+        tracing::info!(traceparent = %traceparent, "received parent trace context");
+    } else {
+        tracing::debug!("no TRACEPARENT env var (proxy will create new trace)");
+    }
+    if config.otlp_endpoint.is_some() {
+        tracing::info!(endpoint = ?config.otlp_endpoint, "opentelemetry export configured");
+    } else {
+        tracing::debug!("no otlp_endpoint configured (console logging only)");
+    }
 
+    tracing::debug!("loaded proxy config from: {}", args.config.display());
     tracing::debug!("starting nix-jail mitm proxy");
     tracing::debug!("listen address: {}", config.listen_addr);
     tracing::debug!("ca certificate: {}", config.ca_cert_path.display());
@@ -47,7 +66,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::debug!("proxy authentication: disabled");
     }
 
-    run_proxy(config).await?;
+    // Wrap the proxy in a root span that will carry the parent trace context
+    // This ensures all LLM completion spans are linked to the parent trace
+    async { run_proxy(config).await }
+        .instrument(tracing::info_span!("proxy"))
+        .await?;
 
     Ok(())
 }

@@ -69,6 +69,7 @@ http-body-util = "0.1"
 ipnetwork = "0.21"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
+socket2 = "0.5"
 rcgen = "0.14"
 bytes = "1.0"
 webpki-roots = "1.0"
@@ -83,6 +84,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 thiserror = "2.0"
 portable-pty = "0.9"
 prometheus = { version = "0.14", features = ["process"] }
+flate2 = "1.1.8"
 
 # Network namespace management (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]

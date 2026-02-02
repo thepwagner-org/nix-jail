@@ -1,3 +1,4 @@
+use crate::proxy::llm::ToolCall;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,6 +14,21 @@ pub struct RequestKey {
     pub decision: String,   // "approved" or "denied"
 }
 
+/// LLM API usage statistics summary
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LlmStatsSummary {
+    /// Total input/prompt tokens across all requests
+    pub total_input_tokens: u64,
+    /// Total output/completion tokens across all requests
+    pub total_output_tokens: u64,
+    /// Total cache read tokens across all requests (Anthropic only)
+    pub total_cache_read_tokens: u64,
+    /// Request count by model name, sorted by count descending
+    pub requests_by_model: Vec<(String, u64)>,
+    /// Tool call count by tool name, sorted by count descending
+    pub tool_calls: Vec<(String, u64)>,
+}
+
 /// Serializable proxy statistics for file output
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyStatsSummary {
@@ -22,6 +38,9 @@ pub struct ProxyStatsSummary {
     /// New detailed format with all dimensions
     #[serde(default)]
     pub requests: Vec<(RequestKey, u64)>,
+    /// LLM API usage statistics
+    #[serde(default)]
+    pub llm: Option<LlmStatsSummary>,
 }
 
 /// Thread-safe statistics tracking for proxy requests
@@ -31,6 +50,14 @@ pub struct ProxyStats {
     denied: Mutex<HashMap<String, u64>>,
     /// Detailed request tracking with all dimensions
     requests: Mutex<HashMap<RequestKey, u64>>,
+    /// LLM token usage tracking
+    llm_input_tokens: Mutex<u64>,
+    llm_output_tokens: Mutex<u64>,
+    llm_cache_read_tokens: Mutex<u64>,
+    /// LLM request count by model
+    llm_requests_by_model: Mutex<HashMap<String, u64>>,
+    /// LLM tool call count by tool name
+    llm_tool_calls: Mutex<HashMap<String, u64>>,
 }
 
 impl ProxyStats {
@@ -82,6 +109,50 @@ impl ProxyStats {
         *map.entry(key).or_insert(0) += 1;
     }
 
+    /// Record LLM API usage metrics from a response
+    pub fn record_llm_metrics(
+        &self,
+        model: Option<&str>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        tool_calls: &[ToolCall],
+    ) {
+        // Record token counts
+        if let Some(tokens) = input_tokens {
+            #[allow(clippy::expect_used)]
+            let mut total = self.llm_input_tokens.lock().expect("operation failed");
+            *total += tokens;
+        }
+        if let Some(tokens) = output_tokens {
+            #[allow(clippy::expect_used)]
+            let mut total = self.llm_output_tokens.lock().expect("operation failed");
+            *total += tokens;
+        }
+        if let Some(tokens) = cache_read_tokens {
+            #[allow(clippy::expect_used)]
+            let mut total = self.llm_cache_read_tokens.lock().expect("operation failed");
+            *total += tokens;
+        }
+
+        // Record model usage
+        let model_name = model.unwrap_or("unknown").to_string();
+        {
+            #[allow(clippy::expect_used)]
+            let mut map = self.llm_requests_by_model.lock().expect("operation failed");
+            *map.entry(model_name).or_insert(0) += 1;
+        }
+
+        // Record tool calls (by name only for aggregate stats)
+        {
+            #[allow(clippy::expect_used)]
+            let mut map = self.llm_tool_calls.lock().expect("operation failed");
+            for tool in tool_calls {
+                *map.entry(tool.name.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
     /// Get summary statistics as a serializable struct
     pub fn summary(&self) -> ProxyStatsSummary {
         #[allow(clippy::expect_used)]
@@ -100,10 +171,46 @@ impl ProxyStats {
         let mut requests_vec: Vec<_> = requests.iter().map(|(k, v)| (k.clone(), *v)).collect();
         requests_vec.sort_by(|a, b| b.1.cmp(&a.1));
 
+        // Build LLM stats summary
+        #[allow(clippy::expect_used)]
+        let input_tokens = *self.llm_input_tokens.lock().expect("operation failed");
+        #[allow(clippy::expect_used)]
+        let output_tokens = *self.llm_output_tokens.lock().expect("operation failed");
+        #[allow(clippy::expect_used)]
+        let cache_read_tokens = *self.llm_cache_read_tokens.lock().expect("operation failed");
+        #[allow(clippy::expect_used)]
+        let models = self.llm_requests_by_model.lock().expect("operation failed");
+        #[allow(clippy::expect_used)]
+        let tools = self.llm_tool_calls.lock().expect("operation failed");
+
+        let llm = if input_tokens > 0
+            || output_tokens > 0
+            || cache_read_tokens > 0
+            || !models.is_empty()
+            || !tools.is_empty()
+        {
+            let mut models_vec: Vec<_> = models.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            models_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let mut tools_vec: Vec<_> = tools.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            tools_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+            Some(LlmStatsSummary {
+                total_input_tokens: input_tokens,
+                total_output_tokens: output_tokens,
+                total_cache_read_tokens: cache_read_tokens,
+                requests_by_model: models_vec,
+                tool_calls: tools_vec,
+            })
+        } else {
+            None
+        };
+
         ProxyStatsSummary {
             approved: approved_vec,
             denied: denied_vec,
             requests: requests_vec,
+            llm,
         }
     }
 

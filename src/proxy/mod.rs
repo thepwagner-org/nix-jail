@@ -52,6 +52,10 @@ pub struct ProxyConfig {
     /// Optional path to log all requests as JSON lines (for debugging)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_log_path: Option<PathBuf>,
+
+    /// Optional OpenTelemetry OTLP endpoint for exporting traces
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub otlp_endpoint: Option<String>,
 }
 
 fn default_ca_cert_path() -> PathBuf {

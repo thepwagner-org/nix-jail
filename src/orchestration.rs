@@ -413,6 +413,7 @@ pub async fn execute_job(
         &merged_credentials,
         executor.proxy_listen_addr(),
         &log_sink,
+        config.otlp_endpoint.as_deref(),
     )
     .instrument(tracing::info_span!("configure_proxy"))
     .await
@@ -1691,6 +1692,7 @@ async fn configure_proxy(
     credentials: &[Credential],
     proxy_listen_addr: &str,
     log_sink: &Arc<dyn LogSink>,
+    otlp_endpoint: Option<&str>,
 ) -> Result<Option<PathBuf>, OrchestrationError> {
     let has_network_rules = network_policy
         .map(|policy| !policy.rules.is_empty())
@@ -1715,6 +1717,7 @@ async fn configure_proxy(
         &filtered_credentials,
         proxy_username,
         proxy_password,
+        otlp_endpoint.map(|s| s.to_string()),
     )
     .map_err(|e| OrchestrationError::ProxyConfigError(e.to_string()))?;
 
@@ -2071,6 +2074,9 @@ pub struct LocalExecutionConfig {
 
     /// Pass real credentials to sandbox (INSECURE - for debugging only)
     pub insecure_credentials: bool,
+
+    /// OpenTelemetry OTLP endpoint for proxy tracing
+    pub otlp_endpoint: Option<String>,
 }
 
 impl std::fmt::Debug for LocalExecutionConfig {
@@ -2124,6 +2130,7 @@ pub async fn execute_local(
         &config.credentials,
         executor.proxy_listen_addr(),
         &log_sink,
+        config.otlp_endpoint.as_deref(),
     )
     .await?;
 
@@ -2489,6 +2496,24 @@ pub async fn execute_local(
                     approved_total, denied_total
                 ),
             );
+
+            // Log LLM usage stats if present
+            if let Some(ref llm) = stats.llm {
+                tracing::info!(
+                    input_tokens = llm.total_input_tokens,
+                    output_tokens = llm.total_output_tokens,
+                    cache_read_tokens = llm.total_cache_read_tokens,
+                    "llm token usage"
+                );
+
+                for (model, count) in &llm.requests_by_model {
+                    tracing::info!(model = %model, requests = count, "llm model usage");
+                }
+
+                for (tool, count) in &llm.tool_calls {
+                    tracing::info!(tool = %tool, calls = count, "llm tool usage");
+                }
+            }
         }
     }
 
@@ -2522,8 +2547,8 @@ mod tests {
             allowed_host_patterns: vec!["api\\.example\\.com".to_string()],
             header_format: "Bearer {token}".to_string(),
             dummy_token: None,
-            redact_response: false,
-            redact_paths: vec![],
+            redact_response: true,
+            redact_paths: vec![r"/oauth/token".to_string(), r"/token$".to_string()],
             extract_llm_metrics: false,
             llm_provider: None,
         }
@@ -2613,7 +2638,8 @@ mod tests {
         );
         assert_eq!(cred.allowed_host_patterns, vec!["github\\.com".to_string()]);
         assert_eq!(cred.header_format, "token {token}");
-        assert!(!cred.redact_response);
+        // redact_response defaults to true for security
+        assert!(cred.redact_response);
         assert!(!cred.extract_llm_metrics);
     }
 

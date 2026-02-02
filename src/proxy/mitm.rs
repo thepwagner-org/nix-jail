@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio_rustls::TlsAcceptor;
+use tracing::Instrument;
 
 /// Global connection counter for generating unique connection IDs
 static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -35,6 +36,7 @@ type RedactionSignal = Arc<tokio::sync::Mutex<Option<String>>>;
 #[derive(Debug, Clone)]
 struct LlmMetricsContext {
     host: String,
+    path: String,
     credential: String,
     provider: LlmProvider,
 }
@@ -43,9 +45,53 @@ type LlmMetricsSignal = Arc<tokio::sync::Mutex<Option<LlmMetricsContext>>>;
 
 use crate::config::{extract_access_token, CredentialType, LlmProvider};
 use crate::metrics::SharedMetrics;
-use crate::proxy::llm::StreamingMetricsAccumulator;
+use crate::proxy::llm::{LlmMetrics, StreamingMetricsAccumulator};
 use crate::proxy::policy::{CompiledPolicy, PolicyDecision};
 use crate::proxy::stats::ProxyStats;
+
+/// Emit an OpenTelemetry span for LLM API completion metrics.
+///
+/// Creates a span (not just an event) so it appears in distributed traces.
+/// Uses gen_ai semantic conventions for attributes:
+/// - gen_ai.system: The LLM provider (anthropic, openai)
+/// - gen_ai.request.model: Model name
+/// - gen_ai.usage.input_tokens: Input/prompt tokens
+/// - gen_ai.usage.output_tokens: Output/completion tokens
+/// - gen_ai.usage.cache_read_tokens: Cache read tokens (Anthropic)
+/// - gen_ai.tool_calls: JSON array of tool calls with arguments
+fn emit_llm_completion_span(ctx: &LlmMetricsContext, metrics: &LlmMetrics, conn_id: u64) {
+    let provider_str = match ctx.provider {
+        LlmProvider::Anthropic => "anthropic",
+        LlmProvider::OpenAI => "openai",
+    };
+
+    let model_str = metrics.model.as_deref().unwrap_or("unknown");
+    let input_tokens = metrics.input_tokens.unwrap_or(0);
+    let output_tokens = metrics.output_tokens.unwrap_or(0);
+    let cache_read_tokens = metrics.cache_read_tokens.unwrap_or(0);
+
+    // Serialize tool calls to JSON for the span attribute
+    let tool_calls_json = serde_json::to_string(&metrics.tool_calls).unwrap_or_default();
+
+    // Create a span with all LLM metrics as attributes
+    // The span is immediately entered and exited, recording a point-in-time event
+    let span = tracing::info_span!(
+        target: "gen_ai",
+        "llm.completion",
+        gen_ai_system = provider_str,
+        gen_ai_request_model = model_str,
+        gen_ai_usage_input_tokens = input_tokens,
+        gen_ai_usage_output_tokens = output_tokens,
+        gen_ai_usage_cache_read_tokens = cache_read_tokens,
+        gen_ai_tool_calls = tool_calls_json,
+        conn_id = conn_id,
+        host = ctx.host.as_str(),
+        path = ctx.path.as_str(),
+        credential = ctx.credential.as_str(),
+    );
+    // Enter and immediately exit to record the span
+    let _guard = span.enter();
+}
 
 /// Shared state for the proxy server
 ///
@@ -224,11 +270,17 @@ pub async fn start_server(
                 let state = state.clone();
 
                 // Spawn task to handle connection independently - no need to await
-                drop(tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, state, peer_addr.to_string()).await {
-                        tracing::error!("connection error from {}: {}", peer_addr, e);
+                // Use in_current_span() to propagate trace context without creating a visible span
+                drop(tokio::spawn(
+                    async move {
+                        if let Err(e) =
+                            handle_connection(stream, state, peer_addr.to_string()).await
+                        {
+                            tracing::error!("connection error from {}: {}", peer_addr, e);
+                        }
                     }
-                }));
+                    .in_current_span(),
+                ));
             }
         }
     }
@@ -424,36 +476,42 @@ async fn handle_connect(
     let state_for_mitm = state.clone();
     let policy_decision_for_mitm = policy_decision;
     // Spawn task to handle WebSocket upgrade in background - no need to await
-    drop(tokio::spawn(async move {
-        match hyper::upgrade::on(req).await {
-            Ok(upgraded) => {
-                // Wrap upgraded connection with TokioIo for AsyncRead/AsyncWrite traits
-                let io = TokioIo::new(upgraded);
-                if let Err(e) = handle_mitm(
-                    io,
-                    hostname,
-                    cert_der,
-                    ca_cert_der,
-                    key_der,
-                    state_for_mitm,
-                    policy_decision_for_mitm,
-                )
-                .await
-                {
-                    // Downgrade expected connection errors to debug level
-                    let err_str = e.to_string();
-                    if err_str.contains("close_notify") || err_str.contains("Connection reset") {
-                        tracing::debug!("connection closed: {}", e);
-                    } else if err_str.contains("Connection refused") {
-                        tracing::debug!("connection refused (likely dns-blocked): {}", e);
-                    } else {
-                        tracing::error!("mitm error: {}", e);
+    // Instrument with span to inherit trace context from parent
+    let mitm_span = tracing::info_span!("mitm", host = %hostname);
+    drop(tokio::spawn(
+        async move {
+            match hyper::upgrade::on(req).await {
+                Ok(upgraded) => {
+                    // Wrap upgraded connection with TokioIo for AsyncRead/AsyncWrite traits
+                    let io = TokioIo::new(upgraded);
+                    if let Err(e) = handle_mitm(
+                        io,
+                        hostname,
+                        cert_der,
+                        ca_cert_der,
+                        key_der,
+                        state_for_mitm,
+                        policy_decision_for_mitm,
+                    )
+                    .await
+                    {
+                        // Downgrade expected connection errors to debug level
+                        let err_str = e.to_string();
+                        if err_str.contains("close_notify") || err_str.contains("Connection reset")
+                        {
+                            tracing::debug!("connection closed: {}", e);
+                        } else if err_str.contains("Connection refused") {
+                            tracing::debug!("connection refused (likely dns-blocked): {}", e);
+                        } else {
+                            tracing::error!("mitm error: {}", e);
+                        }
                     }
                 }
+                Err(e) => tracing::error!("upgrade error: {}", e),
             }
-            Err(e) => tracing::error!("upgrade error: {}", e),
         }
-    }));
+        .instrument(mitm_span),
+    ));
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -513,6 +571,16 @@ where
     // Connect to upstream server
     let upstream_addr = format!("{}:443", hostname);
     let upstream_stream = TcpStream::connect(&upstream_addr).await?;
+
+    // Configure TCP keepalive to prevent connection resets on long-running streams
+    upstream_stream.set_nodelay(true)?;
+    let sock_ref = socket2::SockRef::from(&upstream_stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(30))
+        .with_interval(std::time::Duration::from_secs(10));
+    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+        tracing::warn!(conn_id, error = %e, "failed to set tcp keepalive");
+    }
 
     // Configure TLS for upstream connection
     let mut root_store = rustls::RootCertStore::empty();
@@ -605,6 +673,8 @@ where
 {
     let mut buf = vec![0u8; 8192];
     let mut accumulated = Vec::new();
+    // Track remaining request body bytes to forward (for POST requests with Content-Length)
+    let mut body_bytes_remaining: usize = 0;
 
     loop {
         let n = reader.read(&mut buf).await?;
@@ -612,8 +682,28 @@ where
             break;
         }
 
-        // Accumulate data for parsing
-        accumulated.extend_from_slice(&buf[..n]);
+        // If we're in body forwarding mode, forward data directly
+        if body_bytes_remaining > 0 {
+            let to_forward = n.min(body_bytes_remaining);
+            upstream_writer.write_all(&buf[..to_forward]).await?;
+            body_bytes_remaining -= to_forward;
+
+            // If we forwarded less than we read, the rest is the next request
+            if to_forward < n {
+                accumulated.extend_from_slice(&buf[to_forward..n]);
+            }
+
+            // If more body expected, continue reading
+            if body_bytes_remaining > 0 {
+                continue;
+            }
+            // Body complete - flush to ensure data is transmitted
+            upstream_writer.flush().await?;
+            // Fall through to parse next request from accumulated
+        } else {
+            // Accumulate data for parsing
+            accumulated.extend_from_slice(&buf[..n]);
+        }
 
         // Try to parse HTTP requests from accumulated data
         loop {
@@ -790,6 +880,14 @@ where
                             }
                         }
 
+                        // Extract Content-Length for body tracking (needed for all paths)
+                        let req_content_length: Option<usize> = req
+                            .headers
+                            .iter()
+                            .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+                            .and_then(|h| std::str::from_utf8(h.value).ok())
+                            .and_then(|v| v.parse().ok());
+
                         // Policy-based credential injection
                         if let Some(credential_name) = credential_from_policy {
                             // Fetch token with 5-minute caching
@@ -829,6 +927,45 @@ where
                                         } else {
                                             Some(token.clone())
                                         };
+
+                                    // Set LLM metrics signal early (before any early returns)
+                                    // This ensures metrics are captured even if no token injection occurs
+                                    // Only track actual LLM endpoints (not health checks, OAuth, etc.)
+                                    let is_llm_endpoint = path.starts_with("/v1/messages")
+                                        || path.starts_with("/v1/chat/completions");
+                                    if credential.extract_llm_metrics && is_llm_endpoint {
+                                        let provider = credential.llm_provider.or_else(|| {
+                                            if hostname.contains("anthropic") {
+                                                Some(crate::config::LlmProvider::Anthropic)
+                                            } else if hostname.contains("openai") {
+                                                Some(crate::config::LlmProvider::OpenAI)
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                        if let Some(provider) = provider {
+                                            let mut signal = llm_metrics_signal.lock().await;
+                                            *signal = Some(LlmMetricsContext {
+                                                host: hostname.clone(),
+                                                path: path.to_string(),
+                                                credential: credential_name.to_string(),
+                                                provider,
+                                            });
+                                            tracing::debug!(
+                                                credential = credential_name,
+                                                path = path,
+                                                provider = ?provider,
+                                                "signaling llm metrics extraction"
+                                            );
+                                        }
+                                    }
+                                    tracing::debug!(
+                                        credential = credential_name,
+                                        host = %hostname,
+                                        method = method,
+                                        path = path,
+                                        "credentialed request"
+                                    );
 
                                     let header_value = match (
                                         &client_auth,
@@ -960,23 +1097,6 @@ where
                                         );
                                     }
 
-                                    // Check if this credential needs LLM metrics extraction
-                                    if credential.extract_llm_metrics {
-                                        if let Some(provider) = credential.llm_provider {
-                                            let mut signal = llm_metrics_signal.lock().await;
-                                            *signal = Some(LlmMetricsContext {
-                                                host: hostname.clone(),
-                                                credential: credential_name.to_string(),
-                                                provider,
-                                            });
-                                            tracing::debug!(
-                                                credential = credential_name,
-                                                provider = ?provider,
-                                                "signaling llm metrics extraction"
-                                            );
-                                        }
-                                    }
-
                                     // Build new headers list, replacing Authorization in place
                                     // If response redaction is needed, strip Accept-Encoding to
                                     // force uncompressed responses we can parse
@@ -1022,11 +1142,25 @@ where
                                     // End of headers
                                     reconstructed.extend_from_slice(b"\r\n");
 
-                                    // Body (everything after the headers)
+                                    // Body (everything after the headers in this chunk)
+                                    let body_in_chunk = accumulated.len() - bytes_parsed;
                                     reconstructed.extend_from_slice(&accumulated[bytes_parsed..]);
 
                                     // Write the reconstructed request to upstream
                                     upstream_writer.write_all(&reconstructed).await?;
+
+                                    // Track remaining body bytes to forward
+                                    if let Some(total_body) = req_content_length {
+                                        if body_in_chunk < total_body {
+                                            body_bytes_remaining = total_body - body_in_chunk;
+                                        } else {
+                                            // Body complete in first chunk - flush
+                                            upstream_writer.flush().await?;
+                                        }
+                                    } else {
+                                        // No Content-Length (e.g., GET request) - flush
+                                        upstream_writer.flush().await?;
+                                    }
 
                                     // Clear accumulated buffer since we've processed everything
                                     accumulated.clear();
@@ -1037,26 +1171,42 @@ where
                                         credential_name,
                                         e
                                     );
-                                    // Forward request without modification on error
-                                    upstream_writer
-                                        .write_all(&accumulated[..bytes_parsed])
-                                        .await?;
-                                    let _ = accumulated.drain(..bytes_parsed);
+                                    // Forward entire request (headers + body in chunk)
+                                    upstream_writer.write_all(&accumulated).await?;
+                                    // Track remaining body
+                                    let body_in_chunk = accumulated.len() - bytes_parsed;
+                                    if let Some(cl) = req_content_length {
+                                        if body_in_chunk < cl {
+                                            body_bytes_remaining = cl - body_in_chunk;
+                                        } else {
+                                            upstream_writer.flush().await?;
+                                        }
+                                    } else {
+                                        upstream_writer.flush().await?;
+                                    }
+                                    accumulated.clear();
                                 }
                             }
                         } else {
                             // No credential injection - forward as-is
-                            upstream_writer
-                                .write_all(&accumulated[..bytes_parsed])
-                                .await?;
-                            let _ = accumulated.drain(..bytes_parsed);
+                            upstream_writer.write_all(&accumulated).await?;
+                            let body_in_chunk = accumulated.len() - bytes_parsed;
+                            if let Some(cl) = req_content_length {
+                                if body_in_chunk < cl {
+                                    body_bytes_remaining = cl - body_in_chunk;
+                                } else {
+                                    upstream_writer.flush().await?;
+                                }
+                            } else {
+                                upstream_writer.flush().await?;
+                            }
+                            accumulated.clear();
                         }
                     } else {
                         // Failed to parse completely - forward as-is
-                        upstream_writer
-                            .write_all(&accumulated[..bytes_parsed])
-                            .await?;
-                        let _ = accumulated.drain(..bytes_parsed);
+                        upstream_writer.write_all(&accumulated).await?;
+                        upstream_writer.flush().await?;
+                        accumulated.clear();
                     }
                 }
                 Ok(httparse::Status::Partial) => {
@@ -1116,11 +1266,19 @@ where
     let mut llm_context: Option<LlmMetricsContext> = None;
     let mut llm_accumulator: Option<StreamingMetricsAccumulator> = None;
     let mut llm_is_streaming: Option<bool> = None;
+    let mut llm_is_gzip: Option<bool> = None;
     let mut llm_response_body: Vec<u8> = Vec::new();
     let mut llm_headers_parsed = false;
+    let mut llm_metrics_recorded = false; // Track if we've already recorded metrics
 
     loop {
-        let n = upstream_reader.read(&mut buf).await?;
+        let n = match upstream_reader.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::debug!(conn_id, error = %e, "upstream read error");
+                return Err(e.into());
+            }
+        };
         if n == 0 {
             break;
         }
@@ -1135,6 +1293,9 @@ where
         if llm_context.is_none() {
             let signal = llm_metrics_signal.lock().await;
             llm_context = signal.clone();
+            if llm_context.is_some() {
+                tracing::debug!(conn_id, "llm_context acquired from signal");
+            }
         }
 
         if credential_name.is_none() && llm_context.is_none() {
@@ -1148,6 +1309,12 @@ where
 
         // Handle LLM metrics extraction (forward while parsing - no modification)
         if credential_name.is_none() && llm_context.is_some() {
+            tracing::trace!(
+                conn_id,
+                n,
+                headers_parsed = llm_headers_parsed,
+                "processing llm response chunk"
+            );
             // Accumulate data for header parsing
             accumulated.extend_from_slice(&buf[..n]);
 
@@ -1167,13 +1334,22 @@ where
                                 .unwrap_or(false)
                     });
 
+                    // Check Content-Encoding for gzip
+                    let is_gzip = resp.headers.iter().any(|h| {
+                        h.name.eq_ignore_ascii_case("content-encoding")
+                            && std::str::from_utf8(h.value)
+                                .map(|v| v.contains("gzip"))
+                                .unwrap_or(false)
+                    });
+                    llm_is_gzip = Some(is_gzip);
+
                     llm_is_streaming = Some(is_sse);
 
                     if is_sse {
                         // Create streaming accumulator
                         if let Some(ref ctx) = llm_context {
                             llm_accumulator = Some(StreamingMetricsAccumulator::new(ctx.provider));
-                            tracing::debug!(conn_id, "detected sse streaming llm response");
+                            tracing::debug!(conn_id, path = %ctx.path, "detected sse streaming llm response");
                         }
                     } else {
                         tracing::debug!(conn_id, "detected non-streaming llm response");
@@ -1201,6 +1377,41 @@ where
                 if llm_is_streaming == Some(true) {
                     if let Some(ref mut acc) = llm_accumulator {
                         acc.process_chunk(&buf[..n]);
+
+                        // Record metrics immediately when complete (don't wait for EOF)
+                        // SSE streams may be interrupted by proxy shutdown before EOF
+                        if !llm_metrics_recorded && acc.is_complete() {
+                            if let Some(ref ctx) = llm_context {
+                                let metrics = acc.metrics();
+
+                                // Record to stats for file output
+                                state.stats.record_llm_metrics(
+                                    metrics.model.as_deref(),
+                                    metrics.input_tokens,
+                                    metrics.output_tokens,
+                                    metrics.cache_read_tokens,
+                                    &metrics.tool_calls,
+                                );
+
+                                // Record to Prometheus if available
+                                if let Some(ref registry) = state.metrics {
+                                    registry.record_llm_usage(
+                                        &ctx.host,
+                                        &ctx.credential,
+                                        metrics.model.as_deref(),
+                                        metrics.input_tokens,
+                                        metrics.output_tokens,
+                                        metrics.cache_read_tokens,
+                                        &metrics.tool_calls,
+                                    );
+                                }
+
+                                // Emit OpenTelemetry event for distributed tracing
+                                emit_llm_completion_span(ctx, metrics, conn_id);
+
+                                llm_metrics_recorded = true;
+                            }
+                        }
                     }
                 } else {
                     // Non-streaming: accumulate body for final parsing
@@ -1390,24 +1601,49 @@ where
         client_writer.write_all(&accumulated).await?;
     }
 
-    // Record LLM metrics at stream end
+    // Record LLM metrics at stream end (unless already recorded for streaming)
+    tracing::debug!(
+        conn_id,
+        has_llm_context = llm_context.is_some(),
+        already_recorded = llm_metrics_recorded,
+        "relay loop ended"
+    );
     if let Some(ctx) = llm_context {
+        let _had_accumulator = llm_accumulator.is_some();
+
+        // For streaming responses, metrics may have already been recorded when complete
+        // For non-streaming, we always record here
+        let should_record = !llm_metrics_recorded;
+
         let metrics = if let Some(acc) = llm_accumulator {
             // Streaming response - finalize accumulator
             acc.finalize()
         } else if !llm_response_body.is_empty() {
             // Non-streaming response - parse the buffered body
-            crate::proxy::llm::parse_llm_response(&llm_response_body, ctx.provider)
-                .unwrap_or_default()
+            // May need to decompress gzip and decode chunked encoding
+            let body = decode_response_body(&llm_response_body, llm_is_gzip == Some(true));
+            crate::proxy::llm::parse_llm_response(&body, ctx.provider).unwrap_or_default()
         } else {
             crate::proxy::llm::LlmMetrics::default()
         };
 
-        // Record to Prometheus if registry available
-        if let Some(ref registry) = state.metrics {
-            registry.record_llm_usage(
-                &ctx.host,
-                &ctx.credential,
+        // Only record if not already recorded during streaming
+        if should_record {
+            // Record to Prometheus if registry available
+            if let Some(ref registry) = state.metrics {
+                registry.record_llm_usage(
+                    &ctx.host,
+                    &ctx.credential,
+                    metrics.model.as_deref(),
+                    metrics.input_tokens,
+                    metrics.output_tokens,
+                    metrics.cache_read_tokens,
+                    &metrics.tool_calls,
+                );
+            }
+
+            // Record to stats for file output (for local execution mode)
+            state.stats.record_llm_metrics(
                 metrics.model.as_deref(),
                 metrics.input_tokens,
                 metrics.output_tokens,
@@ -1415,16 +1651,12 @@ where
                 &metrics.tool_calls,
             );
 
+            // Emit OpenTelemetry event for distributed tracing
+            emit_llm_completion_span(&ctx, &metrics, conn_id);
+        } else {
             tracing::debug!(
                 conn_id,
-                host = %ctx.host,
-                credential = %ctx.credential,
-                model = ?metrics.model,
-                input_tokens = ?metrics.input_tokens,
-                output_tokens = ?metrics.output_tokens,
-                cache_read_tokens = ?metrics.cache_read_tokens,
-                tool_calls = ?metrics.tool_calls.len(),
-                "recorded llm metrics"
+                "skipping duplicate llm metrics recording (already recorded during stream)"
             );
         }
 
@@ -1465,10 +1697,10 @@ async fn redact_oauth_response(
             .await;
         json["access_token"] = serde_json::Value::String(dummy);
         redacted_count += 1;
-        tracing::debug!(
+        tracing::info!(
             conn_id,
             credential = credential_name,
-            "redacted access_token"
+            "redacted access_token in oauth response"
         );
     }
 
@@ -1481,10 +1713,10 @@ async fn redact_oauth_response(
             .await;
         json["refresh_token"] = serde_json::Value::String(dummy);
         redacted_count += 1;
-        tracing::debug!(
+        tracing::info!(
             conn_id,
             credential = credential_name,
-            "redacted refresh_token"
+            "redacted refresh_token in oauth response"
         );
     }
 
@@ -1557,6 +1789,73 @@ fn empty_body() -> BoxBody {
     http_body_util::Empty::<bytes::Bytes>::new()
         .map_err(|never| match never {})
         .boxed()
+}
+
+/// Decode HTTP response body, handling chunked transfer encoding and gzip compression
+fn decode_response_body(raw_body: &[u8], is_gzip: bool) -> Vec<u8> {
+    // First, try to decode chunked transfer encoding
+    // Chunked format: <size_hex>\r\n<data>\r\n...<size_hex>\r\n<data>\r\n0\r\n\r\n
+    let decoded_chunks = decode_chunked(raw_body).unwrap_or_else(|| raw_body.to_vec());
+
+    // Then decompress gzip if needed
+    if is_gzip {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let mut decoder = GzDecoder::new(&decoded_chunks[..]);
+        let mut decompressed = Vec::new();
+        if decoder.read_to_end(&mut decompressed).is_ok() {
+            decompressed
+        } else {
+            tracing::warn!("failed to decompress gzip response body");
+            decoded_chunks
+        }
+    } else {
+        decoded_chunks
+    }
+}
+
+/// Decode chunked transfer encoding
+/// Returns None if the body doesn't appear to be chunked
+fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut pos = 0;
+
+    while pos < raw.len() {
+        // Find the end of the size line (CRLF)
+        let size_end = raw[pos..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|p| pos + p)?;
+
+        // Parse the hex size
+        let size_str = std::str::from_utf8(&raw[pos..size_end]).ok()?;
+        let size_str = size_str.split(';').next()?; // Handle chunk extensions
+        let chunk_size = usize::from_str_radix(size_str.trim(), 16).ok()?;
+
+        // Move past the size line and CRLF
+        pos = size_end + 2;
+
+        // Size 0 means end of chunks
+        if chunk_size == 0 {
+            break;
+        }
+
+        // Extract chunk data
+        if pos + chunk_size > raw.len() {
+            return None; // Incomplete chunk
+        }
+        result.extend_from_slice(&raw[pos..pos + chunk_size]);
+
+        // Move past chunk data and CRLF
+        pos += chunk_size + 2;
+    }
+
+    if result.is_empty() {
+        None // Doesn't look like valid chunked encoding
+    } else {
+        Some(result)
+    }
 }
 
 #[cfg(test)]

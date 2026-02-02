@@ -1,8 +1,12 @@
 // nix-jail: sandboxed execution with sparse checkout
+use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use std::collections::HashMap;
 use tracing_subscriber::{
-    fmt, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
+    filter, fmt, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
+    Layer,
 };
 
 pub mod cache;
@@ -35,9 +39,22 @@ pub use service::JailServiceImpl;
 
 /// Guard that ensures OpenTelemetry spans are flushed on shutdown.
 /// Drop this guard when the application exits to ensure all traces are exported.
-#[derive(Debug)]
 pub struct TracingGuard {
     provider: Option<SdkTracerProvider>,
+    /// Context guard that keeps the parent span context attached.
+    /// Must be dropped after provider to ensure spans are properly linked.
+    #[allow(dead_code)]
+    context_guard: Option<opentelemetry::ContextGuard>,
+}
+
+// Manual Debug impl since ContextGuard doesn't implement Debug
+impl std::fmt::Debug for TracingGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TracingGuard")
+            .field("provider", &self.provider)
+            .field("context_guard", &self.context_guard.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 impl Drop for TracingGuard {
@@ -48,6 +65,7 @@ impl Drop for TracingGuard {
             let _ = provider.force_flush();
             let _ = provider.shutdown();
         }
+        // context_guard is dropped after provider, which is correct order
     }
 }
 
@@ -89,12 +107,16 @@ pub fn init_tracing(
         (None, None)
     };
 
+    // Filter to exclude gen_ai target from console output (still goes to OTel)
+    let console_filter = filter::filter_fn(|metadata| metadata.target() != "gen_ai");
+
     // Build the subscriber - create otel layer inside each branch to satisfy type system
     if use_stderr {
         let fmt_layer = fmt::layer()
             .compact()
             .with_span_events(FmtSpan::CLOSE)
-            .with_writer(std::io::stderr);
+            .with_writer(std::io::stderr)
+            .with_filter(console_filter);
 
         let otel_layer = provider.as_ref().map(|p| {
             tracing_opentelemetry::layer().with_tracer(p.tracer(service_name.to_string()))
@@ -106,7 +128,10 @@ pub fn init_tracing(
             .with(otel_layer)
             .init();
     } else {
-        let fmt_layer = fmt::layer().compact().with_span_events(FmtSpan::CLOSE);
+        let fmt_layer = fmt::layer()
+            .compact()
+            .with_span_events(FmtSpan::CLOSE)
+            .with_filter(console_filter);
 
         let otel_layer = provider.as_ref().map(|p| {
             tracing_opentelemetry::layer().with_tracer(p.tracer(service_name.to_string()))
@@ -119,6 +144,10 @@ pub fn init_tracing(
             .init();
     }
 
+    // Extract parent trace context from environment variables (W3C Trace Context)
+    // This allows child processes to link their spans to the parent's trace
+    let context_guard = extract_parent_context_from_env();
+
     // Log OTel status now that tracing is initialized
     if let Some(error) = otel_init_error {
         tracing::warn!(error = %error, "failed to initialize opentelemetry, using console only");
@@ -127,8 +156,14 @@ pub fn init_tracing(
             tracing::debug!(endpoint = %endpoint, "opentelemetry export enabled");
         }
     }
+    if context_guard.is_some() {
+        tracing::debug!("attached parent trace context from environment");
+    }
 
-    TracingGuard { provider }
+    TracingGuard {
+        provider,
+        context_guard,
+    }
 }
 
 fn init_otlp_tracer(
@@ -153,6 +188,28 @@ fn init_otlp_tracer(
         .build();
 
     Ok(provider)
+}
+
+/// Extract parent trace context from TRACEPARENT/TRACESTATE environment variables.
+///
+/// This implements W3C Trace Context propagation for child processes.
+/// Returns a ContextGuard that must be kept alive to maintain the parent link.
+fn extract_parent_context_from_env() -> Option<opentelemetry::ContextGuard> {
+    let traceparent = std::env::var("TRACEPARENT").ok()?;
+
+    // Build a carrier from environment variables
+    let mut carrier: HashMap<String, String> = HashMap::new();
+    let _ = carrier.insert("traceparent".to_string(), traceparent);
+    if let Ok(tracestate) = std::env::var("TRACESTATE") {
+        let _ = carrier.insert("tracestate".to_string(), tracestate);
+    }
+
+    // Extract the context using W3C Trace Context propagator
+    let propagator = TraceContextPropagator::new();
+    let cx = propagator.extract(&carrier);
+
+    // Attach the context so subsequent spans will use it as parent
+    Some(cx.attach())
 }
 
 /// Create a new JailServiceServer with the given database path and config

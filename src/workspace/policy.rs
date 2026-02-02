@@ -32,6 +32,7 @@ pub fn write_proxy_config(
     credentials: &[&Credential],
     proxy_username: Option<String>,
     proxy_password: Option<String>,
+    otlp_endpoint: Option<String>,
 ) -> Result<PathBuf, String> {
     let config = ProxyConfig {
         listen_addr: listen_addr.to_string(),
@@ -41,6 +42,7 @@ pub fn write_proxy_config(
         proxy_username,
         proxy_password,
         request_log_path: None,
+        otlp_endpoint,
     };
 
     let config_path = config_dir.join("proxy-config.json");
@@ -72,6 +74,7 @@ mod tests {
             &empty_creds,
             None,
             None,
+            None, // otlp_endpoint
         )
         .expect("failed to write proxy config");
 

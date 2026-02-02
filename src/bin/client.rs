@@ -318,6 +318,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // Capture otlp_endpoint before destructuring cli.command
+    let otlp_endpoint = cli.otlp_endpoint.clone();
+
     // Handle Run command separately (doesn't need server connection)
     if let Commands::Run {
         package,
@@ -368,6 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             env,
             insecure_credentials,
             command,
+            otlp_endpoint,
         )
         .instrument(tracing::info_span!("run"))
         .await?;
@@ -795,6 +799,7 @@ async fn run_local(
     env: Vec<(String, String)>,
     insecure_credentials: bool,
     command: Vec<String>,
+    otlp_endpoint: Option<String>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     tracing::info!(packages = ?packages, repo = ?repo, path = ?path, "running locally");
 
@@ -1045,6 +1050,7 @@ git checkout"#,
         on_pty_ready,
         env,
         insecure_credentials,
+        otlp_endpoint,
     };
 
     // Create executor and job root

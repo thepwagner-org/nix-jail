@@ -311,6 +311,11 @@ impl CompiledPolicy {
             .get(credential_name)
             .ok_or_else(|| format!("Credential not found: {}", credential_name))?;
 
+        // Check cache first
+        if let Some(cached) = self.token_cache.get(credential_name).await {
+            return Ok(cached);
+        }
+
         // Use cache with automatic token fetching and retry
         let credential_clone = credential.clone();
         let cred_name_clone = credential_name.to_string();
@@ -324,7 +329,7 @@ impl CompiledPolicy {
                     crate::config::fetch_credential_token(&credential_clone).await
                 })
                 .await
-                .inspect(|_token| {
+                .inspect(|_| {
                     tracing::debug!("cached token for credential: {}", cred_name_clone);
                 })
             })
@@ -540,8 +545,8 @@ mod tests {
                 allowed_host_patterns: vec![r"api\.anthropic\.com".to_string()],
                 header_format: "Bearer {token}".to_string(),
                 dummy_token: None,
-                redact_response: false,
-                redact_paths: vec![],
+                redact_response: true,
+                redact_paths: vec![r"/oauth/token".to_string(), r"/token$".to_string()],
                 extract_llm_metrics: false,
                 llm_provider: None,
             },
@@ -554,8 +559,8 @@ mod tests {
                 allowed_host_patterns: vec![r"api\.github\.com".to_string()],
                 header_format: "token {token}".to_string(),
                 dummy_token: None,
-                redact_response: false,
-                redact_paths: vec![],
+                redact_response: true,
+                redact_paths: vec![r"/oauth/token".to_string(), r"/token$".to_string()],
                 extract_llm_metrics: false,
                 llm_provider: None,
             },
