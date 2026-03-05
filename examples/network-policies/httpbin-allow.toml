@@ -4,5 +4,5 @@
 [[rules]]
 action = "allow"
 [rules.pattern]
-host = "httpbin\\.org"
+host = "httpbin.org"
 path = "/get"

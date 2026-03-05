@@ -85,6 +85,30 @@ message JobRequest {
   // that reference other projects in the monorepo (e.g., shell.nix with `projects.foo`).
   // Example: ["projects/meow", "projects/shared-lib"]
   repeated string extra_paths = 14;
+
+  // Working directory for the job, relative to the workspace root.
+  // If omitted, defaults to the workspace root.
+  // Example: "projects/meow" sets CWD to <workspace>/projects/meow inside the sandbox.
+  optional string cwd = 15;
+
+  // Subdomain for reverse proxy routing (e.g., "my-project").
+  // When set, the web frontend maps {subdomain}.{base_hostname} to this job.
+  // Must be a valid DNS label (lowercase alphanumeric + hyphens).
+  optional string subdomain = 16;
+
+  // Port the job's web service will listen on inside the sandbox.
+  // When set (along with subdomain), alice spawns a reverse proxy listener
+  // that forwards inbound HTTP from the host to this port in the job's
+  // network namespace.
+  optional uint32 service_port = 17;
+
+  // Job profile names to apply in order (e.g., ["opencode", "cargo"]).
+  // The server loads each profile from its profile_dir and merges them
+  // sequentially into the request. Profiles are applied left-to-right;
+  // the first profile to set a singular field (script, hardening, etc.)
+  // wins. Additive fields (packages, env, network rules) accumulate across
+  // all profiles. Explicit request fields always take precedence.
+  repeated string profiles = 18;
 }
 
 // A credential provided by the client, valid only for this job
@@ -95,7 +119,7 @@ message EphemeralCredential {
   // The actual token value (will be injected by proxy, never logged)
   string token = 2;
 
-  // Host patterns this credential is allowed for (regex, e.g., ["github\\.com"])
+  // Host glob patterns this credential is allowed for (e.g., ["github.com", "*.example.com"])
   repeated string allowed_hosts = 3;
 
   // Header format template (e.g., "Bearer {token}", "token {token}")
@@ -131,10 +155,10 @@ message NetworkPattern {
 
 // Host pattern with optional path restriction
 message HostPattern {
-  // Host regex pattern (e.g., "api\\.anthropic\\.com", ".*\\.google\\.com")
+  // Host glob pattern (e.g., "api.anthropic.com", "*.google.com")
   string host = 1;
 
-  // Optional path regex pattern (e.g., "/v1/.*", "/owner/.*")
+  // Optional path glob pattern (e.g., "/v1/*", "/owner/*")
   optional string path = 2;
 }
 
@@ -212,6 +236,10 @@ message StreamRequest {
   // If omitted or 0, only stream live logs (attach to "now")
   // If N > 0, first send last N lines from storage, then stream live
   optional uint32 tail_lines = 2;
+
+  // If true, keep the stream open and follow live output while the job runs.
+  // If false (default), serve only stored logs and close immediately.
+  bool follow = 3;
 }
 
 // Source of a log entry
@@ -288,6 +316,23 @@ message JobInfo {
 
   // Total runtime in seconds (for completed jobs) or elapsed time (for running jobs)
   uint64 runtime_seconds = 8;
+
+  // Port of alice's reverse proxy listener on the host (127.0.0.1:PORT).
+  // Set when the job was submitted with service_port and alice has bound
+  // its inbound reverse proxy. The web frontend connects here.
+  optional uint32 reverse_proxy_port = 9;
+
+  // Subdomain for reverse proxy routing (mirrors JobRequest.subdomain).
+  optional string subdomain = 10;
+
+  // Script content (for exec mode, mirrors JobRequest.script).
+  optional string script = 11;
+
+  // Service port (mirrors JobRequest.service_port).
+  optional uint32 service_port = 12;
+
+  // Allowed hosts from the network policy (host patterns, for display/retry).
+  repeated string allowed_hosts = 13;
 }
 
 // Response containing a list of jobs
@@ -297,6 +342,18 @@ message ListJobsResponse {
 
   // Total number of jobs matching the filter (for pagination)
   uint32 total_count = 2;
+}
+
+// Request to cancel a running job
+message CancelJobRequest {
+  // The job ID to cancel
+  string job_id = 1;
+}
+
+// Response from cancelling a job
+message CancelJobResponse {
+  // Whether the job was found and a signal was sent
+  bool cancelled = 1;
 }
 
 // Request to run garbage collection on the cache
@@ -318,6 +375,9 @@ service JailService {
 
   // List jobs with optional filtering and pagination
   rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+
+  // Cancel a running job by sending SIGTERM to its systemd unit
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
 
   // Run garbage collection to clear the cache
   rpc Gc(GcRequest) returns (GcResponse);

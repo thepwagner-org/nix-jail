@@ -3,7 +3,7 @@
 #
 # Run (denied): cargo run --bin client -- exec -p curl -s examples/scripts/curl.sh
 # Run (allowed): cargo run --bin client -- exec -p curl -s examples/scripts/curl.sh --policy examples/network-policies/httpbin-allow.toml
-# Run (CLI override): cargo run --bin client -- exec -p curl -s examples/scripts/curl.sh --allow-host "httpbin\\.org"
+# Run (CLI override): cargo run --bin client -- exec -p curl -s examples/scripts/curl.sh --allow-host "httpbin.org"
 
 
 echo "=== Environment Variables ==="

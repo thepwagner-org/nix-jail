@@ -1,0 +1,37 @@
+# Allow access to Anthropic API for opencode
+# Requires "anthropic" credential configured with opencode_provider_id = "anthropic"
+
+[[rules]]
+action = "allow"
+credential = "anthropic"
+[rules.pattern]
+host = "api.anthropic.com"
+
+# opencode-anthropic-auth plugin uses console.anthropic.com for OAuth token refresh
+[[rules]]
+action = "allow"
+[rules.pattern]
+host = "console.anthropic.com"
+
+# opencode bootstraps itself by fetching plugins from npm on startup
+[[rules]]
+action = "allow"
+[rules.pattern]
+host = "registry.npmjs.org"
+
+[[rules]]
+action = "allow"
+[rules.pattern]
+host = "registry.bun.sh"
+
+# opencode web UI proxies frontend assets from app.opencode.ai
+[[rules]]
+action = "allow"
+[rules.pattern]
+host = "app.opencode.ai"
+
+# opencode fetches available models from models.dev
+[[rules]]
+action = "allow"
+[rules.pattern]
+host = "models.dev"

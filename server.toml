@@ -6,6 +6,7 @@ addr = "127.0.0.1:50051"
 state_dir = "/tmp/nix-jail"
 store_strategy = "bind-mount"  # Use store paths directly (no copy needed for sandbox-exec)
 otlp_endpoint = "https://tempo.pwagner.net:4317"
+profile_dir = "/etc/nixos/projects/nix-jail/profiles"
 
 # Cargo build caching (Swatinem/rust-cache pattern)
 [cache]
@@ -18,5 +19,19 @@ target_cache_dir = "/tmp/nix-jail/targets"  # Per-repo build artifacts
 name = "forgejo"
 type = "github"
 source_env = "GIT_TOKEN"
-allowed_host_patterns = ["git\\.pwagner\\.net"]
+allowed_host_patterns = ["git.pwagner.net"]
 header_format = "token {token}"
+
+# Anthropic API credential for opencode sessions.
+# Reads the access token from opencode's auth.json on the host.
+# alice intercepts oauth token refresh responses and dynamically updates
+# the injected token for the duration of the session.
+[[credentials]]
+name = "anthropic"
+type = "generic"
+opencode_provider_id = "anthropic"
+allowed_host_patterns = ["api.anthropic.com"]
+header_format = "x-api-key {token}"
+dummy_token = "sk-ant-oat01-DUMMY-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+redact_response = true
+extract_llm_metrics = true

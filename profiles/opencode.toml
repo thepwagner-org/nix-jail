@@ -1,0 +1,76 @@
+# Job profile for opencode coding agent sessions.
+#
+# Usage:
+#   nj exec --profile opencode --path projects/foo
+#   POST /api/jobs {"profile":"opencode","subdomain":"foo","service_port":3337}
+#
+# The profile supplies the script, network policy, hardening, and env vars.
+# Explicit flags / request fields always override these defaults.
+#
+# Credentials referenced here must exist in server.toml.
+
+description = "OpenCode coding agent session"
+
+# opencode's bun runtime requires JIT (W^X exception in systemd hardening)
+hardening = "jit-runtime"
+
+# opencode serve listens on this port inside the sandbox; meow-web reverse-proxies it
+service_port = 3337
+
+# Launch script — run opencode in server mode
+# cd to /workspace so opencode picks it up as the project root (opencode uses $PWD)
+script = """
+#!/usr/bin/env bash
+cd /workspace
+exec opencode serve --port 3337 --hostname 0.0.0.0 --print-logs
+"""
+
+# Credentials referenced by name from server.toml.
+# The server resolves these and makes them available via alice.
+credentials = ["anthropic"]
+
+# Shell environment providing opencode, zsh, coreutils, and git.
+# The name must match an entry in the server config [shells] table.
+shell = "sandbox"
+
+[environment]
+# Prevent opencode from trying to auto-update its binary inside the sandbox
+OPENCODE_DISABLE_AUTOUPDATE = "true"
+# Suppress LSP binary downloads (not useful inside the ephemeral sandbox)
+OPENCODE_DISABLE_LSP_DOWNLOAD = "true"
+# Disable the built-in opencode provider (we use the anthropic credential instead)
+OPENCODE_CONFIG_CONTENT = '{"disabled_providers":["opencode"]}'
+
+# Network rules — first match wins, everything else is blocked.
+# Credential names reference entries in server.toml [[credentials]].
+
+[[network.rules]]
+action = "allow"
+credential = "anthropic"
+[network.rules.pattern]
+host = "api.anthropic.com"
+
+[[network.rules]]
+action = "allow"
+[network.rules.pattern]
+host = "console.anthropic.com"
+
+[[network.rules]]
+action = "allow"
+[network.rules.pattern]
+host = "registry.npmjs.org"
+
+[[network.rules]]
+action = "allow"
+[network.rules.pattern]
+host = "registry.bun.sh"
+
+[[network.rules]]
+action = "allow"
+[network.rules.pattern]
+host = "app.opencode.ai"
+
+[[network.rules]]
+action = "allow"
+[network.rules.pattern]
+host = "models.dev"

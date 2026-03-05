@@ -580,3 +580,71 @@ pub fn build_pkg_config_path_env(store_paths: &[PathBuf]) -> String {
         .collect::<Vec<_>>()
         .join(":")
 }
+
+/// Check if a package string is a flake installable rather than a plain nixpkgs name.
+///
+/// Flake installables contain path separators, `#`, or `:` — e.g.:
+/// - `github:anomalyco/opencode/v1.2.14`
+/// - `/Users/pwagner/src#opencode`
+/// - `nixpkgs#hello`
+pub fn is_flake_installable(pkg: &str) -> bool {
+    pkg.contains('#') || pkg.contains('/') || pkg.contains(':')
+}
+
+/// Resolve a flake installable to its store path.
+///
+/// Runs `nix build <installable> --no-link --print-out-paths` and returns
+/// the output store path.
+pub async fn resolve_flake_installable(installable: &str) -> Result<PathBuf, WorkspaceError> {
+    tracing::info!(installable = %installable, "resolving flake installable");
+
+    let output = Command::new("nix")
+        .args(["build", installable, "--no-link", "--print-out-paths"])
+        .output()
+        .await
+        .map_err(|e| {
+            WorkspaceError::DerivationNotFound(format!(
+                "failed to execute nix build for '{}': {}",
+                installable, e
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(WorkspaceError::DerivationNotFound(format!(
+            "nix build failed for '{}': {}",
+            installable, stderr
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let path = stdout
+        .lines()
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| {
+            WorkspaceError::DerivationNotFound(format!(
+                "nix build produced no output for '{}'",
+                installable
+            ))
+        })?;
+
+    tracing::info!(installable = %installable, path = %path, "resolved flake installable");
+    Ok(PathBuf::from(path.trim()))
+}
+
+/// Find the best shell binary in the store paths.
+///
+/// Probes for `bin/zsh` then `bin/bash` across all store paths,
+/// returning the first match. This lets `SHELL` point at the
+/// nix-managed shell instead of the macOS system shell.
+pub fn find_shell(store_paths: &[PathBuf]) -> Option<PathBuf> {
+    for shell in ["zsh", "bash"] {
+        for path in store_paths {
+            let candidate = path.join("bin").join(shell);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}

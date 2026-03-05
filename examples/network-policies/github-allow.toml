@@ -4,10 +4,10 @@
 action = "allow"
 credential = "github"
 [rules.pattern]
-host = "api\\.github\\.com"
+host = "api.github.com"
 
 [[rules]]
 action = "allow"
 credential = "github"
 [rules.pattern]
-host = "github\\.com"
+host = "github.com"

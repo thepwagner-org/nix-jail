@@ -4,4 +4,4 @@
 [[rules]]
 action = "allow"
 [rules.pattern]
-host = ".*"
+host = "*"

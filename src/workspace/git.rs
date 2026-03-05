@@ -5,7 +5,8 @@
 //! # Security
 //! - Uses shallow clones (depth=1) for branches/tags (not commit SHAs)
 //! - All parameters are validated before use
-//! - No shell command execution (uses git2 library directly)
+//! - git2 paths (clone_repository, resolve_ref_to_commit) use libgit2 credential callbacks
+//! - git CLI paths (sparse_checkout_from_mirror) use GIT_ASKPASS to avoid embedding tokens in URLs
 
 use super::WorkspaceError;
 use crate::cache::WorkspaceStorage;
@@ -381,15 +382,13 @@ pub fn resolve_ref_from_mirror(
     Ok(sha)
 }
 
-/// Perform a sparse shallow checkout from a remote with local reference
+/// Perform a sparse shallow checkout from a remote
 ///
 /// Creates a shallow clone (depth=1) from the remote with sparse checkout configured.
-/// Uses the local mirror as a reference to avoid re-downloading objects that already
-/// exist locally. Only fetches objects needed for the single commit and sparse paths.
+/// Only fetches objects needed for the single commit and sparse paths.
 ///
 /// # Arguments
 /// * `repo_url` - Remote repository URL to clone from
-/// * `reference_path` - Optional path to local repository for object reuse
 /// * `target_dir` - Directory to create the checkout in
 /// * `commit_sha` - Commit SHA to checkout
 /// * `sparse_paths` - Paths to include in sparse checkout (empty = full checkout)
@@ -400,11 +399,11 @@ pub fn resolve_ref_from_mirror(
 /// - Uses `Command::new` with explicit args (no shell interpolation)
 pub fn sparse_checkout_from_mirror(
     repo_url: &str,
-    reference_path: Option<&Path>,
     target_dir: &Path,
     commit_sha: &str,
     sparse_paths: &[&str],
     storage: &Arc<dyn WorkspaceStorage>,
+    github_token: Option<&str>,
 ) -> Result<(), WorkspaceError> {
     use std::process::Command;
 
@@ -421,9 +420,63 @@ pub fn sparse_checkout_from_mirror(
         .create_dir(target_dir)
         .map_err(|e| WorkspaceError::IoError(std::io::Error::other(e.to_string())))?;
 
+    // Set up GIT_ASKPASS for authentication when a token is provided.
+    // We write a tiny shell script to a tempfile; git calls it when it needs
+    // credentials.  The script just echoes the token as the password — git
+    // ignores whatever username is returned by ASKPASS and uses "git" internally.
+    // Using ASKPASS keeps the token out of the URL and out of process arguments.
+    // Use TempPath (not NamedTempFile) so the write fd is closed before git execs
+    // the script. On Linux, execve() on a file with an open write fd fails with
+    // ETXTBSY ("Text file busy"). into_temp_path() drops the File while keeping
+    // the path alive so the file isn't deleted until _askpass_guard drops.
+    let _askpass_guard: Option<tempfile::TempPath> = if let Some(token) = github_token {
+        let mut f = tempfile::Builder::new()
+            .prefix("nix-jail-askpass-")
+            .suffix(".sh")
+            .tempfile()
+            .map_err(|e| {
+                WorkspaceError::IoError(std::io::Error::other(format!(
+                    "failed to create askpass tempfile: {}",
+                    e
+                )))
+            })?;
+        use std::io::Write as _;
+        writeln!(f, "#!/bin/sh").map_err(WorkspaceError::IoError)?;
+        writeln!(f, "echo '{}'", token.replace('\'', r"'\''")).map_err(WorkspaceError::IoError)?;
+        // Make the script executable before closing the fd
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(WorkspaceError::IoError)?;
+        // Close the write fd — keeps path alive but allows git to exec the script
+        let path = f.into_temp_path();
+        tracing::debug!("created git askpass script for authenticated clone");
+        Some(path)
+    } else {
+        None
+    };
+
+    /// Build a `Command::new("git")` with ASKPASS set when a token is available.
+    macro_rules! git_cmd {
+        () => {{
+            let mut cmd = Command::new("git");
+            if let Some(ref f) = _askpass_guard {
+                // Disable any system credential helpers so ASKPASS is used exclusively
+                let _ = cmd
+                    .env("GIT_ASKPASS", std::path::Path::new(&*f))
+                    .env("GIT_CONFIG_COUNT", "1")
+                    .env("GIT_CONFIG_KEY_0", "credential.helper")
+                    .env("GIT_CONFIG_VALUE_0", "");
+            }
+            cmd
+        }};
+    }
+
     // Step 1: Clone from remote with minimal object transfer
     // --depth 1: only fetch one commit (no history)
-    // --filter=blob:none: don't fetch blobs until needed (partial clone)
+    // --filter=combine:blob:none+tree:0: don't fetch blobs or trees eagerly.
+    //   tree:0 prevents the sandboxed process from enumerating sibling project
+    //   directories in the monorepo. Trees needed for sparse checkout paths are
+    //   fetched on demand during checkout (step 3) before the sandbox starts.
     // --sparse: only checkout specified paths
     // Note: We don't use --reference because --dissociate copies too many objects.
     // The filters already minimize network transfer effectively.
@@ -432,7 +485,7 @@ pub fn sparse_checkout_from_mirror(
         "--depth".to_string(),
         "1".to_string(),
         "--no-checkout".to_string(),
-        "--filter=blob:none".to_string(),
+        "--filter=combine:blob:none+tree:0".to_string(),
     ];
 
     // Add sparse cone mode
@@ -443,23 +496,12 @@ pub fn sparse_checkout_from_mirror(
     clone_args.push(repo_url.to_string());
     clone_args.push(target_dir.to_string_lossy().to_string());
 
-    // Log if reference path was provided (we don't use it, but useful for debugging)
-    if let Some(ref_path) = reference_path {
-        tracing::debug!(
-            reference = %ref_path.display(),
-            "reference path provided but not used (filters are sufficient)"
-        );
-    }
-
-    let clone_output = Command::new("git")
-        .args(&clone_args)
-        .output()
-        .map_err(|e| {
-            WorkspaceError::IoError(std::io::Error::other(format!(
-                "failed to run git clone: {}",
-                e
-            )))
-        })?;
+    let clone_output = git_cmd!().args(&clone_args).output().map_err(|e| {
+        WorkspaceError::IoError(std::io::Error::other(format!(
+            "failed to run git clone: {}",
+            e
+        )))
+    })?;
 
     if !clone_output.status.success() {
         return Err(WorkspaceError::IoError(std::io::Error::other(format!(
@@ -471,7 +513,7 @@ pub fn sparse_checkout_from_mirror(
     // Step 2: Configure sparse checkout paths if specified
     if !sparse_paths.is_empty() {
         // Set sparse checkout paths (--sparse already initialized cone mode)
-        let mut set_cmd = Command::new("git");
+        let mut set_cmd = git_cmd!();
         let _ = set_cmd.args([
             "-C",
             &target_dir.to_string_lossy(),
@@ -498,7 +540,7 @@ pub fn sparse_checkout_from_mirror(
     }
 
     // Step 3: Checkout HEAD (the shallow clone already has the right commit)
-    let checkout_output = Command::new("git")
+    let checkout_output = git_cmd!()
         .args(["-C", &target_dir.to_string_lossy(), "checkout"])
         .output()
         .map_err(|e| {
@@ -518,7 +560,7 @@ pub fn sparse_checkout_from_mirror(
     // Step 4: Remove extensions.worktreeConfig to make libgit2 happy
     // Sparse checkout sets this extension, but libgit2 doesn't support it and fails
     // with "unsupported extension name extensions.worktreeconfig"
-    let unset_output = Command::new("git")
+    let unset_output = git_cmd!()
         .args([
             "-C",
             &target_dir.to_string_lossy(),
@@ -548,7 +590,6 @@ pub fn sparse_checkout_from_mirror(
 
     tracing::info!(
         repo = %repo_url,
-        reference = ?reference_path.map(|p| p.display().to_string()),
         target = %target_dir.display(),
         commit = %commit_sha,
         sparse_paths = ?sparse_paths,

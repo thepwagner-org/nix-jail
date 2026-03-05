@@ -26,7 +26,10 @@ const DOCKER_NETWORK: &str = "nix-jail";
 ///
 /// Binds to 0.0.0.0 (all interfaces) because the Docker bridge interface
 /// doesn't exist when the proxy starts.
-pub const DOCKER_PROXY_ADDR: &str = "0.0.0.0:3128";
+///
+/// Port 0 lets the OS assign an ephemeral port, enabling concurrent jobs to each
+/// run their own alice instance without port conflicts.
+pub const DOCKER_PROXY_ADDR: &str = "0.0.0.0:0";
 
 /// Linux Docker-based executor with container isolation.
 ///
@@ -511,8 +514,19 @@ impl Executor for DockerExecutor {
             docker_args.extend(["-e".to_string(), format!("{}={}", key, value)]);
         }
 
-        // Working directory inside container
-        docker_args.extend(["-w".to_string(), "/workspace".to_string()]);
+        // Working directory inside container.
+        // When cwd is set (a subdirectory of working_dir), translate it to
+        // the corresponding path under /workspace.
+        let container_cwd = if let Some(ref cwd) = config.cwd {
+            if let Ok(relative) = cwd.strip_prefix(&config.working_dir) {
+                format!("/workspace/{}", relative.display())
+            } else {
+                "/workspace".to_string()
+            }
+        } else {
+            "/workspace".to_string()
+        };
+        docker_args.extend(["-w".to_string(), container_cwd]);
 
         // Choose base image based on store setup strategy
         let base_image = match &config.store_setup {
@@ -703,7 +717,7 @@ mod tests {
     async fn test_docker_executor_trait_methods() {
         let executor = DockerExecutor::new();
 
-        assert_eq!(executor.proxy_listen_addr(), "0.0.0.0:3128");
+        assert_eq!(executor.proxy_listen_addr(), "0.0.0.0:0");
         // proxy_connect_host is platform-specific
         #[cfg(target_os = "macos")]
         assert_eq!(executor.proxy_connect_host(), "host.docker.internal");

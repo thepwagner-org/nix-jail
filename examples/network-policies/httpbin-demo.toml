@@ -4,4 +4,4 @@
 action = "allow"
 credential = "demo"
 [rules.pattern]
-host = "httpbin\\.org"
+host = "httpbin.org"

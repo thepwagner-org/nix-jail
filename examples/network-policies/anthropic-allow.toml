@@ -5,12 +5,12 @@
 action = "allow"
 credential = "anthropic"
 [rules.pattern]
-host = "api\\.anthropic\\.com"
+host = "api.anthropic.com"
 
 # Claude Code also needs console.anthropic.com for OAuth/account
 [[rules]]
 action = "allow"
 credential = "anthropic"
 [rules.pattern]
-host = "console\\.anthropic\\.com"
+host = "console.anthropic.com"
 

@@ -125,6 +125,7 @@ impl TestConfigBuilder {
             hardening_profile: self.hardening_profile,
             interactive: self.interactive,
             pty_size: self.pty_size,
+            cwd: None,
             cache_mounts: vec![], // No caching in tests by default
         }
     }

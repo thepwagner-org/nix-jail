@@ -26,7 +26,7 @@ use super::traits::ResolvedCacheMount;
 /// - Explicitly silences expected denials to reduce log noise
 /// - Grants minimal permissions required for Nix builds
 /// - When proxy_port is None, network access is completely blocked
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn generate_profile(
     closure_paths: &[PathBuf],
     workspace_path: &Path,
@@ -150,6 +150,22 @@ pub fn generate_profile_with_cache(
         home.display()
     ));
 
+    // Allow path traversal from job_dir down to home for realpath/canonicalize.
+    // The subpath rule above covers `home` and below, but intermediate directories
+    // (job_dir, job_dir/root, job_dir/root/home) need file-read-metadata for lstat().
+    profile.push_str(";; Job directory path traversal (for canonicalize)\n");
+    let mut ancestor = home.parent();
+    while let Some(p) = ancestor {
+        profile.push_str(&format!(
+            "(allow file-read-metadata (literal \"{}\"))\n",
+            p.display()
+        ));
+        if p == job_dir {
+            break;
+        }
+        ancestor = p.parent();
+    }
+
     // Allow wrapper bin directory (for security wrapper script)
     let wrapper_bin = job_dir.join("bin");
     profile.push_str(";; Wrapper bin directory (security wrapper)\n");
@@ -158,16 +174,18 @@ pub fn generate_profile_with_cache(
         wrapper_bin.display()
     ));
 
-    // Allow file-read-metadata on parent directories (for realpath resolution)
-    // Node.js realpathSync needs to lstat each component of the path
-    profile.push_str(";; Parent directories (for realpath resolution)\n");
+    // Allow file-read-data on parent directories (for realpath resolution and bun .env lookup)
+    // Node.js realpathSync needs to lstat each component of the path.
+    // Bun walks parent directories at startup looking for bunfig.toml/.env files;
+    // if these reads are denied, bun silently drops process.env entirely.
+    profile.push_str(";; Parent directories (for realpath resolution and bun .env lookup)\n");
     let mut parent = workspace_path.parent();
     while let Some(p) = parent {
         if p.as_os_str().is_empty() || p == std::path::Path::new("/") {
             break;
         }
         profile.push_str(&format!(
-            "(allow file-read-metadata (literal \"{}\"))\n",
+            "(allow file-read-data file-read-metadata (literal \"{}\"))\n",
             p.display()
         ));
         parent = p.parent();
@@ -179,7 +197,7 @@ pub fn generate_profile_with_cache(
             break;
         }
         profile.push_str(&format!(
-            "(allow file-read-metadata (literal \"{}\"))\n",
+            "(allow file-read-data file-read-metadata (literal \"{}\"))\n",
             p.display()
         ));
         parent = p.parent();

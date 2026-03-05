@@ -240,7 +240,7 @@ impl CachedJobWorkspace {
             r#"
             set -e
             cd /workspace
-            git clone --depth 1 --filter=blob:none --sparse --no-checkout '{repo}' .
+            git clone --depth 1 --filter=combine:blob:none+tree:0 --sparse --no-checkout '{repo}' .
             git sparse-checkout set '{sparse_path}'
             git checkout
             "#,
@@ -525,7 +525,7 @@ impl CachedJobWorkspace {
                 let mirror = self.mirror.as_ref().ok_or_else(|| {
                     WorkspaceError::InvalidPath("sparse checkout requires mirror".into())
                 })?;
-                let mirror_path = mirror.sync(repo, github_token)?;
+                let _mirror_path = mirror.sync(repo, github_token)?;
 
                 // Include the project path, nix/ for flake support, and any extra paths
                 // (root flake.nix often imports nix/lib.nix, and projects may depend on each other)
@@ -543,11 +543,11 @@ impl CachedJobWorkspace {
 
                 git::sparse_checkout_from_mirror(
                     repo,
-                    Some(&mirror_path),
                     &temp_clone,
                     commit_sha,
                     &sparse_paths,
                     storage,
+                    github_token,
                 )?;
 
                 // Move to cache

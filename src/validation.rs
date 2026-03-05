@@ -232,7 +232,7 @@ pub fn validate_credential_redact_paths(
 /// NetworkPolicy validation error
 #[derive(Debug)]
 pub enum NetworkPolicyError {
-    InvalidRegex { pattern: String, error: String },
+    InvalidPattern { pattern: String, error: String },
     InvalidCidr { cidr: String, error: String },
     UnknownCredential { credential: String },
     MissingPattern,
@@ -241,8 +241,8 @@ pub enum NetworkPolicyError {
 impl std::fmt::Display for NetworkPolicyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NetworkPolicyError::InvalidRegex { pattern, error } => {
-                write!(f, "Invalid regex pattern '{}': {}", pattern, error)
+            NetworkPolicyError::InvalidPattern { pattern, error } => {
+                write!(f, "Invalid pattern '{}': {}", pattern, error)
             }
             NetworkPolicyError::InvalidCidr { cidr, error } => {
                 write!(f, "Invalid CIDR '{}': {}", cidr, error)
@@ -316,26 +316,24 @@ fn validate_network_rule(
     Ok(())
 }
 
-/// Validate a HostPattern (regex for host and optional path)
+/// Validate a HostPattern (glob for host and optional path)
 fn validate_host_pattern(pattern: &HostPattern) -> Result<(), NetworkPolicyError> {
-    // Validate host regex compiles with size limit to prevent ReDoS
-    let _ = RegexBuilder::new(&pattern.host)
-        .size_limit(MAX_REGEX_SIZE)
-        .build()
-        .map_err(|e| NetworkPolicyError::InvalidRegex {
+    // Validate host glob pattern is non-empty and reasonable
+    if pattern.host.is_empty() {
+        return Err(NetworkPolicyError::InvalidPattern {
             pattern: pattern.host.clone(),
-            error: e.to_string(),
-        })?;
+            error: "host pattern cannot be empty".to_string(),
+        });
+    }
 
-    // Validate path regex if present
+    // Validate path glob pattern if present
     if let Some(path) = &pattern.path {
-        let _ = RegexBuilder::new(path)
-            .size_limit(MAX_REGEX_SIZE)
-            .build()
-            .map_err(|e| NetworkPolicyError::InvalidRegex {
+        if path.is_empty() {
+            return Err(NetworkPolicyError::InvalidPattern {
                 pattern: path.clone(),
-                error: e.to_string(),
-            })?;
+                error: "path pattern cannot be empty".to_string(),
+            });
+        }
     }
 
     Ok(())
@@ -439,7 +437,7 @@ impl From<EphemeralCredentialError> for Status {
 /// - Name: non-empty, alphanumeric + hyphens only
 /// - Token: non-empty (NEVER log the value!)
 /// - At least one allowed host
-/// - Host patterns are valid regex (ReDoS protection)
+/// - Host patterns are valid globs (non-empty)
 /// - Header format contains {token} placeholder
 pub fn validate_ephemeral_credential(
     cred: &EphemeralCredential,
@@ -470,16 +468,15 @@ pub fn validate_ephemeral_credential(
         });
     }
 
-    // Validate each host pattern as valid regex (ReDoS protection)
+    // Validate each host glob pattern is non-empty
     for pattern in &cred.allowed_hosts {
-        let _ = RegexBuilder::new(pattern)
-            .size_limit(MAX_REGEX_SIZE)
-            .build()
-            .map_err(|e| EphemeralCredentialError::InvalidHostPattern {
+        if pattern.is_empty() {
+            return Err(EphemeralCredentialError::InvalidHostPattern {
                 name: cred.name.clone(),
                 pattern: pattern.clone(),
-                error: e.to_string(),
-            })?;
+                error: "host pattern cannot be empty".to_string(),
+            });
+        }
     }
 
     // Header format must contain {token}
@@ -615,7 +612,7 @@ mod tests {
                 keychain_service: "test".to_string(),
                 keychain_account: None,
             },
-            allowed_host_patterns: vec!["api\\.anthropic\\.com".to_string()],
+            allowed_host_patterns: vec!["api.anthropic.com".to_string()],
             header_format: "Bearer {token}".to_string(),
             dummy_token: None,
             redact_response: true,
@@ -710,164 +707,116 @@ mod tests {
     #[test]
     fn test_valid_host_pattern() {
         let pattern = HostPattern {
-            host: r"api\.anthropic\.com".to_string(),
-            path: Some(r"/v1/.*".to_string()),
+            host: "api.anthropic.com".to_string(),
+            path: Some("/v1/*".to_string()),
         };
         assert!(validate_host_pattern(&pattern).is_ok());
     }
 
     #[test]
-    fn test_invalid_host_regex() {
+    fn test_invalid_host_pattern() {
         let pattern = HostPattern {
-            host: r"[invalid(".to_string(),
+            host: "".to_string(),
             path: None,
         };
-        assert!(matches!(
-            validate_host_pattern(&pattern),
-            Err(NetworkPolicyError::InvalidRegex { .. })
-        ));
+        assert!(validate_host_pattern(&pattern).is_err());
     }
 
     #[test]
-    fn test_host_regex_wildcard_subdomain() {
+    fn test_host_pattern_wildcard_subdomain() {
         // Wildcard pattern for any subdomain of example.com
         let pattern = HostPattern {
-            host: r".*\.example\.com".to_string(),
+            host: "*.example.com".to_string(),
             path: None,
         };
         assert!(validate_host_pattern(&pattern).is_ok());
     }
 
     #[test]
-    fn test_host_regex_case_sensitive() {
-        // Regex is case-sensitive by default
+    fn test_host_pattern_case_sensitive() {
         let pattern = HostPattern {
-            host: r"API\.example\.com".to_string(),
+            host: "API.example.com".to_string(),
             path: None,
         };
         assert!(validate_host_pattern(&pattern).is_ok());
     }
 
     #[test]
-    fn test_host_regex_case_insensitive() {
-        // Case-insensitive flag
+    fn test_host_pattern_case_insensitive() {
+        // Globs don't have case-insensitive flags; just validate the pattern passes
         let pattern = HostPattern {
-            host: r"(?i)api\.example\.com".to_string(),
+            host: "api.example.com".to_string(),
             path: None,
         };
         assert!(validate_host_pattern(&pattern).is_ok());
     }
 
     #[test]
-    fn test_host_regex_unicode() {
+    fn test_host_pattern_unicode() {
         // Unicode domain names (IDN)
         let pattern = HostPattern {
-            host: r"münchen\.example\.com".to_string(),
+            host: "münchen.example.com".to_string(),
             path: None,
         };
         assert!(validate_host_pattern(&pattern).is_ok());
     }
 
     #[test]
-    fn test_host_regex_escaped_special_chars() {
-        // Test properly escaped special characters
+    fn test_host_pattern_special_chars() {
+        // Test special characters in host patterns
         let pattern = HostPattern {
-            host: r"api-v1\.example\.com".to_string(),
+            host: "api-v1.example.com".to_string(),
             path: None,
         };
         assert!(validate_host_pattern(&pattern).is_ok());
     }
 
     #[test]
-    fn test_host_regex_alternation() {
-        // Multiple hosts using alternation
+    fn test_host_pattern_anchored() {
+        // Exact host pattern
         let pattern = HostPattern {
-            host: r"(api|www|cdn)\.example\.com".to_string(),
+            host: "api.example.com".to_string(),
             path: None,
         };
         assert!(validate_host_pattern(&pattern).is_ok());
     }
 
     #[test]
-    fn test_host_regex_anchored() {
-        // Explicitly anchored pattern
+    fn test_path_pattern_valid() {
         let pattern = HostPattern {
-            host: r"^api\.example\.com$".to_string(),
-            path: None,
+            host: "api.example.com".to_string(),
+            path: Some("/v1/*".to_string()),
         };
         assert!(validate_host_pattern(&pattern).is_ok());
     }
 
     #[test]
-    fn test_path_regex_valid() {
+    fn test_path_pattern_invalid() {
         let pattern = HostPattern {
-            host: r"api\.example\.com".to_string(),
-            path: Some(r"/v[0-9]+/.*".to_string()),
+            host: "api.example.com".to_string(),
+            path: Some("".to_string()),
         };
-        assert!(validate_host_pattern(&pattern).is_ok());
+        assert!(validate_host_pattern(&pattern).is_err());
     }
 
     #[test]
-    fn test_path_regex_invalid() {
-        let pattern = HostPattern {
-            host: r"api\.example\.com".to_string(),
-            path: Some(r"[unclosed".to_string()),
-        };
-        assert!(matches!(
-            validate_host_pattern(&pattern),
-            Err(NetworkPolicyError::InvalidRegex { .. })
-        ));
-    }
-
-    #[test]
-    fn test_path_regex_empty() {
-        // None vs Some("") - both should be valid
+    fn test_path_pattern_empty() {
+        // None path should be valid (no path restriction)
         let pattern1 = HostPattern {
-            host: r"api\.example\.com".to_string(),
+            host: "api.example.com".to_string(),
             path: None,
         };
         assert!(validate_host_pattern(&pattern1).is_ok());
-
-        let pattern2 = HostPattern {
-            host: r"api\.example\.com".to_string(),
-            path: Some("".to_string()),
-        };
-        assert!(validate_host_pattern(&pattern2).is_ok());
     }
 
     #[test]
-    fn test_path_regex_query_string() {
+    fn test_path_pattern_query_string() {
         // Pattern that matches path with query strings
         let pattern = HostPattern {
-            host: r"api\.example\.com".to_string(),
-            path: Some(r"/search\?.*".to_string()),
+            host: "api.example.com".to_string(),
+            path: Some("/search?*".to_string()),
         };
         assert!(validate_host_pattern(&pattern).is_ok());
-    }
-
-    #[test]
-    fn test_host_regex_simple_redos_pattern_allowed() {
-        // Simple ReDoS patterns that don't exceed size limit still compile
-        // The size limit primarily protects against pathologically large patterns
-        let pattern = HostPattern {
-            host: r"(a+)+b".to_string(),
-            path: None,
-        };
-        assert!(validate_host_pattern(&pattern).is_ok());
-    }
-
-    #[test]
-    fn test_host_regex_exceeds_size_limit() {
-        // Pattern that exceeds compiled regex size limit
-        let huge_pattern = format!("({})+", "a".repeat(10000));
-        let pattern = HostPattern {
-            host: huge_pattern,
-            path: None,
-        };
-        assert!(matches!(
-            validate_host_pattern(&pattern),
-            Err(NetworkPolicyError::InvalidRegex { .. })
-        ));
     }
 
     #[test]
@@ -1027,7 +976,7 @@ mod tests {
             rules: vec![NetworkRule {
                 pattern: Some(NetworkPattern {
                     pattern: Some(network_pattern::Pattern::Host(HostPattern {
-                        host: r"github\.com".to_string(),
+                        host: "github.com".to_string(),
                         path: None,
                     })),
                 }),
@@ -1049,8 +998,8 @@ mod tests {
             rules: vec![NetworkRule {
                 pattern: Some(NetworkPattern {
                     pattern: Some(network_pattern::Pattern::Host(HostPattern {
-                        host: r"api\.anthropic\.com".to_string(),
-                        path: Some(r"/v1/.*".to_string()),
+                        host: "api.anthropic.com".to_string(),
+                        path: Some("/v1/*".to_string()),
                     })),
                 }),
                 action: NetworkAction::Allow as i32,
@@ -1175,7 +1124,7 @@ mod tests {
         EphemeralCredential {
             name: "github-publish-abc123".to_string(),
             token: "ghs_xxxxxxxxxxxx".to_string(),
-            allowed_hosts: vec!["github\\.com".to_string()],
+            allowed_hosts: vec!["github.com".to_string()],
             header_format: "Bearer {token}".to_string(),
         }
     }
@@ -1191,7 +1140,7 @@ mod tests {
         let cred = EphemeralCredential {
             name: "multi-host".to_string(),
             token: "token123".to_string(),
-            allowed_hosts: vec!["github\\.com".to_string(), "api\\.github\\.com".to_string()],
+            allowed_hosts: vec!["github.com".to_string(), "api.github.com".to_string()],
             header_format: "token {token}".to_string(),
         };
         assert!(validate_ephemeral_credential(&cred).is_ok());
@@ -1293,11 +1242,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_ephemeral_credential_invalid_host_regex() {
+    fn test_validate_ephemeral_credential_empty_host_pattern() {
         let cred = EphemeralCredential {
             name: "test".to_string(),
             token: "tok".to_string(),
-            allowed_hosts: vec!["[invalid".to_string()],
+            allowed_hosts: vec!["".to_string()],
             header_format: "Bearer {token}".to_string(),
         };
         assert!(matches!(
@@ -1307,14 +1256,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_ephemeral_credential_complex_valid_regex() {
+    fn test_validate_ephemeral_credential_complex_valid_pattern() {
         let cred = EphemeralCredential {
             name: "test".to_string(),
             token: "tok".to_string(),
-            allowed_hosts: vec![
-                r".*\.github\.com".to_string(),
-                r"api\.anthropic\.com".to_string(),
-            ],
+            allowed_hosts: vec!["*.github.com".to_string(), "api.anthropic.com".to_string()],
             header_format: "Bearer {token}".to_string(),
         };
         assert!(validate_ephemeral_credential(&cred).is_ok());

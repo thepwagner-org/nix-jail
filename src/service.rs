@@ -8,7 +8,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::cache::CacheManager;
 use crate::config;
 use crate::jail::jail_service_server::JailService;
-use crate::jail::{JobRequest, JobResponse, LogEntry, StreamRequest};
+use crate::jail::{
+    CancelJobRequest, CancelJobResponse, JobRequest, JobResponse, LogEntry, StreamRequest,
+};
 use crate::job_workspace::JobWorkspace;
 use crate::orchestration;
 use crate::storage::{JobMetadata, JobStatus, JobStorage};
@@ -122,11 +124,31 @@ impl JailService for JailServiceImpl {
         let span = tracing::info_span!("grpc.submit_job");
         let _ = span.set_parent(parent_context);
 
-        let req = request.into_inner();
+        let mut req = request.into_inner();
         let this = self.clone();
 
         async move {
-        // Validation
+        // Apply job profile defaults before validation so the profile can supply
+        // the script, network policy, env vars, etc.
+        // Profiles are applied left-to-right; additive fields accumulate,
+        // singular fields (script, hardening, etc.) are set by the first profile
+        // that supplies them. Explicit request fields always win.
+        for profile_name in &req.profiles.clone() {
+            match this.config.load_profile(profile_name) {
+                Ok(profile) => {
+                    tracing::info!(profile = %profile_name, "applying job profile");
+                    profile.apply_defaults_to(&mut req, &this.config.credentials, &this.config.shells);
+                }
+                Err(e) => {
+                    tracing::warn!(profile = %profile_name, error = %e, "failed to load profile");
+                    return Err(Status::invalid_argument(format!(
+                        "unknown profile {profile_name:?}: {e}"
+                    )));
+                }
+            }
+        }
+
+        // Validation (after profile application so profile-supplied values are checked)
         validation::validate_script(&req.script)?;
         if !req.repo.is_empty() {
             validation::validate_repo(&req.repo)?;
@@ -155,6 +177,17 @@ impl JailService for JailServiceImpl {
         let job_id = Ulid::new().to_string();
         let interactive = req.interactive.unwrap_or(false);
 
+        // Append a short job-ID suffix to any requested subdomain so each job
+        // gets a fresh browser origin → fresh localStorage → no stale opencode
+        // session state from a previous job with the same name.
+        // E.g. "opencode" → "opencode-8qsr7k" (last 6 chars of ULID, lowercased).
+        if let Some(ref base) = req.subdomain.clone() {
+            if !base.is_empty() {
+                let suffix = job_id[job_id.len() - 6..].to_ascii_lowercase();
+                req.subdomain = Some(format!("{base}-{suffix}"));
+            }
+        }
+
         tracing::info!(
             job_id = %job_id,
             packages = ?req.packages,
@@ -181,6 +214,9 @@ impl JailService for JailServiceImpl {
             push: req.push.unwrap_or(false),
             caches: req.caches.clone(),
             extra_paths: req.extra_paths.clone(),
+            cwd: req.cwd.clone(),
+            subdomain: req.subdomain.clone(),
+            service_port: req.service_port,
             status: JobStatus::Running,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -235,7 +271,7 @@ impl JailService for JailServiceImpl {
         };
 
         // Spawn execution task with trace context propagated
-        let exec_span = tracing::info_span!(parent: tracing::Span::current(), "execute_job", job_id = %job_id);
+        let exec_span = tracing::info_span!(parent: tracing::Span::current(), "execute_job", job_id = %job_id, repo = %req.repo, path = %req.path);
         let task_handle = tokio::spawn(
             async move {
                 orchestration::execute_job(
@@ -268,6 +304,8 @@ impl JailService for JailServiceImpl {
         let running_job = RunningJob {
             log_tx,
             task_handle,
+            reverse_proxy_port: None, // set later by execute_job after alice starts
+            subdomain: req.subdomain.clone(),
         };
         let mut jobs = this.registry.jobs.write().await;
         let _ = jobs.insert(job_id.clone(), running_job);
@@ -294,6 +332,7 @@ impl JailService for JailServiceImpl {
         let req = request.into_inner();
         let job_id = req.job_id;
         let tail_lines = req.tail_lines;
+        let follow = req.follow;
 
         // Check if job exists
         let job = self
@@ -306,12 +345,13 @@ impl JailService for JailServiceImpl {
             job_id = %job_id,
             status = %job.status.to_string(),
             tail_lines = ?tail_lines,
+            follow = follow,
             "streaming job"
         );
 
         match job.status {
-            JobStatus::Running => {
-                // Job is running, subscribe to its broadcast channel
+            JobStatus::Running if follow => {
+                // Job is running and client wants live output: subscribe to broadcast channel
                 if let Some(mut broadcast_rx) = self.registry.subscribe(&job_id).await {
                     let (tx, rx) = tokio::sync::mpsc::channel(config::CHANNEL_BUFFER_SIZE);
                     let storage = self.storage.clone();
@@ -404,8 +444,9 @@ impl JailService for JailServiceImpl {
                     Ok(Response::new(ReceiverStream::new(rx)))
                 }
             }
-            JobStatus::Completed | JobStatus::Failed => {
-                // Job is done, serve existing logs
+            JobStatus::Running | JobStatus::Completed | JobStatus::Failed => {
+                // Job is done, or running but client does not want to follow:
+                // serve stored logs only and close the stream.
                 let (tx, rx) = tokio::sync::mpsc::channel(config::CHANNEL_BUFFER_SIZE);
                 orchestration::serve_stored_logs(job_id, self.storage.clone(), tx).await;
                 Ok(Response::new(ReceiverStream::new(rx)))
@@ -458,60 +499,94 @@ impl JailService for JailServiceImpl {
             .list_jobs(status_filter, limit, offset)
             .map_err(|e| Status::internal(format!("Failed to list jobs: {}", e)))?;
 
-        // Convert JobMetadata to JobInfo
-        let job_infos: Vec<crate::jail::JobInfo> = jobs
-            .into_iter()
-            .map(|job| {
-                let created_timestamp = job
-                    .created_at
-                    .duration_since(SystemTime::UNIX_EPOCH)
+        // Convert JobMetadata to JobInfo, enriching running jobs with
+        // live data from the job registry (reverse proxy port, subdomain).
+        let registry = &self.registry;
+        let mut job_infos: Vec<crate::jail::JobInfo> = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let created_timestamp = job
+                .created_at
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+
+            let completed_timestamp = job.completed_at.map(|t| {
+                t.duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs() as i64;
+                    .as_secs() as i64
+            });
 
-                let completed_timestamp = job.completed_at.map(|t| {
-                    t.duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64
-                });
+            // Calculate runtime
+            let runtime_seconds = if let Some(completed_at) = job.completed_at {
+                completed_at
+                    .duration_since(job.created_at)
+                    .unwrap_or_default()
+                    .as_secs()
+            } else {
+                SystemTime::now()
+                    .duration_since(job.created_at)
+                    .unwrap_or_default()
+                    .as_secs()
+            };
 
-                // Calculate runtime
-                let runtime_seconds = if let Some(completed_at) = job.completed_at {
-                    completed_at
-                        .duration_since(job.created_at)
-                        .unwrap_or_default()
-                        .as_secs()
+            // Enrich with live data from job registry (for running jobs)
+            let (reverse_proxy_port, subdomain) =
+                registry.get_web_info(&job.id).await.unwrap_or((None, None));
+
+            // Extract allowed host patterns from the network policy for display/retry
+            let allowed_hosts: Vec<String> = job
+                .network_policy
+                .as_ref()
+                .map(|policy| {
+                    policy
+                        .rules
+                        .iter()
+                        .filter_map(|rule| {
+                            use crate::jail::network_pattern::Pattern;
+                            rule.pattern
+                                .as_ref()
+                                .and_then(|p| p.pattern.as_ref())
+                                .and_then(|p| match p {
+                                    Pattern::Host(h) => Some(h.host.clone()),
+                                    Pattern::Ip(_) => None,
+                                })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            job_infos.push(crate::jail::JobInfo {
+                job_id: job.id,
+                status: job.status.to_string(),
+                created_at: Some(prost_types::Timestamp {
+                    seconds: created_timestamp,
+                    nanos: 0,
+                }),
+                completed_at: completed_timestamp
+                    .map(|seconds| prost_types::Timestamp { seconds, nanos: 0 }),
+                repo: if job.repo.is_empty() {
+                    None
                 } else {
-                    // For running jobs, calculate elapsed time
-                    SystemTime::now()
-                        .duration_since(job.created_at)
-                        .unwrap_or_default()
-                        .as_secs()
-                };
-
-                crate::jail::JobInfo {
-                    job_id: job.id,
-                    status: job.status.to_string(),
-                    created_at: Some(prost_types::Timestamp {
-                        seconds: created_timestamp,
-                        nanos: 0,
-                    }),
-                    completed_at: completed_timestamp
-                        .map(|seconds| prost_types::Timestamp { seconds, nanos: 0 }),
-                    repo: if job.repo.is_empty() {
-                        None
-                    } else {
-                        Some(job.repo)
-                    },
-                    path: if job.path.is_empty() || job.path == "." {
-                        None
-                    } else {
-                        Some(job.path)
-                    },
-                    packages: job.packages,
-                    runtime_seconds,
-                }
-            })
-            .collect();
+                    Some(job.repo)
+                },
+                path: if job.path.is_empty() || job.path == "." {
+                    None
+                } else {
+                    Some(job.path)
+                },
+                packages: job.packages,
+                runtime_seconds,
+                reverse_proxy_port: reverse_proxy_port.map(|p| p as u32),
+                subdomain,
+                script: if job.script.is_empty() {
+                    None
+                } else {
+                    Some(job.script)
+                },
+                service_port: job.service_port,
+                allowed_hosts,
+            });
+        }
 
         tracing::info!(count = job_infos.len(), total = total_count, "listed jobs");
 
@@ -550,5 +625,47 @@ impl JailService for JailServiceImpl {
         Ok(Response::new(crate::jail::GcResponse {
             deleted_count: total_deleted as u32,
         }))
+    }
+
+    async fn cancel_job(
+        &self,
+        request: Request<CancelJobRequest>,
+    ) -> Result<Response<CancelJobResponse>, Status> {
+        let parent_context = extract_trace_context(&request);
+        let span = tracing::info_span!("grpc.cancel_job");
+        let _ = span.set_parent(parent_context);
+        let _guard = span.enter();
+
+        let job_id = request.into_inner().job_id;
+
+        // Verify the job exists and is running
+        let job = self
+            .storage
+            .get_job(&job_id)
+            .map_err(|e| Status::internal(format!("storage error: {}", e)))?
+            .ok_or_else(|| Status::not_found(format!("job not found: {}", job_id)))?;
+
+        if job.status != JobStatus::Running {
+            return Ok(Response::new(CancelJobResponse { cancelled: false }));
+        }
+
+        // Send SIGTERM to the systemd transient unit. Unit name matches the
+        // pattern used in SystemdExecutor::execute(): "nix-jail-{job_id}".
+        let unit_name = format!("nix-jail-{}.service", job_id);
+        tracing::info!(job_id = %job_id, unit = %unit_name, "cancelling job");
+
+        let output = tokio::process::Command::new("systemctl")
+            .args(["kill", "--kill-whom=all", "--signal=SIGTERM", &unit_name])
+            .output()
+            .await
+            .map_err(|e| Status::internal(format!("systemctl kill failed: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Unit may have already exited — not a hard error
+            tracing::warn!(job_id = %job_id, stderr = %stderr, "systemctl kill returned non-zero");
+        }
+
+        Ok(Response::new(CancelJobResponse { cancelled: true }))
     }
 }

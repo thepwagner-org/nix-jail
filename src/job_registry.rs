@@ -16,6 +16,10 @@ pub struct RunningJob {
     pub log_tx: broadcast::Sender<Result<LogEntry, Status>>,
     /// Task handle for the job execution
     pub task_handle: JoinHandle<()>,
+    /// Port of alice's reverse proxy listener on the host (set after proxy starts)
+    pub reverse_proxy_port: Option<u16>,
+    /// Subdomain for web frontend routing (from JobRequest)
+    pub subdomain: Option<String>,
 }
 
 /// Registry of currently running jobs
@@ -44,6 +48,8 @@ impl JobRegistry {
         let running_job = RunningJob {
             log_tx: log_tx.clone(),
             task_handle,
+            reverse_proxy_port: None,
+            subdomain: None,
         };
 
         let mut jobs = self.jobs.write().await;
@@ -75,6 +81,24 @@ impl JobRegistry {
     pub async fn is_running(&self, job_id: &str) -> bool {
         let jobs = self.jobs.read().await;
         jobs.contains_key(job_id)
+    }
+
+    /// Update the reverse proxy port for a running job.
+    ///
+    /// Called from the execution task after alice starts and reports
+    /// its reverse proxy listener port.
+    pub async fn set_reverse_proxy_port(&self, job_id: &str, port: u16) {
+        let mut jobs = self.jobs.write().await;
+        if let Some(job) = jobs.get_mut(job_id) {
+            job.reverse_proxy_port = Some(port);
+        }
+    }
+
+    /// Get the reverse proxy port and subdomain for a running job.
+    pub async fn get_web_info(&self, job_id: &str) -> Option<(Option<u16>, Option<String>)> {
+        let jobs = self.jobs.read().await;
+        jobs.get(job_id)
+            .map(|j| (j.reverse_proxy_port, j.subdomain.clone()))
     }
 }
 

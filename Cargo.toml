@@ -62,29 +62,25 @@ tracing-opentelemetry = "0.32"
 chrono = "0.4"
 nu-ansi-term = "0.50"
 
-# Proxy dependencies
+# Metrics HTTP server
 hyper = { version = "1.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 http-body-util = "0.1"
+
+# Shared dependencies
 ipnetwork = "0.21"
 rustls = { version = "0.23", features = ["ring"] }
-tokio-rustls = "0.26"
-socket2 = "0.5"
-rcgen = "0.14"
-bytes = "1.11.1"
-webpki-roots = "1.0"
-time = "0.3.47"
-httparse = "1.9"
 regex = "1.12.2"
 nix = { version = "0.30", features = ["signal", "term"] }
 moka = { version = "0.12", features = ["future", "sync"] }
 tokio-retry = "0.3"
-git2 = { version = "0.20.2", features = ["https", "vendored-openssl", "vendored-libgit2"] }
+git2 = { version = "0.20.4", features = ["https", "vendored-openssl", "vendored-libgit2"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 thiserror = "2.0"
+anyhow = "1"
 portable-pty = "0.9"
 prometheus = { version = "0.14", features = ["process"] }
-flate2 = "1.1.8"
+which = "7"
 
 # Network namespace management (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -93,6 +89,18 @@ rtnetlink = "0.18"
 # Async utilities (used on all platforms for WebSocket)
 [dependencies.futures]
 version = "0.3"
+
+[[bin]]
+name = "nixjaild"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "nj"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "nj-web"
+path = "src/bin/web/main.rs"
 
 [build-dependencies]
 tonic-build = "0.14"

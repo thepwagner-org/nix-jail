@@ -15,7 +15,7 @@ use super::traits::{ExecutionConfig, ExecutionHandle, Executor, ExecutorError, H
 use async_trait::async_trait;
 use futures::stream::TryStreamExt;
 use rtnetlink::{new_connection, LinkUnspec, LinkVeth};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -35,7 +35,10 @@ const VETH_PREFIX_LEN: u8 = 30; // /30 = 2 usable IPs (network, proxy, job, broa
 ///
 /// SECURITY: This is safe because network namespace isolation ensures the job can ONLY
 /// reach the proxy via the veth pair. The job has no route to any other network.
-pub const LINUX_PROXY_ADDR: &str = "0.0.0.0:3128";
+///
+/// Port 0 lets the OS assign an ephemeral port, enabling concurrent jobs to each
+/// run their own alice instance without port conflicts.
+pub const LINUX_PROXY_ADDR: &str = "0.0.0.0:0";
 
 /// Network isolation strategy for a job
 enum NetworkSetup {
@@ -92,7 +95,6 @@ fn workspace_to_chroot_path(host_path: &Path, workspace_root: &Path) -> PathBuf 
 fn generate_hardening_properties(
     root_dir: &Path,
     workspace: &Path,
-    _job_id: &str,
     config: &ExecutionConfig,
     profile: HardeningProfile,
     sandbox_user: (&str, &str),
@@ -610,6 +612,9 @@ pub struct SystemdExecutor {
     /// Tracks allocated IP subnet counters for active jobs
     /// Each counter represents a /30 subnet: counter * 4 gives offset from 10.0.0.0
     allocated_subnets: Arc<Mutex<HashSet<u32>>>,
+    /// Subnet allocations by job_id, set up before alice starts when a reverse
+    /// proxy is needed. execute() picks these up instead of allocating fresh.
+    allocated_networks: Arc<Mutex<HashMap<String, (Ipv4Addr, u32)>>>,
 }
 
 impl Default for SystemdExecutor {
@@ -622,7 +627,39 @@ impl SystemdExecutor {
     pub fn new() -> Self {
         SystemdExecutor {
             allocated_subnets: Arc::new(Mutex::new(HashSet::new())),
+            allocated_networks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Allocate a /30 subnet for a job before the executor runs.
+    ///
+    /// Returns the job's IP address (e.g. 10.0.0.2). The subnet counter is
+    /// stored internally so that `execute()` reuses it, keeping alice's
+    /// `[reverse_proxy]` backend address consistent with the actual namespace IP.
+    #[allow(clippy::expect_used)]
+    fn do_setup_network(&self, job_id: &str) -> Result<Ipv4Addr, ExecutorError> {
+        let (proxy_ip, job_ip, counter) = self.allocate_subnet()?;
+        tracing::debug!(
+            job_id = %job_id,
+            proxy_ip = %proxy_ip,
+            job_ip = %job_ip,
+            "allocated subnet for job network namespace"
+        );
+        let _ = self
+            .allocated_networks
+            .lock()
+            .expect("allocated_networks mutex poisoned")
+            .insert(job_id.to_string(), (job_ip, counter));
+        Ok(job_ip)
+    }
+
+    /// Retrieve and consume the allocated (job_ip, counter) for a job, if any.
+    #[allow(clippy::expect_used)]
+    fn take_allocated_network(&self, job_id: &str) -> Option<(Ipv4Addr, u32)> {
+        self.allocated_networks
+            .lock()
+            .expect("allocated_networks mutex poisoned")
+            .remove(job_id)
     }
 
     /// Allocates a unique /30 subnet for a job
@@ -684,7 +721,6 @@ impl SystemdExecutor {
         &self,
         systemd_args: Vec<String>,
         unit_name: String,
-        _pty_size: Option<(u16, u16)>,
         timeout_duration: std::time::Duration,
         job_id: String,
         cleanup_tx: Option<oneshot::Sender<i32>>,
@@ -868,7 +904,15 @@ impl Executor for SystemdExecutor {
         // - With proxy: allocate IP subnet and create veth-based network namespace
         // - Without proxy: use PrivateNetwork=yes for simpler loopback-only isolation
         let network_setup = if config.proxy_port.is_some() {
-            let (proxy_ip, job_ip, subnet_counter) = self.allocate_subnet()?;
+            // Use already-allocated subnet if network was set up before alice started
+            let (proxy_ip, job_ip, subnet_counter) =
+                if let Some((job_ip, counter)) = self.take_allocated_network(job_id) {
+                    let base_ip = u32::from(job_ip) - 1; // job is proxy+1
+                    let proxy_ip = Ipv4Addr::from(base_ip);
+                    (proxy_ip, job_ip, counter)
+                } else {
+                    self.allocate_subnet()?
+                };
             create_network_namespace(job_id, proxy_ip, job_ip).await?;
             let netns_path = format!("/var/run/netns/nix-jail-{}", job_id);
             NetworkSetup::Namespace {
@@ -898,7 +942,6 @@ impl Executor for SystemdExecutor {
         let properties = generate_hardening_properties(
             root_dir,
             &workspace_bind_source,
-            job_id,
             &config,
             config.hardening_profile,
             sandbox_user,
@@ -943,12 +986,17 @@ impl Executor for SystemdExecutor {
         // Set working directory inside chroot
         // - Server mode: working_dir is under job_dir/workspace, convert to /workspace/subpath
         // - Local mode: working_dir is user's directory bound directly at /workspace
-        let chroot_working_dir = if config.working_dir.starts_with(&job_workspace) {
-            // Server mode: convert host path to chroot-relative path
-            // e.g., /var/lib/nix-jail/jobs/{id}/workspace/projects/foo -> /workspace/projects/foo
-            workspace_to_chroot_path(&config.working_dir, &job_workspace)
+        // When cwd is set, use it as the CWD (translated to chroot-relative path).
+        let effective_cwd = config.cwd.as_deref().unwrap_or(&config.working_dir);
+        let chroot_working_dir = if effective_cwd.starts_with(&job_workspace) {
+            workspace_to_chroot_path(effective_cwd, &job_workspace)
+        } else if effective_cwd.starts_with(&config.working_dir) {
+            // cwd is a subdirectory of working_dir — translate to /workspace/subdir
+            let relative = effective_cwd
+                .strip_prefix(&config.working_dir)
+                .unwrap_or(Path::new(""));
+            PathBuf::from("/workspace").join(relative)
         } else {
-            // Local mode: user's directory is bound at /workspace
             PathBuf::from("/workspace")
         };
         systemd_args.push(format!(
@@ -1019,6 +1067,7 @@ impl Executor for SystemdExecutor {
             let (cleanup_tx, cleanup_rx) = oneshot::channel();
             let executor_clone = Self {
                 allocated_subnets: Arc::clone(&self.allocated_subnets),
+                allocated_networks: Arc::clone(&self.allocated_networks),
             };
             let job_id_clone = config.job_id.clone();
             let subnet_counter = *subnet_counter;
@@ -1047,7 +1096,6 @@ impl Executor for SystemdExecutor {
             self.execute_interactive(
                 systemd_args,
                 unit_name,
-                config.pty_size,
                 timeout_duration,
                 job_id,
                 cleanup_tx,
@@ -1064,6 +1112,10 @@ impl Executor for SystemdExecutor {
             )
             .await
         }
+    }
+
+    fn setup_network(&self, job_id: &str) -> Result<Option<std::net::Ipv4Addr>, ExecutorError> {
+        self.do_setup_network(job_id).map(Some)
     }
 
     fn proxy_listen_addr(&self) -> &'static str {
@@ -1255,13 +1307,13 @@ mod tests {
             hardening_profile: HardeningProfile::Default,
             interactive: false,
             pty_size: None,
+            cwd: None,
             cache_mounts: vec![],
         };
 
         let props = generate_hardening_properties(
             &root,
             &workspace,
-            "test-job",
             &config,
             HardeningProfile::Default,
             ("nix-jail", "nix-jail"),
@@ -1367,13 +1419,13 @@ mod tests {
             hardening_profile: HardeningProfile::Default,
             interactive: false,
             pty_size: None,
+            cwd: None,
             cache_mounts: vec![],
         };
 
         let props = generate_hardening_properties(
             &root,
             &workspace,
-            "test-job",
             &config,
             HardeningProfile::Default,
             ("nix-jail", "nix-jail"),
@@ -1553,7 +1605,7 @@ mod tests {
         // Cleanup
         executor.deallocate_subnet(counter);
         executor.deallocate_subnet(counter2);
-        assert_eq!(LINUX_PROXY_ADDR, "0.0.0.0:3128");
+        assert_eq!(LINUX_PROXY_ADDR, "0.0.0.0:0");
     }
 
     #[test]
@@ -1579,13 +1631,13 @@ mod tests {
             hardening_profile: HardeningProfile::Default,
             interactive: false,
             pty_size: None,
+            cwd: None,
             cache_mounts: vec![],
         };
 
         let props_default = generate_hardening_properties(
             &root,
             &workspace,
-            "test-job",
             &config_default,
             HardeningProfile::Default,
             ("nix-jail", "nix-jail"),
@@ -1611,13 +1663,13 @@ mod tests {
             hardening_profile: HardeningProfile::JitRuntime,
             interactive: false,
             pty_size: None,
+            cwd: None,
             cache_mounts: vec![],
         };
 
         let props_jit = generate_hardening_properties(
             &root,
             &workspace,
-            "test-job",
             &config_jit,
             HardeningProfile::JitRuntime,
             ("nix-jail", "nix-jail"),
@@ -1654,7 +1706,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::panic)] // Test assertion
     async fn test_execute_systemd_requires_root_dir() {
-        use crate::executor::JobExecutor;
+        use crate::executor::Executor;
 
         // This test verifies error handling when root_dir doesn't exist
         // It doesn't actually need systemd or root
@@ -1673,6 +1725,7 @@ mod tests {
             hardening_profile: HardeningProfile::Default,
             interactive: false,
             pty_size: None,
+            cwd: None,
             cache_mounts: vec![],
         };
 

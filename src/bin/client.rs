@@ -86,13 +86,24 @@ struct OutputOptions {
 enum Commands {
     /// Execute a script with specified Nix packages
     Exec {
+        /// Job profile(s) to apply (can be specified multiple times, e.g. --profile opencode --profile cargo).
+        ///
+        /// The server loads each `{profile_dir}/{name}.toml` in order. Additive fields
+        /// (packages, network rules, env vars) accumulate across profiles; singular fields
+        /// (script, hardening) are set by the first profile that supplies them.
+        /// Explicit flags always override profile defaults.
+        #[arg(long)]
+        profile: Vec<String>,
+
         /// Nix packages to make available (can be specified multiple times)
         #[arg(short, long)]
         package: Vec<String>,
 
         /// Path to script file to execute
+        ///
+        /// Optional when --profile is given and the profile supplies a script.
         #[arg(short, long)]
-        script: std::path::PathBuf,
+        script: Option<std::path::PathBuf>,
 
         /// Path to network policy JSON file
         #[arg(long)]
@@ -162,6 +173,15 @@ enum Commands {
         #[arg(long)]
         store_strategy: Option<String>,
 
+        /// Environment variables to pass into the sandbox (KEY=VALUE format, can be specified multiple times)
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+
+        /// Working directory inside the sandbox, relative to the workspace root
+        /// Example: "projects/meow" sets CWD to <workspace>/projects/meow
+        #[arg(long)]
+        cwd: Option<String>,
+
         /// Enable automatic pull request creation for git repositories
         /// After successful execution, commits will be pushed to a new branch (job-${jobID})
         /// and a pull request will be created to the original branch.
@@ -172,15 +192,19 @@ enum Commands {
         #[command(flatten)]
         output: OutputOptions,
     },
-    /// Attach to an existing job and stream its output
+    /// Attach to an existing job and show its output
     Attach {
         /// Job ID to attach to
         job_id: String,
 
-        /// Number of historical log lines to show before live streaming
-        /// If omitted, only shows live output from "now"
+        /// Number of historical log lines to show
+        /// If omitted, shows all stored logs
         #[arg(long)]
         tail: Option<u32>,
+
+        /// Follow live output while the job is running
+        #[arg(long, short = 'f')]
+        follow: bool,
 
         #[command(flatten)]
         output: OutputOptions,
@@ -214,6 +238,15 @@ enum Commands {
 
     /// Execute a command locally without a server (serverless mode)
     Run {
+        /// Job profile to apply (path to a .toml profile file).
+        ///
+        /// Loads the profile and uses it to fill in defaults for network policy,
+        /// environment variables, and hardening profile.  The command must still
+        /// be given on the command line (profiles do not supply commands for local runs).
+        /// Explicit flags always override profile defaults.
+        #[arg(long)]
+        profile: Option<std::path::PathBuf>,
+
         /// Nix packages to make available (can be specified multiple times)
         #[arg(short, long)]
         package: Vec<String>,
@@ -245,6 +278,14 @@ enum Commands {
         /// Working directory (defaults to current directory, ignored if --repo is set)
         #[arg(long)]
         workdir: Option<std::path::PathBuf>,
+
+        /// Override the process working directory independently of --workdir.
+        ///
+        /// The sandbox mounts --workdir as the workspace, but the spawned
+        /// process starts in --cwd instead. Must be a path within --workdir.
+        /// Also used for devshell auto-detection (.envrc / flake.nix lookup).
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
 
         /// Nixpkgs version to use for package resolution
         #[arg(long, alias = "nixpkgs", default_value = "nixos-25.11")]
@@ -323,6 +364,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Handle Run command separately (doesn't need server connection)
     if let Commands::Run {
+        profile,
         package,
         policy,
         allow_host,
@@ -331,6 +373,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         path,
         git_ref,
         workdir,
+        cwd,
         nixpkgs_version,
         hardening_profile,
         config,
@@ -353,6 +396,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         let exit_code = run_local(
+            profile,
             package,
             policy,
             allow_host,
@@ -361,6 +405,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             path,
             git_ref,
             workdir,
+            cwd,
             nixpkgs_version,
             hardening_profile,
             config,
@@ -394,6 +439,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Exec {
+            profile,
             package,
             script,
             policy,
@@ -407,6 +453,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             executor,
             store_strategy,
             push,
+            env,
+            cwd,
             output,
         } => {
             // Default store_strategy based on executor
@@ -420,6 +468,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             exec_job(
                 &mut client,
+                profile, // Vec<String> from --profile (repeatable)
                 package,
                 script,
                 policy,
@@ -433,6 +482,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 executor,
                 store_strategy,
                 push,
+                env,
+                cwd,
                 output,
             )
             .await?;
@@ -440,9 +491,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Attach {
             job_id,
             tail,
+            follow,
             output,
         } => {
-            attach_job(&mut client, job_id, tail, output).await?;
+            attach_job(&mut client, job_id, tail, follow, output).await?;
         }
         Commands::AttachInteractive { websocket_url } => {
             attach_interactive(websocket_url).await?;
@@ -465,11 +517,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip(client, output, script_path, policy_path, allow_hosts, allow_cidrs, path, hardening_profile), fields(packages = ?packages, repo = ?repo))]
+#[tracing::instrument(skip(client, output, script_path, policy_path, allow_hosts, allow_cidrs, path, hardening_profile, env_vars, cwd), fields(packages = ?packages, repo = ?repo, profiles = ?profiles))]
 async fn exec_job(
     client: &mut JailServiceClient<tonic::transport::Channel>,
+    profiles: Vec<String>,
     mut packages: Vec<String>,
-    script_path: std::path::PathBuf,
+    script_path: Option<std::path::PathBuf>,
     policy_path: Option<std::path::PathBuf>,
     allow_hosts: Vec<String>,
     allow_cidrs: Vec<String>,
@@ -481,6 +534,8 @@ async fn exec_job(
     executor: String,
     store_strategy: String,
     push: bool,
+    env_vars: Vec<String>,
+    cwd: Option<String>,
     output: OutputOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
@@ -488,13 +543,24 @@ async fn exec_job(
         "executing job"
     );
 
-    let script = std::fs::read_to_string(&script_path).map_err(|e| {
-        format!(
-            "Failed to read script file {}: {}",
-            script_path.display(),
-            e
-        )
-    })?;
+    // Script is optional when a profile supplies it server-side.
+    // If a script path is given, read it now; otherwise leave script empty
+    // and let the server fill it in from the profile.
+    let script = if let Some(ref script_path) = script_path {
+        let content = std::fs::read_to_string(script_path).map_err(|e| {
+            format!(
+                "failed to read script file {}: {}",
+                script_path.display(),
+                e
+            )
+        })?;
+        content
+    } else if profiles.is_empty() {
+        return Err("--script is required when --profile is not set".into());
+    } else {
+        // Profile will supply the script server-side.
+        String::new()
+    };
 
     // Auto-detect interpreter from hashbang
     if let Some(interpreter) = detect_hashbang(&script) {
@@ -566,6 +632,15 @@ async fn exec_job(
         });
     }
 
+    // Parse KEY=VALUE env var strings into a HashMap
+    let env: std::collections::HashMap<String, String> = env_vars
+        .iter()
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            Some((k.to_owned(), v.to_owned()))
+        })
+        .collect();
+
     let request = Request::new(JobRequest {
         packages,
         script,
@@ -576,11 +651,15 @@ async fn exec_job(
         nixpkgs_version: Some(nixpkgs_version),
         hardening_profile,
         push: Some(push),
-        interactive: None,                     // Not interactive for exec mode
-        caches: vec![],                        // Use server defaults
-        ephemeral_credentials: vec![],         // CLI doesn't support ephemeral credentials yet
-        env: std::collections::HashMap::new(), // Use server defaults
-        extra_paths: vec![],                   // CLI doesn't support extra paths yet
+        interactive: None,             // Not interactive for exec mode
+        caches: vec![],                // Use server defaults
+        ephemeral_credentials: vec![], // CLI doesn't support ephemeral credentials yet
+        env,
+        extra_paths: vec![], // CLI doesn't support extra paths yet
+        cwd,
+        subdomain: None,    // CLI doesn't support web routing yet
+        service_port: None, // CLI doesn't support web routing yet
+        profiles,
     });
 
     let job_id = {
@@ -591,8 +670,8 @@ async fn exec_job(
         job_id
     };
 
-    // Immediately start streaming the job output (no tail, just live from beginning)
-    stream_job_output(client, &job_id, None, output).await
+    // Immediately start streaming the job output (no tail, follow live from beginning)
+    stream_job_output(client, &job_id, None, true, output).await
 }
 
 /// Detect hashbang from script content and return interpreter_name
@@ -613,6 +692,7 @@ async fn attach_job(
     client: &mut JailServiceClient<tonic::transport::Channel>,
     job_id: String,
     tail: Option<u32>,
+    follow: bool,
     output: OutputOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Trim "job_id=" prefix if present (convenience for copy-paste from logs)
@@ -621,8 +701,8 @@ async fn attach_job(
         .unwrap_or(&job_id)
         .to_string();
 
-    tracing::info!(tail = ?tail, "attaching to job");
-    stream_job_output(client, &job_id, tail, output).await
+    tracing::info!(tail = ?tail, follow = follow, "attaching to job");
+    stream_job_output(client, &job_id, tail, follow, output).await
 }
 
 #[allow(clippy::print_stdout)] // Intentional: user-facing output to terminal
@@ -781,7 +861,8 @@ async fn gc_cache(
 /// Execute a command locally without a server
 #[allow(clippy::too_many_arguments)]
 async fn run_local(
-    packages: Vec<String>,
+    profile_path: Option<std::path::PathBuf>,
+    mut packages: Vec<String>,
     policy_path: Option<std::path::PathBuf>,
     allow_hosts: Vec<String>,
     allow_cidrs: Vec<String>,
@@ -789,6 +870,7 @@ async fn run_local(
     path: Option<String>,
     git_ref: Option<String>,
     workdir: Option<std::path::PathBuf>,
+    cwd: Option<std::path::PathBuf>,
     nixpkgs_version: String,
     hardening_profile: Option<String>,
     config_path: Option<std::path::PathBuf>,
@@ -796,12 +878,46 @@ async fn run_local(
     interactive: bool,
     executor_type: String,
     store_strategy: String,
-    env: Vec<(String, String)>,
+    mut env: Vec<(String, String)>,
     insecure_credentials: bool,
     command: Vec<String>,
     otlp_endpoint: Option<String>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     tracing::info!(packages = ?packages, repo = ?repo, path = ?path, "running locally");
+
+    // Apply profile defaults (client-side for local runs).
+    // Profile-supplied values are the baseline; explicit CLI flags take precedence.
+    let (profile_policy, profile_hardening) = if let Some(ref profile_file) = profile_path {
+        let profile = nix_jail::config::Profile::from_toml_file(profile_file)
+            .map_err(|e| format!("failed to load profile: {e}"))?;
+        tracing::info!(path = %profile_file.display(), "applying local profile");
+
+        // Packages: extend with profile packages not already requested.
+        for pkg in &profile.packages {
+            if !packages.contains(pkg) {
+                packages.push(pkg.clone());
+            }
+        }
+
+        // Env vars: profile provides base; CLI vars override (they come later in the vec).
+        // Prepend profile env so CLI vars (which come later) win.
+        let mut profile_env: Vec<(String, String)> = profile.environment.into_iter().collect();
+        profile_env.append(&mut env);
+        env = profile_env;
+
+        let policy = if !profile.network.rules.is_empty() {
+            let client_policy = nix_jail::networkpolicy::ClientNetworkPolicy {
+                rules: profile.network.rules,
+            };
+            Some(client_policy.to_proto())
+        } else {
+            None
+        };
+
+        (policy, profile.hardening)
+    } else {
+        (None, None)
+    };
 
     // Determine state directory for workspace/cache
     let state_dir = std::env::temp_dir().join("nix-jail-local");
@@ -935,7 +1051,7 @@ git checkout"#,
         (dir, None)
     };
 
-    // Load network policy if provided
+    // Load network policy if provided; fall back to profile policy if no explicit file given.
     let mut network_policy = if let Some(ref path) = policy_path {
         let policy_toml = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read policy file {}: {}", path.display(), e))?;
@@ -948,7 +1064,8 @@ git checkout"#,
         );
         Some(policy_file.to_proto())
     } else {
-        None
+        // Use profile-derived policy as the baseline (may be None if profile not given).
+        profile_policy
     };
 
     // Apply CLI overrides for allowed hosts/CIDRs
@@ -987,8 +1104,9 @@ git checkout"#,
         }
     }
 
-    // Parse hardening profile
-    let profile = match hardening_profile.as_deref() {
+    // Parse hardening profile: CLI flag > profile default > Default.
+    let effective_hardening = hardening_profile.or(profile_hardening);
+    let hardening = match effective_hardening.as_deref() {
         Some(s) => s.parse::<HardeningProfile>()?,
         None => HardeningProfile::Default,
     };
@@ -1036,13 +1154,33 @@ git checkout"#,
     // Build execution config (clone packages/nixpkgs_version for later use by DockerVolumeJobRoot)
     let packages_for_docker = packages.clone();
     let nixpkgs_for_docker = nixpkgs_version.clone();
+    // Canonicalize --cwd if provided and validate it's within the workspace.
+    let cwd = match cwd {
+        Some(c) => {
+            let c = c
+                .canonicalize()
+                .map_err(|e| format!("--cwd path '{}': {}", c.display(), e))?;
+            if !c.starts_with(&working_dir) {
+                return Err(format!(
+                    "--cwd '{}' is not within --workdir '{}'",
+                    c.display(),
+                    working_dir.display()
+                )
+                .into());
+            }
+            Some(c)
+        }
+        None => None,
+    };
+
     let exec_config = LocalExecutionConfig {
         packages,
         command,
         working_dir,
+        cwd,
         network_policy,
         credentials,
-        hardening_profile: profile,
+        hardening_profile: hardening,
         state_dir,
         nixpkgs_version: Some(nixpkgs_version),
         interactive,
@@ -1051,6 +1189,7 @@ git checkout"#,
         env,
         insecure_credentials,
         otlp_endpoint,
+        proxy_binary: None,
     };
 
     // Create executor and job root
@@ -1116,11 +1255,13 @@ async fn stream_job_output(
     client: &mut JailServiceClient<tonic::transport::Channel>,
     job_id: &str,
     tail: Option<u32>,
+    follow: bool,
     output: OutputOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let request = Request::new(StreamRequest {
         job_id: job_id.to_string(),
         tail_lines: tail,
+        follow,
     });
 
     let mut stream = client

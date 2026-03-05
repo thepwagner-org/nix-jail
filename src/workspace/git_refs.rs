@@ -140,12 +140,7 @@ pub fn get_commits_between(
 }
 
 /// Push a branch to remote using git2 library with authentication
-pub fn push_branch(
-    repo_dir: &Path,
-    branch: &str,
-    token: &str,
-    _remote_url: &str,
-) -> Result<(), WorkspaceError> {
+pub fn push_branch(repo_dir: &Path, branch: &str, token: &str) -> Result<(), WorkspaceError> {
     let repo = Repository::open(repo_dir).map_err(|e| {
         WorkspaceError::IoError(std::io::Error::other(format!(
             "Failed to open repository: {}",

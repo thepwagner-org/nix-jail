@@ -21,7 +21,6 @@ use crate::jail::{LogEntry, LogSource, NetworkPolicy};
 use crate::job_dir::JobDirectory;
 use crate::job_workspace::JobWorkspace;
 use crate::log_sink::{format_info, LogSink, StorageLogSink};
-use crate::proxy::ProxyStatsSummary;
 use crate::proxy_manager::ProxyManager;
 use crate::root::JobRoot;
 use crate::storage::{JobMetadata, JobStatus, JobStorage, LogEntry as StorageLogEntry};
@@ -162,6 +161,34 @@ fn merge_ephemeral_credentials(
     credentials
 }
 
+/// Strip embedded credentials from a git URL and return an owned clean URL string.
+///
+/// Callers (e.g. forgejo-nix-ci) used to embed a PAT directly in the clone URL.
+/// nix-jail now owns the credential, so we strip any `userinfo@` component and
+/// use the server-configured credential instead.  Warns if stripping was necessary.
+fn sanitize_repo_url(url: &str, job_id: &str) -> String {
+    let prefix = if url.starts_with("https://") {
+        "https://"
+    } else if url.starts_with("http://") {
+        "http://"
+    } else {
+        return url.to_string();
+    };
+
+    let rest = &url[prefix.len()..];
+    if let Some(at_pos) = rest.find('@') {
+        let slash_pos = rest.find('/').unwrap_or(rest.len());
+        if at_pos < slash_pos {
+            tracing::warn!(
+                job_id = %job_id,
+                "repo URL contained embedded credentials — stripped; configure a server credential instead"
+            );
+            return format!("{}{}", prefix, &rest[at_pos + 1..]);
+        }
+    }
+    url.to_string()
+}
+
 /// Serve stored logs for a completed job
 pub async fn serve_stored_logs(
     job_id: String,
@@ -266,6 +293,46 @@ pub async fn execute_job(
     ephemeral_credentials: Vec<EphemeralCredential>,
     job_env: HashMap<String, String>,
 ) {
+    let job_id = job.id.clone();
+    let registry = ctx.registry.clone();
+    let tx = ctx.tx.clone();
+
+    execute_job_inner(job, ctx, interactive, ephemeral_credentials, job_env).await;
+
+    // Guard: ensure registry cleanup on early failures.
+    // execute_job_inner has many early return points (setup errors, flake
+    // resolution failures, etc.) that skip the normal completion path's
+    // registry.remove() call. Without this, the broadcast channel stays
+    // open and stream_job clients hang forever.
+    //
+    // On the normal completion path, registry.remove() was already called
+    // inside execute_job_inner, so is_running() returns false and this is
+    // a no-op.
+    if registry.is_running(&job_id).await {
+        // Send failure exit_code so stream clients know the job failed
+        let _ = tx.send(Ok(LogEntry {
+            content: String::new(),
+            timestamp: Some(prost_types::Timestamp {
+                seconds: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+                nanos: 0,
+            }),
+            source: LogSource::System as i32,
+            exit_code: Some(1),
+        }));
+        registry.remove(&job_id).await;
+    }
+}
+
+async fn execute_job_inner(
+    job: JobMetadata,
+    ctx: ExecuteJobContext,
+    interactive: bool,
+    ephemeral_credentials: Vec<EphemeralCredential>,
+    job_env: HashMap<String, String>,
+) {
     tracing::debug!(status = %job.status.to_string(), "executing job");
 
     let ExecuteJobContext {
@@ -297,7 +364,7 @@ pub async fn execute_job(
     );
     let packages = job.packages.clone();
     let script = job.script.clone();
-    let repo = job.repo.clone();
+    let repo = sanitize_repo_url(&job.repo, &job_id);
     let path = job.path.clone();
     let extra_paths = job.extra_paths.clone();
     let git_ref = job.git_ref.clone();
@@ -405,8 +472,43 @@ pub async fn execute_job(
     let merged_credentials =
         merge_ephemeral_credentials(&config.credentials, &ephemeral_credentials);
 
-    // Phase 1: Create proxy config if network policy has rules
-    let proxy_config_path = match configure_proxy(
+    // If the job wants an inbound reverse proxy, set up the network namespace now
+    // so we know the job's IP before writing alice's config.
+    let reverse_proxy_setup = if let Some(port) = job.service_port {
+        match executor.setup_network(&job_id) {
+            Ok(Some(job_ip)) => {
+                tracing::info!(
+                    job_id = %job_id,
+                    job_ip = %job_ip,
+                    service_port = port,
+                    "allocated network for reverse proxy job"
+                );
+                Some(workspace::ReverseProxySetup {
+                    listen: "127.0.0.1:0".to_string(),
+                    backend: format!("{}:{}", job_ip, port),
+                })
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    job_id = %job_id,
+                    "executor does not support network namespaces, reverse proxy unavailable"
+                );
+                None
+            }
+            Err(e) => {
+                log_sink.error(&job_id, &format!("Failed to set up network: {}", e));
+                if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
+                    tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                }
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Phase 1: Create alice proxy config if network policy has rules or reverse proxy is needed
+    let proxy_config = match configure_proxy(
         &job_id,
         &job_dir,
         job.network_policy.as_ref(),
@@ -414,11 +516,12 @@ pub async fn execute_job(
         executor.proxy_listen_addr(),
         &log_sink,
         config.otlp_endpoint.as_deref(),
+        reverse_proxy_setup.as_ref(),
     )
     .instrument(tracing::info_span!("configure_proxy"))
     .await
     {
-        Ok(path) => path,
+        Ok(config) => config,
         Err(e) => {
             log_sink.error(&job_id, &format!("Failed to configure proxy: {}", e));
             if let Err(e) = storage.update_job_status(&job_id, JobStatus::Failed) {
@@ -428,10 +531,14 @@ pub async fn execute_job(
         }
     };
 
-    // Explicit packages take precedence over detected flakes
-    let store_paths = if !packages.is_empty() {
+    // Resolve explicit packages, then additively merge the workspace devShell closure.
+    // Both are combined so the sandbox gets the profile's toolchain AND the project's
+    // flake devShell (e.g. cargo, language servers) when a flake.nix is present.
+    let mut store_paths: Vec<std::path::PathBuf> = Vec::new();
+
+    if !packages.is_empty() {
         let nixpkgs_version = job.nixpkgs_version.as_deref();
-        let store_paths = find_packages(
+        match find_packages(
             is_exec_mode,
             &packages,
             nixpkgs_version,
@@ -440,14 +547,15 @@ pub async fn execute_job(
             &log_sink,
         )
         .instrument(tracing::info_span!("resolve_packages"))
-        .await;
-        match store_paths {
-            Some(paths) => paths,
+        .await
+        {
+            Some(paths) => store_paths.extend(paths),
             None => return, // Error already logged
         }
-    } else if let Some(ref source) = flake_source {
-        log_sink.info(&job_id, &format!("Computing flake closure from {}", source));
+    }
 
+    if let Some(ref source) = flake_source {
+        log_sink.info(&job_id, &format!("Computing flake closure from {}", source));
         match workspace::compute_flake_closure(source).await {
             Ok(paths) => {
                 tracing::info!(
@@ -459,7 +567,7 @@ pub async fn execute_job(
                     &job_id,
                     &format!("Flake closure: {} store paths", paths.len()),
                 );
-                paths
+                store_paths.extend(paths);
             }
             Err(e) => {
                 log_sink.error(&job_id, &format!("Failed to compute flake closure: {}", e));
@@ -469,9 +577,7 @@ pub async fn execute_job(
                 return;
             }
         }
-    } else {
-        vec![]
-    };
+    }
 
     // Compute full closure once (used for both cache and executor)
     let closure = if !store_paths.is_empty() {
@@ -563,12 +669,14 @@ pub async fn execute_job(
         // Non-fatal: continue execution
     }
 
-    // Phase 2: Start proxy now that root exists (proxy writes cert to root/etc/ssl/certs/)
+    // Phase 2: Start alice proxy now that root exists (writes cert to root/etc/ssl/certs/)
     let mut proxy = match start_proxy_if_configured(
         &job_id,
         &job_dir,
-        proxy_config_path.as_ref(),
+        proxy_config,
         executor.proxy_listen_addr(),
+        &merged_credentials,
+        config.proxy_binary.as_deref(),
     )
     .instrument(tracing::info_span!("start_proxy"))
     .await
@@ -582,6 +690,13 @@ pub async fn execute_job(
             return;
         }
     };
+
+    // Store reverse proxy port in registry so ListJobs can expose it for routing
+    if let Some(ref p) = proxy {
+        if let Some(rp_port) = p.reverse_proxy_port {
+            registry.set_reverse_proxy_port(&job_id, rp_port).await;
+        }
+    }
 
     // Create tmp directory for the job
     let tmp_dir = workspace_dir.join("tmp");
@@ -668,6 +783,14 @@ pub async fn execute_job(
         // Prevent openssl-sys from vendoring OpenSSL - use system OpenSSL via pkg-config
         let _ = env.insert("OPENSSL_NO_VENDOR".to_string(), "1".to_string());
 
+        // Set SHELL to nix-managed zsh or bash if available and not already overridden
+        if !env.contains_key("SHELL") {
+            if let Some(shell) = workspace::find_shell(&store_paths) {
+                tracing::info!(shell = %shell.display(), "setting SHELL from store paths");
+                let _ = env.insert("SHELL".to_string(), shell.display().to_string());
+            }
+        }
+
         // Log env vars for debugging
         log_sink.info(
             &job_id,
@@ -701,6 +824,7 @@ pub async fn execute_job(
             network_policy: job.network_policy.as_ref(),
             log_sink: &log_sink,
             insecure_credentials: false,
+            sandbox_username: sandbox_user.map(|(u, _)| u).unwrap_or("sandbox"),
         };
         setup_credentials_env(&ctx, &mut env);
     }
@@ -736,7 +860,7 @@ pub async fn execute_job(
     // Resolve cache mounts from client request (or empty if none specified)
     // For caches with populate_command: run populate, snapshot, then mount live cache
     let cache_mounts = if job.caches.is_empty() {
-        build_default_cache_mounts(&config, repo_hash.as_deref())
+        vec![]
     } else {
         // Partition caches: those with populate_command vs without
         let (populate_caches, normal_caches): (Vec<_>, Vec<_>) = job
@@ -958,6 +1082,7 @@ pub async fn execute_job(
         hardening_profile,
         interactive,
         pty_size: None, // Server mode uses WebSocket for terminal size
+        cwd: job.cwd.as_ref().map(|c| workspace_dir.join(c)),
         cache_mounts,
     };
 
@@ -1113,33 +1238,29 @@ pub async fn execute_job(
     // Note: Executor cleanup (sandbox profile, network namespace, etc.) is handled
     // internally by each executor implementation when the job exits.
 
-    // Read proxy stats from file (written by proxy on shutdown)
-    let stats_path =
-        ProxyManager::ca_cert_host_path(&job_dir.root).with_file_name("proxy-stats.json");
-    if let Ok(contents) = std::fs::read_to_string(&stats_path) {
-        if let Ok(stats) = serde_json::from_str::<ProxyStatsSummary>(&contents) {
-            let approved_total: u64 = stats.approved.iter().map(|(_, c)| c).sum();
-            let denied_total: u64 = stats.denied.iter().map(|(_, c)| c).sum();
+    // Collect stats from alice's metrics endpoints (queried before stop)
+    if let Some(ref proxy) = proxy {
+        let stats = proxy.collect_stats().await;
+        let (approved, denied) = stats.request_counts();
+        if approved > 0 || denied > 0 {
             log_sink.info(
                 &job_id,
-                &format!(
-                    "Proxy stats: {} approved, {} denied",
-                    approved_total, denied_total
-                ),
+                &format!("Proxy stats: {} approved, {} denied", approved, denied),
             );
+        }
 
-            // Aggregate detailed request stats into Prometheus metrics
-            if let Some(ref m) = metrics_ref {
-                for (key, count) in &stats.requests {
-                    m.record_proxy_request(
-                        &key.host,
-                        &key.method,
-                        key.status,
-                        &key.credential,
-                        &key.decision,
-                        *count,
-                    );
-                }
+        // Record LLM usage metrics
+        if let Some(ref m) = metrics_ref {
+            for completion in &stats.llm_completions {
+                m.record_llm_usage(
+                    completion.host.as_deref().unwrap_or("unknown"),
+                    "", // credential not tracked per-completion in alice
+                    completion.model.as_deref(),
+                    completion.input_tokens,
+                    completion.output_tokens,
+                    completion.cache_read_tokens,
+                    completion.tool_calls.as_deref().unwrap_or(&[]),
+                );
             }
         }
     }
@@ -1354,23 +1475,6 @@ fn find_cache_with_fallbacks(
     primary.to_path_buf()
 }
 
-/// Build default cache mounts (empty - clients must specify cache requests)
-///
-/// For backward compatibility during migration, this returns empty.
-/// Once forgejo-nix-ci sends cache requests, caching will work.
-fn build_default_cache_mounts(
-    config: &ServerConfig,
-    _repo_hash: Option<&str>,
-) -> Vec<ResolvedCacheMount> {
-    if !config.cache.enabled {
-        return vec![];
-    }
-
-    // No default caches - clients must specify what they need
-    // This is the new model where all ecosystem knowledge is in forgejo-nix-ci
-    vec![]
-}
-
 /// Resolve the host path for a cache request (without fallback logic for populate phase)
 fn resolve_cache_host_path(
     request: &CacheRequest,
@@ -1459,6 +1563,7 @@ async fn run_populate_phase(
         hardening_profile,
         interactive: false,
         pty_size: None,
+        cwd: None,
         cache_mounts: vec![cache_mount],
     };
 
@@ -1553,7 +1658,11 @@ fn build_environment(
         };
         let _ = env.insert("SSL_CERT_FILE".to_string(), ca_cert_path.clone());
         let _ = env.insert("NODE_EXTRA_CA_CERTS".to_string(), ca_cert_path.clone());
-        let _ = env.insert("REQUESTS_CA_BUNDLE".to_string(), ca_cert_path);
+        let _ = env.insert("REQUESTS_CA_BUNDLE".to_string(), ca_cert_path.clone());
+        // Cargo maps this to curl's CURLOPT_CAINFO, which works with all TLS
+        // backends. SSL_CERT_FILE only works with OpenSSL — macOS curl uses
+        // SecureTransport which ignores it, breaking cargo fetch through the proxy.
+        let _ = env.insert("CARGO_HTTP_CAINFO".to_string(), ca_cert_path);
         let _ = env.insert("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string());
     }
 
@@ -1630,22 +1739,65 @@ async fn find_packages(
     log_sink: &Arc<dyn LogSink>,
 ) -> Option<Vec<std::path::PathBuf>> {
     if is_exec_mode {
-        let pkg_refs: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
-        // Server mode: in-memory cache only (daemon stays running)
-        match workspace::find_nix_packages_cached(&pkg_refs, nixpkgs_version, None).await {
-            Ok(paths) => {
-                let version_info = nixpkgs_version.unwrap_or("(none)");
-                tracing::info!(packages = ?packages, nixpkgs_version = %version_info, "found nix packages");
-                Some(paths)
-            }
-            Err(e) => {
-                log_sink.error(job_id, &format!("Failed to find packages: {}", e));
-                if let Err(e) = storage.update_job_status(job_id, JobStatus::Failed) {
-                    tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+        // Partition into plain nixpkgs names and flake installables (store paths,
+        // github: refs, path#attr expressions, etc.).
+        let (plain, flake): (Vec<&str>, Vec<&str>) = packages
+            .iter()
+            .map(|s| s.as_str())
+            .partition(|p| !workspace::is_flake_installable(p));
+
+        let mut all_paths: Vec<std::path::PathBuf> = Vec::new();
+
+        if !plain.is_empty() {
+            // Server mode: in-memory cache only (daemon stays running)
+            match workspace::find_nix_packages_cached(&plain, nixpkgs_version, None).await {
+                Ok(paths) => {
+                    let version_info = nixpkgs_version.unwrap_or("(none)");
+                    tracing::info!(packages = ?plain, nixpkgs_version = %version_info, "found nix packages");
+                    all_paths.extend(paths);
                 }
-                None
+                Err(e) => {
+                    log_sink.error(job_id, &format!("Failed to find packages: {}", e));
+                    if let Err(e) = storage.update_job_status(job_id, JobStatus::Failed) {
+                        tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                    }
+                    return None;
+                }
             }
         }
+
+        for installable in &flake {
+            match workspace::resolve_flake_installable(installable).await {
+                Ok(path) => match workspace::compute_combined_closure(&[path]).await {
+                    Ok(closure) => all_paths.extend(closure),
+                    Err(e) => {
+                        log_sink.error(
+                            job_id,
+                            &format!("Failed to compute closure for '{}': {}", installable, e),
+                        );
+                        if let Err(e) = storage.update_job_status(job_id, JobStatus::Failed) {
+                            tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                        }
+                        return None;
+                    }
+                },
+                Err(e) => {
+                    log_sink.error(
+                        job_id,
+                        &format!(
+                            "Failed to resolve flake installable '{}': {}",
+                            installable, e
+                        ),
+                    );
+                    if let Err(e) = storage.update_job_status(job_id, JobStatus::Failed) {
+                        tracing::error!(job_id = %job_id, error = %e, "failed to update job status");
+                    }
+                    return None;
+                }
+            }
+        }
+
+        Some(all_paths)
     } else {
         // Submit mode: use curl for now
         match workspace::find_nix_package("curl").await {
@@ -1683,8 +1835,9 @@ fn build_command(script: String) -> Vec<String> {
 
 /// Configure proxy for network policy enforcement
 ///
-/// Returns the path to the proxy config file if network policy has rules,
+/// Returns the alice proxy config result if network policy has rules,
 /// or None if network should be blocked (no policy).
+#[allow(clippy::too_many_arguments)]
 async fn configure_proxy(
     job_id: &str,
     job_dir: &JobDirectory,
@@ -1693,12 +1846,13 @@ async fn configure_proxy(
     proxy_listen_addr: &str,
     log_sink: &Arc<dyn LogSink>,
     otlp_endpoint: Option<&str>,
-) -> Result<Option<PathBuf>, OrchestrationError> {
+    reverse_proxy: Option<&workspace::ReverseProxySetup>,
+) -> Result<Option<workspace::ProxyConfigResult>, OrchestrationError> {
     let has_network_rules = network_policy
         .map(|policy| !policy.rules.is_empty())
         .unwrap_or(false);
 
-    if !has_network_rules {
+    if !has_network_rules && reverse_proxy.is_none() {
         log_sink.info(job_id, "Network access blocked (no policy)");
         return Ok(None);
     }
@@ -1709,7 +1863,13 @@ async fn configure_proxy(
     let proxy_password = Some(workspace::generate_proxy_password());
 
     let ca_cert_host_path = crate::proxy_manager::ProxyManager::ca_cert_host_path(&job_dir.root);
-    let path = workspace::write_proxy_config(
+
+    // Use port 0 so the OS assigns a free ephemeral port for the metrics server.
+    // This avoids collisions when multiple alice instances run concurrently.
+    // The actual bound port is parsed from alice's startup log by ProxyManager.
+    let metrics_port = Some(0u16);
+
+    let result = workspace::write_proxy_config(
         &job_dir.base,
         &ca_cert_host_path,
         proxy_listen_addr,
@@ -1718,6 +1878,8 @@ async fn configure_proxy(
         proxy_username,
         proxy_password,
         otlp_endpoint.map(|s| s.to_string()),
+        metrics_port,
+        reverse_proxy,
     )
     .map_err(|e| OrchestrationError::ProxyConfigError(e.to_string()))?;
 
@@ -1726,9 +1888,9 @@ async fn configure_proxy(
         .map(|c| c.name.as_str())
         .collect();
     tracing::info!(
-        path = %path.display(),
+        path = %result.config_path.display(),
         credentials = ?credential_names,
-        "created proxy config"
+        "created alice proxy config"
     );
 
     if let Some(policy) = network_policy {
@@ -1741,7 +1903,7 @@ async fn configure_proxy(
         );
     }
 
-    Ok(Some(path))
+    Ok(Some(result))
 }
 
 /// Resolve packages and compute closure
@@ -1759,20 +1921,49 @@ async fn resolve_packages_and_closure(
     log_sink: &Arc<dyn LogSink>,
     cache_dir: Option<&Path>,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>), OrchestrationError> {
-    // Explicit packages take precedence over detected flakes
-    let store_paths = if !packages.is_empty() {
-        let pkg_refs: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
-        workspace::find_nix_packages_cached(&pkg_refs, nixpkgs_version, cache_dir)
-            .await
-            .map_err(|e| OrchestrationError::PackageError(e.to_string()))?
-    } else if let Some(source) = flake_source {
+    // Resolve explicit packages (if any).
+    let mut store_paths = Vec::new();
+
+    if !packages.is_empty() {
+        // Partition packages into plain nixpkgs names and flake installables
+        let (plain, flake): (Vec<&str>, Vec<&str>) = packages
+            .iter()
+            .map(|s| s.as_str())
+            .partition(|p| !workspace::is_flake_installable(p));
+
+        // Resolve plain nixpkgs packages in a single batch
+        if !plain.is_empty() {
+            let nixpkgs_paths =
+                workspace::find_nix_packages_cached(&plain, nixpkgs_version, cache_dir)
+                    .await
+                    .map_err(|e| OrchestrationError::PackageError(e.to_string()))?;
+            store_paths.extend(nixpkgs_paths);
+        }
+
+        // Resolve flake installables individually.  Include their full
+        // recursive closure in store_paths so that devShell buildInputs
+        // (and any other transitive deps) end up on PATH.
+        for installable in &flake {
+            let path = workspace::resolve_flake_installable(installable)
+                .await
+                .map_err(|e| OrchestrationError::PackageError(e.to_string()))?;
+            let flake_closure = workspace::compute_combined_closure(&[path])
+                .await
+                .map_err(|e| OrchestrationError::PackageError(e.to_string()))?;
+            store_paths.extend(flake_closure);
+        }
+    }
+
+    // Merge in devshell closure from detected flake source (if any).
+    // This runs alongside explicit packages so the sandbox gets both
+    // the requested packages and the project's development toolchain.
+    if let Some(source) = flake_source {
         log_sink.info(job_id, &format!("Computing flake closure from {}", source));
-        workspace::compute_flake_closure(source)
+        let flake_paths = workspace::compute_flake_closure(source)
             .await
-            .map_err(|e| OrchestrationError::FlakeClosureError(e.to_string()))?
-    } else {
-        vec![]
-    };
+            .map_err(|e| OrchestrationError::FlakeClosureError(e.to_string()))?;
+        store_paths.extend(flake_paths);
+    }
 
     let closure = if !store_paths.is_empty() {
         workspace::compute_combined_closure(&store_paths)
@@ -1787,14 +1978,16 @@ async fn resolve_packages_and_closure(
     Ok((store_paths, closure))
 }
 
-/// Start proxy if config path is provided
+/// Start alice proxy if config result is provided
 async fn start_proxy_if_configured(
     job_id: &str,
     job_dir: &JobDirectory,
-    proxy_config_path: Option<&PathBuf>,
+    proxy_config: Option<workspace::ProxyConfigResult>,
     proxy_listen_addr: &str,
+    credentials: &[Credential],
+    configured_binary: Option<&Path>,
 ) -> Result<Option<ProxyManager>, OrchestrationError> {
-    let Some(config_path) = proxy_config_path else {
+    let Some(config_result) = proxy_config else {
         return Ok(None);
     };
 
@@ -1804,16 +1997,45 @@ async fn start_proxy_if_configured(
         .unwrap_or("127.0.0.1")
         .to_string();
 
+    // Pre-resolve credentials that need orchestrator-level resolution
+    // (keychain, opencode auth, inline) and build env var map for alice
+    let mut resolved_cred_env = HashMap::new();
+    for (i, cred) in credentials.iter().enumerate() {
+        let env_var_name = format!("ALICE_CRED_{}", i);
+        let needs_resolution = matches!(
+            &cred.source,
+            CredentialSource::Keychain { .. }
+                | CredentialSource::OpenCodeAuth { .. }
+                | CredentialSource::Inline { .. }
+        );
+        if needs_resolution {
+            match crate::config::fetch_credential_token(cred).await {
+                Ok(token) => {
+                    let _ = resolved_cred_env.insert(env_var_name, token);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        credential = %cred.name,
+                        error = %e,
+                        "failed to resolve credential for alice"
+                    );
+                }
+            }
+        }
+    }
+
     let proxy = ProxyManager::start(
         job_id.to_string(),
         job_dir.root.clone(),
-        config_path.clone(),
+        config_result,
         listen_host,
+        resolved_cred_env,
+        configured_binary,
     )
     .await
     .map_err(|e| OrchestrationError::ProxyStartError(e.to_string()))?;
 
-    tracing::debug!(port = proxy.port, "proxy started");
+    tracing::debug!(port = proxy.port, "alice proxy started");
     Ok(Some(proxy))
 }
 
@@ -1826,6 +2048,9 @@ struct CredentialsSetupContext<'a> {
     network_policy: Option<&'a NetworkPolicy>,
     log_sink: &'a Arc<dyn LogSink>,
     insecure_credentials: bool,
+    /// Username of the sandboxed process (e.g. "nix-jail"). Used to write files
+    /// into the correct home directory under job_dir.root/home/{sandbox_username}/
+    sandbox_username: &'a str,
 }
 
 /// Setup credential-related environment variables
@@ -1838,6 +2063,7 @@ fn setup_credentials_env(ctx: &CredentialsSetupContext<'_>, env: &mut HashMap<St
         network_policy,
         log_sink,
         insecure_credentials,
+        sandbox_username,
     } = ctx;
     let filtered_credentials = filter_credentials(credentials, *network_policy);
 
@@ -1902,7 +2128,7 @@ fn setup_credentials_env(ctx: &CredentialsSetupContext<'_>, env: &mut HashMap<St
         }
     }
 
-    // Generic/OpenCode credentials with env var source - inject dummy token
+    // Generic credentials with env var source - inject dummy token
     for cred in filtered_credentials.iter() {
         tracing::info!(
             name = %cred.name,
@@ -1911,10 +2137,7 @@ fn setup_credentials_env(ctx: &CredentialsSetupContext<'_>, env: &mut HashMap<St
             has_dummy = cred.dummy_token.is_some(),
             "checking credential for env injection"
         );
-        if matches!(
-            cred.credential_type,
-            CredentialType::Generic | CredentialType::OpenCode
-        ) {
+        if matches!(cred.credential_type, CredentialType::Generic) {
             if let CredentialSource::Environment { source_env } = &cred.source {
                 if let Some(ref dummy_token) = cred.dummy_token {
                     let _ = env.insert(source_env.clone(), dummy_token.clone());
@@ -1922,6 +2145,81 @@ fn setup_credentials_env(ctx: &CredentialsSetupContext<'_>, env: &mut HashMap<St
                         job_id,
                         &format!("{} configured (proxy will inject real token)", source_env),
                     );
+                }
+            }
+        }
+    }
+
+    // OpenCodeAuth credentials - write dummy auth.json into sandbox so the opencode
+    // auth plugin reads the dummy token and sets Authorization: Bearer <dummy>.
+    // Alice then swaps the dummy for the real OAuth token in-flight.
+    for cred in filtered_credentials.iter() {
+        if let CredentialSource::OpenCodeAuth {
+            opencode_provider_id,
+        } = &cred.source
+        {
+            if let Some(ref dummy_token) = cred.dummy_token {
+                let auth_dir = job_dir
+                    .root
+                    .join(format!("home/{}/.local/share/opencode", sandbox_username));
+                if let Err(e) = std::fs::create_dir_all(&auth_dir) {
+                    tracing::warn!(error = %e, "failed to create opencode auth dir in sandbox");
+                    continue;
+                }
+                let auth_json = serde_json::json!({
+                    opencode_provider_id: {
+                        "type": "oauth",
+                        "access": dummy_token,
+                        "refresh": "dummy-refresh-token",
+                        "expires": 4102444800000_u64  // 2100-01-01
+                    }
+                });
+                let auth_path = auth_dir.join("auth.json");
+                match std::fs::write(&auth_path, auth_json.to_string()) {
+                    Ok(()) => {
+                        tracing::info!(
+                            provider = %opencode_provider_id,
+                            path = %auth_path.display(),
+                            "wrote dummy auth.json into sandbox for oauth credential injection"
+                        );
+                        // Chown the .local tree to the sandbox user so opencode can write
+                        // subdirectories (e.g. bin/) inside .local/share/opencode at runtime.
+                        // The daemon runs as root and create_dir_all creates dirs owned by
+                        // root; without this chown opencode gets EACCES.
+                        let local_dir = job_dir
+                            .root
+                            .join(format!("home/{}/.local", sandbox_username));
+                        let owner = format!("{}:{}", sandbox_username, sandbox_username);
+                        match std::process::Command::new("chown")
+                            .args(["-R", &owner, &local_dir.to_string_lossy()])
+                            .output()
+                        {
+                            Ok(out) if !out.status.success() => {
+                                tracing::warn!(
+                                    stderr = %String::from_utf8_lossy(&out.stderr),
+                                    "chown opencode auth dir failed"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to run chown on opencode auth dir");
+                            }
+                            Ok(_) => {}
+                        }
+                        log_sink.info(
+                            job_id,
+                            &format!(
+                                "opencode {} oauth configured (proxy will inject real token)",
+                                opencode_provider_id
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            path = %auth_path.display(),
+                            "failed to write dummy auth.json into sandbox"
+                        );
+                    }
                 }
             }
         }
@@ -2019,7 +2317,7 @@ async fn handle_pr_creation(
         &format!("Pushing branch '{}' to remote...", pr_branch),
     );
 
-    workspace::git_refs::push_branch(repo_dir, &pr_branch, &token, repo_url)?;
+    workspace::git_refs::push_branch(repo_dir, &pr_branch, &token)?;
 
     // Create PR: job-${jobID} -> base_branch
     log_sink.info(
@@ -2042,8 +2340,15 @@ pub struct LocalExecutionConfig {
     /// Command to execute (e.g., ["bash", "-c", "..."])
     pub command: Vec<String>,
 
-    /// Working directory for execution
+    /// Working directory for execution (mounted as workspace in sandbox)
     pub working_dir: PathBuf,
+
+    /// Override the process CWD independently of the workspace mount.
+    ///
+    /// When set, the sandboxed process starts in this directory instead of
+    /// `working_dir`. Must be a path within `working_dir`. Also used for
+    /// flake/devshell auto-detection (reads `.envrc` from here).
+    pub cwd: Option<PathBuf>,
 
     /// Network policy (optional)
     pub network_policy: Option<NetworkPolicy>,
@@ -2077,6 +2382,9 @@ pub struct LocalExecutionConfig {
 
     /// OpenTelemetry OTLP endpoint for proxy tracing
     pub otlp_endpoint: Option<String>,
+
+    /// Explicit path to alice proxy binary (overrides PATH lookup)
+    pub proxy_binary: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for LocalExecutionConfig {
@@ -2119,11 +2427,14 @@ pub async fn execute_local(
     let job_dir = JobDirectory::new(&state_dir, &job_id)
         .map_err(|e| OrchestrationError::JobDirError(e.to_string()))?;
 
-    // Detect flake source (local flake.nix or .envrc with use flake)
-    let flake_source = workspace::flake::detect_flake_source(&config.working_dir);
+    // Detect flake source (local flake.nix or .envrc with use flake).
+    // When a separate cwd is provided (e.g. project subdir inside a monorepo),
+    // look there for the .envrc / flake.nix so we pick up the right devshell.
+    let flake_detect_dir = config.cwd.as_deref().unwrap_or(&config.working_dir);
+    let flake_source = workspace::flake::detect_flake_source(flake_detect_dir);
 
-    // Phase 1: Create proxy config if needed
-    let proxy_config_path = configure_proxy(
+    // Phase 1: Create alice proxy config if needed
+    let proxy_config = configure_proxy(
         &job_id,
         &job_dir,
         config.network_policy.as_ref(),
@@ -2131,6 +2442,7 @@ pub async fn execute_local(
         executor.proxy_listen_addr(),
         &log_sink,
         config.otlp_endpoint.as_deref(),
+        None, // TODO: wire reverse_proxy setup after executor refactor
     )
     .await?;
 
@@ -2195,12 +2507,14 @@ pub async fn execute_local(
         // Non-fatal: continue execution
     }
 
-    // Phase 4: Start proxy if configured
+    // Phase 4: Start alice proxy if configured
     let mut proxy = start_proxy_if_configured(
         &job_id,
         &job_dir,
-        proxy_config_path.as_ref(),
+        proxy_config,
         executor.proxy_listen_addr(),
+        &config.credentials,
+        config.proxy_binary.as_deref(),
     )
     .await?;
 
@@ -2286,6 +2600,14 @@ pub async fn execute_local(
 
         // Prevent openssl-sys from vendoring OpenSSL - use system OpenSSL via pkg-config
         let _ = env.insert("OPENSSL_NO_VENDOR".to_string(), "1".to_string());
+
+        // Set SHELL to nix-managed zsh or bash if available and not already overridden
+        if !env.contains_key("SHELL") {
+            if let Some(shell) = workspace::find_shell(&store_paths) {
+                tracing::info!(shell = %shell.display(), "setting SHELL from store paths");
+                let _ = env.insert("SHELL".to_string(), shell.display().to_string());
+            }
+        }
     }
 
     // Configure credentials in home directory (host filesystem path for writing files)
@@ -2298,6 +2620,7 @@ pub async fn execute_local(
         network_policy: config.network_policy.as_ref(),
         log_sink: &log_sink,
         insecure_credentials: config.insecure_credentials,
+        sandbox_username: user,
     };
     setup_credentials_env(&ctx, &mut env);
 
@@ -2317,6 +2640,7 @@ pub async fn execute_local(
         hardening_profile: config.hardening_profile,
         interactive: config.interactive,
         pty_size: config.pty_size,
+        cwd: config.cwd,
         cache_mounts: vec![], // No caching for local execution
     };
 
@@ -2482,37 +2806,27 @@ pub async fn execute_local(
         let _ = tokio::join!(stdout_task, stderr_task);
     }
 
-    // Read proxy stats from file (written by proxy on shutdown)
-    let stats_path =
-        ProxyManager::ca_cert_host_path(&job_dir.root).with_file_name("proxy-stats.json");
-    if let Ok(contents) = std::fs::read_to_string(&stats_path) {
-        if let Ok(stats) = serde_json::from_str::<ProxyStatsSummary>(&contents) {
-            let approved_total: u64 = stats.approved.iter().map(|(_, c)| c).sum();
-            let denied_total: u64 = stats.denied.iter().map(|(_, c)| c).sum();
+    // Collect stats from alice's metrics endpoints (queried before stop)
+    if let Some(ref proxy) = proxy {
+        let stats = proxy.collect_stats().await;
+        let (approved, denied) = stats.request_counts();
+        if approved > 0 || denied > 0 {
             log_sink.info(
                 &job_id,
-                &format!(
-                    "Proxy stats: {} approved, {} denied",
-                    approved_total, denied_total
-                ),
+                &format!("Proxy stats: {} approved, {} denied", approved, denied),
             );
+        }
 
-            // Log LLM usage stats if present
-            if let Some(ref llm) = stats.llm {
+        // Log LLM usage stats
+        for completion in &stats.llm_completions {
+            if let Some(ref model) = completion.model {
                 tracing::info!(
-                    input_tokens = llm.total_input_tokens,
-                    output_tokens = llm.total_output_tokens,
-                    cache_read_tokens = llm.total_cache_read_tokens,
-                    "llm token usage"
+                    model = %model,
+                    input_tokens = completion.input_tokens.unwrap_or(0),
+                    output_tokens = completion.output_tokens.unwrap_or(0),
+                    cache_read_tokens = completion.cache_read_tokens.unwrap_or(0),
+                    "llm usage"
                 );
-
-                for (model, count) in &llm.requests_by_model {
-                    tracing::info!(model = %model, requests = count, "llm model usage");
-                }
-
-                for (tool, count) in &llm.tool_calls {
-                    tracing::info!(tool = %tool, calls = count, "llm tool usage");
-                }
             }
         }
     }
@@ -2544,7 +2858,7 @@ mod tests {
             source: CredentialSource::Environment {
                 source_env: "TEST_TOKEN".to_string(),
             },
-            allowed_host_patterns: vec!["api\\.example\\.com".to_string()],
+            allowed_host_patterns: vec!["api.example.com".to_string()],
             header_format: "Bearer {token}".to_string(),
             dummy_token: None,
             redact_response: true,
@@ -2558,7 +2872,7 @@ mod tests {
         EphemeralCredential {
             name: name.to_string(),
             token: "ephemeral-secret-token".to_string(),
-            allowed_hosts: vec!["github\\.com".to_string()],
+            allowed_hosts: vec!["github.com".to_string()],
             header_format: "token {token}".to_string(),
         }
     }
@@ -2636,7 +2950,7 @@ mod tests {
         assert!(
             matches!(cred.source, CredentialSource::Inline { ref token } if token == "ephemeral-secret-token")
         );
-        assert_eq!(cred.allowed_host_patterns, vec!["github\\.com".to_string()]);
+        assert_eq!(cred.allowed_host_patterns, vec!["github.com".to_string()]);
         assert_eq!(cred.header_format, "token {token}");
         // redact_response defaults to true for security
         assert!(cred.redact_response);

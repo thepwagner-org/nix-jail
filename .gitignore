@@ -1,1 +1,4 @@
 /.claude/plugins/
+/target/
+/result/
+/.direnv/

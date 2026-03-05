@@ -9,13 +9,11 @@
 //! for explicit backend selection.
 
 pub mod exec;
-mod traits;
-mod types;
-
 #[cfg(test)]
 mod executor_tests;
 #[cfg(test)]
 mod test_helpers;
+mod traits;
 
 #[cfg(target_os = "macos")]
 pub mod sandbox;
@@ -33,9 +31,6 @@ pub use traits::{
     ExecutionConfig, ExecutionHandle, Executor, ExecutorError, HardeningProfile, IoHandle,
     ResolvedCacheMount,
 };
-
-// Re-export types module for backward compatibility
-pub use types::JobExecutor;
 
 // Re-export mock for testing
 #[cfg(test)]

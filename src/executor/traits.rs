@@ -144,6 +144,15 @@ pub struct ExecutionConfig {
     /// Terminal size for PTY mode (rows, cols)
     pub pty_size: Option<(u16, u16)>,
 
+    /// Override the process working directory independently of the workspace mount.
+    ///
+    /// When set, the executor uses this path as the CWD for the spawned process
+    /// while `working_dir` still controls which host directory is mounted into
+    /// the sandbox. Must be a path within `working_dir`.
+    ///
+    /// When `None`, the process CWD defaults to `working_dir`.
+    pub cwd: Option<PathBuf>,
+
     /// Resolved cache mounts for this job
     /// These are ready to be bind-mounted by the executor
     pub cache_mounts: Vec<ResolvedCacheMount>,
@@ -204,8 +213,12 @@ pub trait Executor: Send + Sync {
 
     /// Get the proxy listen address for this platform
     ///
-    /// - Linux: "0.0.0.0:3128" (bind all interfaces, veth created later)
-    /// - macOS: "127.0.0.1:3128" (localhost for sandbox-exec)
+    /// Port 0 causes the OS to assign an ephemeral port, which alice reports
+    /// in its "listening for connections" log line. This allows concurrent jobs
+    /// to each run their own alice instance without port conflicts.
+    ///
+    /// - Linux: "0.0.0.0:0" (bind all interfaces, veth created later)
+    /// - macOS: "127.0.0.1:0" (localhost for sandbox-exec)
     fn proxy_listen_addr(&self) -> &'static str;
 
     /// Get the proxy connect host for jobs on this platform
@@ -224,6 +237,19 @@ pub trait Executor: Send + Sync {
 
     /// Get the executor name for display/logging
     fn name(&self) -> &'static str;
+
+    /// Set up the network namespace for a job before the executor runs.
+    ///
+    /// Called before `configure_proxy` when a reverse proxy is needed, so the
+    /// job's IP address is known when writing alice's `[reverse_proxy]` config.
+    /// Returns the job's IP address that alice should use as the backend, or
+    /// `None` if the executor does not support network namespaces (e.g., macOS).
+    ///
+    /// The executor stores the subnet internally; `execute()` with the same
+    /// `job_id` will reuse it rather than allocating a fresh one.
+    fn setup_network(&self, _job_id: &str) -> Result<Option<std::net::Ipv4Addr>, ExecutorError> {
+        Ok(None)
+    }
 
     /// Clean up job root directory with executor-specific privileges
     ///
@@ -353,7 +379,7 @@ pub mod mock {
         }
 
         fn proxy_listen_addr(&self) -> &'static str {
-            "127.0.0.1:3128"
+            "127.0.0.1:0"
         }
 
         fn proxy_connect_host(&self) -> &'static str {

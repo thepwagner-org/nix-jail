@@ -2,7 +2,6 @@
 //!
 //! Exposes job execution, cache performance, and resource metrics.
 
-use crate::proxy::llm::ToolCall;
 use prometheus::{
     CounterVec, Encoder, Gauge, Histogram, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
 };
@@ -249,7 +248,7 @@ impl MetricsRegistry {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
         cache_read_tokens: Option<u64>,
-        tool_calls: &[ToolCall],
+        tool_calls: &[LlmToolCall],
     ) {
         let model_str = model.unwrap_or("unknown");
 
@@ -282,6 +281,12 @@ impl MetricsRegistry {
                 .inc();
         }
     }
+}
+
+/// LLM tool call for metrics recording
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LlmToolCall {
+    pub name: String,
 }
 
 /// Shared metrics registry type

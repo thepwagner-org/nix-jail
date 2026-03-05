@@ -1,0 +1,24 @@
+# Rust/Cargo build support.
+#
+# Adds crates.io registry access. Intended to be composed with another profile
+# that supplies the script, shell, and credentials:
+#
+#   POST /api/jobs {"profiles":["opencode","cargo"],"repo":"..."}
+#   nj exec --profile opencode --profile cargo --repo ...
+
+description = "Rust/Cargo build support (crates.io registry access)"
+
+[[network.rules]]
+action = "allow"
+[network.rules.pattern]
+host = "crates.io"
+
+[[network.rules]]
+action = "allow"
+[network.rules.pattern]
+host = "index.crates.io"
+
+[[network.rules]]
+action = "allow"
+[network.rules.pattern]
+host = "static.crates.io"

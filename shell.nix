@@ -11,4 +11,6 @@ pkgs.mkShell {
     perl
     openssl.dev # .dev includes headers + pkg-config
   ];
+
+  RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
 }

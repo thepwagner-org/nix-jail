@@ -9,26 +9,26 @@ use crate::jail::{
 use serde::Deserialize;
 
 /// TOML-friendly policy format (used for loading from files)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ClientNetworkPolicy {
     pub rules: Vec<ClientNetworkRule>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ClientNetworkRule {
     pub pattern: ClientNetworkPattern,
     pub action: ActionName,
     pub credential: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum ClientNetworkPattern {
     Host { host: String, path: Option<String> },
     Ip { cidr: String },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ActionName {
     Allow,

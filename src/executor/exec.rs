@@ -124,13 +124,11 @@ fn find_binary_in_closure(name: &str, closure: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
-/// Creates the sandbox home directory structure.
+/// Creates the sandbox home directory.
 ///
-/// Creates /home/{user} with standard XDG subdirectories:
-/// - /home/{user}/.config
-/// - /home/{user}/.local/share
-/// - /home/{user}/.local/state
-/// - /home/{user}/.cache
+/// Only the home directory itself is created. XDG subdirectories
+/// (.config, .cache, .local/share, .local/state) are left to tools
+/// that need them — most create them on first use.
 ///
 /// # Arguments
 /// * `root_dir` - The root directory for the chroot
@@ -143,11 +141,7 @@ pub fn create_home_directory(
     let user = sandbox_user.map(|(u, _)| u).unwrap_or("sandbox");
     let home_dir = root_dir.join(format!("home/{}", user));
 
-    // Create XDG directories
-    std::fs::create_dir_all(home_dir.join(".config"))?;
-    std::fs::create_dir_all(home_dir.join(".local/share"))?;
-    std::fs::create_dir_all(home_dir.join(".local/state"))?;
-    std::fs::create_dir_all(home_dir.join(".cache"))?;
+    std::fs::create_dir_all(&home_dir)?;
 
     // Chown to sandbox user if specified (daemon runs as root, jobs run as sandbox user)
     // Skip chown when sandbox_user is None (e.g., macOS sandbox-exec runs as current user)
@@ -234,16 +228,13 @@ mod tests {
 
         let home_dir = root.path().join("home/sandbox");
         assert!(home_dir.exists(), "/home/sandbox should exist");
-        assert!(home_dir.join(".config").exists(), ".config should exist");
+        // XDG subdirs are not pre-created; tools create them on demand
         assert!(
-            home_dir.join(".local/share").exists(),
-            ".local/share should exist"
+            !home_dir.join(".config").exists(),
+            ".config should not exist"
         );
-        assert!(
-            home_dir.join(".local/state").exists(),
-            ".local/state should exist"
-        );
-        assert!(home_dir.join(".cache").exists(), ".cache should exist");
+        assert!(!home_dir.join(".local").exists(), ".local should not exist");
+        assert!(!home_dir.join(".cache").exists(), ".cache should not exist");
     }
 
     #[test]
@@ -256,7 +247,11 @@ mod tests {
 
         let home_dir = root.path().join("home/testuser");
         assert!(home_dir.exists(), "/home/testuser should exist");
-        assert!(home_dir.join(".config").exists(), ".config should exist");
+        // XDG subdirs are not pre-created; tools create them on demand
+        assert!(
+            !home_dir.join(".config").exists(),
+            ".config should not exist"
+        );
     }
 
     #[test]

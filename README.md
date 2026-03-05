@@ -5,9 +5,11 @@ Sandboxed execution for Nix packages with network policy enforcement and credent
 ## What it does
 
 Run scripts in isolated environments where:
+
 - Only the packages you specify are available (minimal Nix closure)
 - Network access is denied by default, allowed by policy
 - Credentials are injected by the proxy, never visible to the sandbox
+
 ```bash
 # Run curl in a sandbox - network blocked by default
 cargo run --bin client -- exec -p curl -s examples/scripts/curl.sh

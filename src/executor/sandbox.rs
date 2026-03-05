@@ -154,7 +154,7 @@ impl Executor for SandboxExecutor {
             // Build command for PTY using the final (possibly sandboxed) command
             let mut cmd_builder = CommandBuilder::new(&final_command[0]);
             cmd_builder.args(&final_command[1..]);
-            cmd_builder.cwd(&config.working_dir);
+            cmd_builder.cwd(config.cwd.as_deref().unwrap_or(&config.working_dir));
             cmd_builder.env_clear();
             for (k, v) in &env {
                 cmd_builder.env(k, v);
@@ -261,7 +261,7 @@ impl Executor for SandboxExecutor {
 
             let mut child = Command::new(program)
                 .args(args)
-                .current_dir(&config.working_dir)
+                .current_dir(config.cwd.as_deref().unwrap_or(&config.working_dir))
                 .env_clear()
                 .envs(&env)
                 .stdout(Stdio::piped())
@@ -354,7 +354,7 @@ impl Executor for SandboxExecutor {
     }
 
     fn proxy_listen_addr(&self) -> &'static str {
-        "127.0.0.1:3128"
+        "127.0.0.1:0"
     }
 
     fn proxy_connect_host(&self) -> &'static str {

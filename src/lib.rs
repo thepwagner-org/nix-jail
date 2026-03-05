@@ -1,6 +1,7 @@
 // nix-jail: sandboxed execution with sparse checkout
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::KeyValue;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::collections::HashMap;
@@ -20,7 +21,6 @@ pub mod log_sink;
 pub mod metrics;
 pub mod networkpolicy;
 pub mod orchestration;
-pub mod proxy;
 pub mod proxy_manager;
 pub mod root;
 pub mod service;
@@ -183,6 +183,7 @@ fn init_otlp_tracer(
         .with_resource(
             Resource::builder_empty()
                 .with_service_name(service_name.to_string())
+                .with_attribute(KeyValue::new("service.version", env!("NIX_JAIL_VERSION")))
                 .build(),
         )
         .build();
