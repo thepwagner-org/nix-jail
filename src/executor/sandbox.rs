@@ -161,9 +161,14 @@ impl Executor for SandboxExecutor {
             }
 
             // Spawn process in PTY
-            let mut pty_child = pty_pair.slave.spawn_command(cmd_builder).map_err(|e| {
+            let pty_child = pty_pair.slave.spawn_command(cmd_builder).map_err(|e| {
                 ExecutorError::SpawnFailed(format!("Failed to spawn in PTY: {}", e))
             })?;
+
+            // Close parent's copy of the slave fd so PTY reader gets EOF when child exits.
+            // Without this, the master read blocks forever because the kernel keeps the PTY
+            // open as long as any slave fd exists -- even after the child process exits.
+            drop(pty_pair.slave);
 
             // Get reader and writer for PTY master
             let mut pty_reader = pty_pair.master.try_clone_reader().map_err(|e| {
@@ -172,6 +177,9 @@ impl Executor for SandboxExecutor {
             let mut pty_writer = pty_pair.master.take_writer().map_err(|e| {
                 ExecutorError::SpawnFailed(format!("Failed to take PTY writer: {}", e))
             })?;
+
+            // Drop the original master handle; reader and writer hold independent fds
+            drop(pty_pair.master);
 
             let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(128);
             let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
@@ -208,21 +216,33 @@ impl Executor for SandboxExecutor {
                     }
                 });
 
-                // Wait for process with timeout
-                let result = tokio::time::timeout(timeout, async {
+                // Wait for process with timeout.
+                // pty_child.wait() is synchronous (portable-pty), so run it in
+                // spawn_blocking to avoid blocking the tokio runtime thread.
+                let pty_child_pid = pty_child.process_id();
+                let wait_task = tokio::task::spawn_blocking(move || {
+                    let mut pty_child = pty_child;
                     pty_child.wait().map_err(std::io::Error::other)
-                })
-                .await;
+                });
 
-                let exit_code = match result {
-                    Ok(Ok(status)) => status.exit_code() as i32,
-                    Ok(Err(e)) => {
+                let exit_code = match tokio::time::timeout(timeout, wait_task).await {
+                    Ok(Ok(Ok(status))) => status.exit_code() as i32,
+                    Ok(Ok(Err(e))) => {
                         tracing::error!(job_id = %job_id, error = %e, "error waiting for process");
+                        -1
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(job_id = %job_id, error = %e, "wait task panicked");
                         -1
                     }
                     Err(_) => {
                         tracing::warn!(job_id = %job_id, "execution timed out, killing process");
-                        let _ = pty_child.kill();
+                        if let Some(pid) = pty_child_pid {
+                            let _ = nix::sys::signal::kill(
+                                nix::unistd::Pid::from_raw(pid as i32),
+                                nix::sys::signal::Signal::SIGKILL,
+                            );
+                        }
                         -1
                     }
                 };

@@ -160,7 +160,7 @@ pub fn push_branch(repo_dir: &Path, branch: &str, token: &str) -> Result<(), Wor
     let token_owned = token.to_string();
 
     let _ = callbacks.credentials(move |_url, username_from_url, _allowed_types| {
-        // For GitHub HTTPS, use token as password
+        // HTTPS token auth: token as password (works for GitHub, Forgejo, Gitea)
         Cred::userpass_plaintext(username_from_url.unwrap_or("git"), &token_owned)
     });
 

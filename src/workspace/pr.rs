@@ -1,39 +1,82 @@
-//! Pull request creation using GitHub API
+//! Pull request creation and auto-merge using Forgejo/Gitea API
 //!
-//! This module provides functions to create pull requests on GitHub
-//! using direct HTTP requests.
+//! This module provides functions to create and auto-merge pull requests
+//! on Forgejo/Gitea instances using direct HTTP requests. The URL parser
+//! is generic and works with any git host (HTTPS, SSH shorthand, SSH URL).
 
 use super::WorkspaceError;
 use serde::{Deserialize, Serialize};
 
-/// Parse a GitHub URL into (owner, repo) components
+/// Parsed git remote URL components
+#[derive(Debug)]
+pub struct GitRemote {
+    pub host: String,
+    pub owner: String,
+    pub repo: String,
+}
+
+/// Parse a git URL into (host, owner, repo) components
 ///
-/// Supports both HTTPS and SSH formats:
-/// - https://github.com/owner/repo
-/// - git@github.com:owner/repo
-/// - https://github.com/owner/repo.git
-fn parse_github_url(url: &str) -> Result<(String, String), WorkspaceError> {
-    // Remove .git suffix if present
+/// Supports HTTPS, SSH shorthand, and SSH URL formats for any host:
+/// - `https://git.example.com/owner/repo[.git]`
+/// - `git@git.example.com:owner/repo[.git]`
+/// - `ssh://git@git.example.com[:port]/owner/repo[.git]`
+pub fn parse_git_url(url: &str) -> Result<GitRemote, WorkspaceError> {
     let url = url.trim_end_matches(".git");
 
-    // Try HTTPS format first
-    if let Some(rest) = url.strip_prefix("https://github.com/") {
-        let parts: Vec<&str> = rest.split('/').collect();
-        if parts.len() >= 2 {
-            return Ok((parts[0].to_string(), parts[1].to_string()));
+    // HTTPS/HTTP: https://host/owner/repo
+    for prefix in &["https://", "http://"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            let parts: Vec<&str> = rest.splitn(4, '/').collect();
+            if parts.len() >= 3
+                && !parts[0].is_empty()
+                && !parts[1].is_empty()
+                && !parts[2].is_empty()
+            {
+                return Ok(GitRemote {
+                    host: parts[0].to_string(),
+                    owner: parts[1].to_string(),
+                    repo: parts[2].to_string(),
+                });
+            }
         }
     }
 
-    // Try SSH format
-    if let Some(rest) = url.strip_prefix("git@github.com:") {
-        let parts: Vec<&str> = rest.split('/').collect();
-        if parts.len() >= 2 {
-            return Ok((parts[0].to_string(), parts[1].to_string()));
+    // SSH shorthand: git@host:owner/repo (colon separates host from path)
+    if let Some(rest) = url.strip_prefix("git@") {
+        if let Some((host, path)) = rest.split_once(':') {
+            let parts: Vec<&str> = path.splitn(3, '/').collect();
+            if parts.len() >= 2 && !host.is_empty() && !parts[0].is_empty() && !parts[1].is_empty()
+            {
+                return Ok(GitRemote {
+                    host: host.to_string(),
+                    owner: parts[0].to_string(),
+                    repo: parts[1].to_string(),
+                });
+            }
+        }
+    }
+
+    // SSH URL: ssh://[user@]host[:port]/owner/repo
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        let rest = rest.split_once('@').map_or(rest, |(_, after)| after);
+        if let Some((host_port, path)) = rest.split_once('/') {
+            // Strip port if present: "host:2222" -> "host"
+            let host = host_port.split(':').next().unwrap_or(host_port);
+            let parts: Vec<&str> = path.splitn(3, '/').collect();
+            if parts.len() >= 2 && !host.is_empty() && !parts[0].is_empty() && !parts[1].is_empty()
+            {
+                return Ok(GitRemote {
+                    host: host.to_string(),
+                    owner: parts[0].to_string(),
+                    repo: parts[1].to_string(),
+                });
+            }
         }
     }
 
     Err(WorkspaceError::InvalidPath(format!(
-        "Invalid GitHub URL format: {}",
+        "could not parse git URL: {}",
         url
     )))
 }
@@ -48,46 +91,54 @@ struct CreatePullRequest {
 
 #[derive(Deserialize)]
 struct PullRequestResponse {
+    number: u64,
     html_url: String,
 }
 
-/// Create a pull request on GitHub
+#[derive(Serialize)]
+struct MergePullRequest {
+    /// Merge method: merge, rebase, rebase-merge, squash, fast-forward-only
+    #[serde(rename = "Do")]
+    method: String,
+    delete_branch_after_merge: bool,
+    merge_when_checks_succeed: bool,
+}
+
+/// Create a pull request on a Forgejo/Gitea instance
 ///
 /// # Arguments
-/// * `repo_url` - GitHub repository URL (HTTPS or SSH format)
+/// * `repo_url` - Git repository URL (any format — host/owner/repo are extracted)
 /// * `head_branch` - Source branch for the PR (e.g., "job-01HXABC...")
 /// * `base_branch` - Target branch for the PR (e.g., "main")
 /// * `commits` - List of commit messages to include in PR body
-/// * `github_token` - GitHub personal access token
+/// * `auth_header_value` - Formatted authorization header value (e.g., "token abc123")
 ///
 /// # Returns
-/// The HTML URL of the created pull request
+/// A tuple of (PR number, HTML URL)
 pub async fn create_pull_request(
     repo_url: &str,
     head_branch: &str,
     base_branch: &str,
     commits: &[String],
-    github_token: &str,
-) -> Result<String, WorkspaceError> {
-    // Parse owner/repo from URL
-    let (owner, repo) = parse_github_url(repo_url)?;
+    auth_header_value: &str,
+) -> Result<(u64, String), WorkspaceError> {
+    let remote = parse_git_url(repo_url)?;
 
     tracing::info!(
-        owner = %owner,
-        repo = %repo,
+        host = %remote.host,
+        owner = %remote.owner,
+        repo = %remote.repo,
         head = %head_branch,
         base = %base_branch,
         "creating pull request"
     );
 
-    // Generate title from first commit
     let title = if commits.is_empty() {
         "Auto-PR: Changes from nix-jail".to_string()
     } else {
         format!("Auto-PR: {}", commits[0])
     };
 
-    // Generate body with all commits
     let commit_list = if commits.is_empty() {
         "No commit messages available".to_string()
     } else {
@@ -98,10 +149,7 @@ pub async fn create_pull_request(
             .join("\n")
     };
 
-    let body = format!(
-        "## Commits\n{}\n\n---\n🤖 Generated by [nix-jail](https://github.com/thepwagner/nix-jail)",
-        commit_list
-    );
+    let body = format!("## Commits\n{}\n\n---\nGenerated by nix-jail", commit_list);
 
     let request_body = CreatePullRequest {
         title,
@@ -113,19 +161,18 @@ pub async fn create_pull_request(
     let client = reqwest::Client::new();
     let response = client
         .post(format!(
-            "https://api.github.com/repos/{}/{}/pulls",
-            owner, repo
+            "https://{}/api/v1/repos/{}/{}/pulls",
+            remote.host, remote.owner, remote.repo
         ))
-        .header("Authorization", format!("Bearer {}", github_token))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "nix-jail")
-        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("Authorization", auth_header_value)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
         .json(&request_body)
         .send()
         .await
         .map_err(|e| {
             WorkspaceError::IoError(std::io::Error::other(format!(
-                "Failed to send pull request: {}",
+                "failed to send pull request: {}",
                 e
             )))
         })?;
@@ -134,20 +181,90 @@ pub async fn create_pull_request(
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(WorkspaceError::IoError(std::io::Error::other(format!(
-            "GitHub API error {}: {}",
+            "Forgejo API error {}: {}",
             status, body
         ))));
     }
 
     let pr: PullRequestResponse = response.json().await.map_err(|e| {
         WorkspaceError::IoError(std::io::Error::other(format!(
-            "Failed to parse pull request response: {}",
+            "failed to parse pull request response: {}",
             e
         )))
     })?;
 
-    tracing::info!(pr_url = %pr.html_url, "Pull request created successfully");
-    Ok(pr.html_url)
+    tracing::info!(pr_url = %pr.html_url, pr_number = pr.number, "pull request created");
+    Ok((pr.number, pr.html_url))
+}
+
+/// Request auto-merge for a pull request on a Forgejo/Gitea instance
+///
+/// If branch protection rules require CI, Forgejo queues this as a scheduled
+/// auto-merge. Without protection rules, it merges immediately.
+///
+/// Errors are logged but not propagated — a failed merge attempt does not
+/// invalidate the PR itself.
+pub async fn auto_merge_pull_request(
+    repo_url: &str,
+    pr_number: u64,
+    auth_header_value: &str,
+) -> Result<(), WorkspaceError> {
+    let remote = parse_git_url(repo_url)?;
+
+    tracing::info!(
+        host = %remote.host,
+        owner = %remote.owner,
+        repo = %remote.repo,
+        pr_number = pr_number,
+        "requesting auto-merge"
+    );
+
+    let request_body = MergePullRequest {
+        method: "merge".to_string(),
+        delete_branch_after_merge: true,
+        merge_when_checks_succeed: true,
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "https://{}/api/v1/repos/{}/{}/pulls/{}/merge",
+            remote.host, remote.owner, remote.repo, pr_number
+        ))
+        .header("Authorization", auth_header_value)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| {
+            WorkspaceError::IoError(std::io::Error::other(format!(
+                "failed to send merge request: {}",
+                e
+            )))
+        })?;
+
+    let status = response.status();
+    if status.is_success() {
+        tracing::info!(pr_number = pr_number, "pull request merged");
+    } else if status.as_u16() == 405 {
+        // 405 = merge not allowed yet (branch protection, checks pending).
+        // merge_when_checks_succeed should queue it for later.
+        tracing::info!(
+            pr_number = pr_number,
+            "merge queued (checks pending or branch protection active)"
+        );
+    } else {
+        let body = response.text().await.unwrap_or_default();
+        tracing::warn!(
+            pr_number = pr_number,
+            status = %status,
+            body = %body,
+            "auto-merge request failed"
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -155,40 +272,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_github_url_https() {
-        let (owner, repo) = parse_github_url("https://github.com/thepwagner/nix-jail")
-            .expect("failed to parse https url");
-        assert_eq!(owner, "thepwagner");
-        assert_eq!(repo, "nix-jail");
+    fn test_parse_https() {
+        let r = parse_git_url("https://git.example.com/example-org/example-repo").unwrap();
+        assert_eq!(r.host, "git.example.com");
+        assert_eq!(r.owner, "example-org");
+        assert_eq!(r.repo, "example-repo");
     }
 
     #[test]
-    fn test_parse_github_url_https_with_git() {
-        let (owner, repo) = parse_github_url("https://github.com/thepwagner/nix-jail.git")
-            .expect("failed to parse https url with .git");
-        assert_eq!(owner, "thepwagner");
-        assert_eq!(repo, "nix-jail");
+    fn test_parse_https_with_git_suffix() {
+        let r = parse_git_url("https://git.example.com/example-org/example-repo.git").unwrap();
+        assert_eq!(r.host, "git.example.com");
+        assert_eq!(r.owner, "example-org");
+        assert_eq!(r.repo, "example-repo");
     }
 
     #[test]
-    fn test_parse_github_url_ssh() {
-        let (owner, repo) = parse_github_url("git@github.com:thepwagner/nix-jail")
-            .expect("failed to parse ssh url");
-        assert_eq!(owner, "thepwagner");
-        assert_eq!(repo, "nix-jail");
+    fn test_parse_ssh_shorthand() {
+        let r = parse_git_url("git@git.example.com:example-org/example-repo").unwrap();
+        assert_eq!(r.host, "git.example.com");
+        assert_eq!(r.owner, "example-org");
+        assert_eq!(r.repo, "example-repo");
     }
 
     #[test]
-    fn test_parse_github_url_ssh_with_git() {
-        let (owner, repo) = parse_github_url("git@github.com:thepwagner/nix-jail.git")
-            .expect("failed to parse ssh url with .git");
-        assert_eq!(owner, "thepwagner");
-        assert_eq!(repo, "nix-jail");
+    fn test_parse_ssh_shorthand_with_git_suffix() {
+        let r = parse_git_url("git@git.example.com:example-org/example-repo.git").unwrap();
+        assert_eq!(r.host, "git.example.com");
+        assert_eq!(r.owner, "example-org");
+        assert_eq!(r.repo, "example-repo");
     }
 
     #[test]
-    fn test_parse_github_url_invalid() {
-        let result = parse_github_url("https://gitlab.com/user/repo");
-        assert!(result.is_err());
+    fn test_parse_ssh_url_with_port() {
+        let r = parse_git_url("ssh://git@git.example.com:2222/example-org/example-repo").unwrap();
+        assert_eq!(r.host, "git.example.com");
+        assert_eq!(r.owner, "example-org");
+        assert_eq!(r.repo, "example-repo");
+    }
+
+    #[test]
+    fn test_parse_ssh_url_without_port() {
+        let r = parse_git_url("ssh://git@git.example.com/example-org/example-repo").unwrap();
+        assert_eq!(r.host, "git.example.com");
+        assert_eq!(r.owner, "example-org");
+        assert_eq!(r.repo, "example-repo");
+    }
+
+    #[test]
+    fn test_parse_github_https() {
+        let r = parse_git_url("https://github.com/thepwagner/nix-jail").unwrap();
+        assert_eq!(r.host, "github.com");
+        assert_eq!(r.owner, "thepwagner");
+        assert_eq!(r.repo, "nix-jail");
+    }
+
+    #[test]
+    fn test_parse_github_ssh() {
+        let r = parse_git_url("git@github.com:thepwagner/nix-jail").unwrap();
+        assert_eq!(r.host, "github.com");
+        assert_eq!(r.owner, "thepwagner");
+        assert_eq!(r.repo, "nix-jail");
+    }
+
+    #[test]
+    fn test_parse_invalid_url() {
+        assert!(parse_git_url("not-a-url").is_err());
+    }
+
+    #[test]
+    fn test_parse_http() {
+        let r = parse_git_url("http://gitea.local/org/repo").unwrap();
+        assert_eq!(r.host, "gitea.local");
+        assert_eq!(r.owner, "org");
+        assert_eq!(r.repo, "repo");
     }
 }

@@ -189,6 +189,33 @@ fn sanitize_repo_url(url: &str, job_id: &str) -> String {
     url.to_string()
 }
 
+/// Check if a hostname matches a credential host pattern.
+///
+/// Supports exact match and wildcard prefix (`*.example.com`).
+fn host_matches_pattern(host: &str, pattern: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        host.len() > suffix.len() + 1
+            && host.ends_with(suffix)
+            && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+    } else {
+        host.eq_ignore_ascii_case(pattern)
+    }
+}
+
+/// Find a credential whose `allowed_host_patterns` matches the host extracted
+/// from the given git repository URL.
+fn find_credential_for_host<'a>(
+    credentials: &'a [Credential],
+    repo_url: &str,
+) -> Option<&'a Credential> {
+    let remote = workspace::pr::parse_git_url(repo_url).ok()?;
+    credentials.iter().find(|c| {
+        c.allowed_host_patterns
+            .iter()
+            .any(|pattern| host_matches_pattern(&remote.host, pattern))
+    })
+}
+
 /// Serve stored logs for a completed job
 pub async fn serve_stored_logs(
     job_id: String,
@@ -369,30 +396,29 @@ async fn execute_job_inner(
     let extra_paths = job.extra_paths.clone();
     let git_ref = job.git_ref.clone();
     let is_exec_mode = !packages.is_empty();
-    // Fetch GitHub token if needed for git cloning
-    let github_token = if !repo.is_empty() {
-        // Look for GitHub credential in server config
-        if let Some(github_cred) = config
-            .credentials
-            .iter()
-            .find(|c| c.credential_type == crate::config::CredentialType::GitHub)
-        {
-            match crate::config::fetch_credential_token(github_cred).await {
+    // Fetch git credential for cloning (matched by repo host)
+    let git_token = if !repo.is_empty() {
+        if let Some(cred) = find_credential_for_host(&config.credentials, &repo) {
+            match crate::config::fetch_credential_token(cred).await {
                 Ok(token) => {
-                    tracing::info!(job_id = %job_id, "fetched github token for private repository access");
+                    tracing::info!(
+                        job_id = %job_id,
+                        credential = %cred.name,
+                        "fetched git credential for private repository access"
+                    );
                     Some(token)
                 }
                 Err(e) => {
                     tracing::warn!(
                         job_id = %job_id,
                         error = %e,
-                        "failed to fetch github token, will attempt public clone"
+                        "failed to fetch git credential, will attempt public clone"
                     );
                     None
                 }
             }
         } else {
-            tracing::debug!(job_id = %job_id, "no github credential configured, cloning as public repository");
+            tracing::debug!(job_id = %job_id, "no credential matches repo host, cloning as public");
             None
         }
     } else {
@@ -434,7 +460,7 @@ async fn execute_job_inner(
                 git_ref.as_deref(),
                 Some(&path),
                 &extra_paths,
-                github_token.as_deref(),
+                git_token.as_deref(),
             )
             .instrument(tracing::info_span!("setup_workspace"))
             .await;
@@ -459,13 +485,11 @@ async fn execute_job_inner(
     // Detect flake source (local flake.nix or .envrc with use flake)
     let flake_source = workspace::flake::detect_flake_source(&workspace_dir);
 
-    // Capture git state before execution (if push enabled and repo provided)
-    let (head_before, base_branch) = if job.push && !repo.is_empty() {
-        let head = workspace::git_refs::get_head_commit(&workspace_dir).ok();
-        let branch = workspace::git_refs::get_current_branch(&workspace_dir).ok();
-        (head, branch)
+    // Capture HEAD SHA before execution so we can detect new commits for PR creation
+    let head_before = if job.push && !repo.is_empty() {
+        workspace::git_refs::get_head_commit(&workspace_dir).ok()
     } else {
-        (None, None)
+        None
     };
 
     // Merge server credentials with ephemeral credentials (ephemeral overrides server)
@@ -1296,13 +1320,12 @@ async fn execute_job_inner(
 
     // Handle PR creation if push is enabled
     if job.push && !repo.is_empty() && exit_code == 0 {
-        if let (Some(before_sha), Some(original_branch)) = (head_before, base_branch) {
+        if let Some(before_sha) = head_before {
             match handle_pr_creation(PrCreationContext {
                 repo_dir: &workspace_dir,
                 job_id: &job_id,
                 repo_url: &repo,
                 head_before: &before_sha,
-                base_branch: &original_branch,
                 config: &config,
                 log_sink: &log_sink,
             })
@@ -2242,7 +2265,6 @@ struct PrCreationContext<'a> {
     job_id: &'a str,
     repo_url: &'a str,
     head_before: &'a str,
-    base_branch: &'a str,
     config: &'a crate::config::ServerConfig,
     log_sink: &'a Arc<dyn LogSink>,
 }
@@ -2255,7 +2277,6 @@ async fn handle_pr_creation(
         job_id,
         repo_url,
         head_before,
-        base_branch,
         config,
         log_sink,
     } = ctx;
@@ -2296,20 +2317,21 @@ async fn handle_pr_creation(
         &format!("Created branch '{}' for pull request", pr_branch),
     );
 
-    // Get GitHub token
-    let github_cred = config
-        .credentials
-        .iter()
-        .find(|c| c.credential_type == crate::config::CredentialType::GitHub)
-        .ok_or_else(|| {
-            workspace::WorkspaceError::InvalidPath("No GitHub credential configured".into())
-        })?;
+    // Find credential matching the repo host
+    let cred = find_credential_for_host(&config.credentials, repo_url).ok_or_else(|| {
+        workspace::WorkspaceError::InvalidPath(format!(
+            "no credential matches repo host for {}",
+            repo_url
+        ))
+    })?;
 
-    let token = crate::config::fetch_credential_token(github_cred)
+    let token = crate::config::fetch_credential_token(cred)
         .await
         .map_err(|e| {
-            workspace::WorkspaceError::InvalidPath(format!("Failed to fetch GitHub token: {}", e))
+            workspace::WorkspaceError::InvalidPath(format!("failed to fetch credential: {}", e))
         })?;
+
+    let auth_header_value = cred.header_format.replace("{token}", &token);
 
     // Push the new branch
     log_sink.info(
@@ -2319,15 +2341,30 @@ async fn handle_pr_creation(
 
     workspace::git_refs::push_branch(repo_dir, &pr_branch, &token)?;
 
-    // Create PR: job-${jobID} -> base_branch
+    // Create PR: job-${jobID} -> main
+    let base_branch = "main";
     log_sink.info(
         job_id,
         &format!("Creating pull request: {} -> {}", pr_branch, base_branch),
     );
 
-    let pr_url =
-        workspace::pr::create_pull_request(repo_url, &pr_branch, base_branch, &commits, &token)
-            .await?;
+    let (pr_number, pr_url) = workspace::pr::create_pull_request(
+        repo_url,
+        &pr_branch,
+        base_branch,
+        &commits,
+        &auth_header_value,
+    )
+    .await?;
+
+    // Request auto-merge (logs result, does not fail the PR creation)
+    log_sink.info(job_id, "Requesting auto-merge...");
+    if let Err(e) =
+        workspace::pr::auto_merge_pull_request(repo_url, pr_number, &auth_header_value).await
+    {
+        tracing::warn!(job_id = %job_id, error = %e, "auto-merge request failed");
+        log_sink.info(job_id, &format!("Auto-merge request failed: {}", e));
+    }
 
     Ok(pr_url)
 }
