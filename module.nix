@@ -123,7 +123,7 @@ in {
         type = lib.types.str;
         description = ''
           Base domain for subdomain routing.
-          e.g. "desktop-17.pwagner.net" routes "foo.desktop-17.pwagner.net" to job with subdomain "foo".
+          e.g. "myhost.example.com" routes "foo.myhost.example.com" to job with subdomain "foo".
         '';
       };
 

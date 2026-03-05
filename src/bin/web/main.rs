@@ -52,7 +52,7 @@ struct Args {
     daemon: String,
 
     /// Base domain — subdomains are stripped from the left
-    /// e.g. "desktop-17.pwagner.net" means "foo.desktop-17.pwagner.net" → subdomain "foo"
+    /// e.g. "myhost.example.com" means "foo.myhost.example.com" → subdomain "foo"
     #[arg(long)]
     base_domain: String,
 }

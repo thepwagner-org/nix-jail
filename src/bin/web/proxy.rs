@@ -129,7 +129,7 @@ fn project_dir(job_path: Option<&str>) -> String {
 /// Generate the bootstrap HTML page.
 ///
 /// Seeds four opencode localStorage keys then redirects to `/`.
-/// `origin` is the full URL origin the browser sees (e.g. `https://opencode.desktop-17.pwagner.net`).
+/// `origin` is the full URL origin the browser sees (e.g. `https://opencode.myhost.example.com`).
 /// `dir` is the project directory inside the sandbox (e.g. `/workspace/projects/nix-jail`).
 fn bootstrap_page(origin: &str, dir: &str) -> String {
     // Escape for embedding in a JS string literal

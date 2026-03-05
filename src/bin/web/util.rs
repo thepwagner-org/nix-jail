@@ -80,7 +80,7 @@ pub fn percent_decode(s: &str) -> String {
 
 /// Extract the leftmost subdomain label from a host string.
 ///
-/// Example: `"foo.desktop-17.pwagner.net"` with base `"desktop-17.pwagner.net"` → `"foo"`.
+/// Example: `"foo.myhost.example.com"` with base `"myhost.example.com"` → `"foo"`.
 /// Returns `None` for an empty label or multi-level subdomains.
 pub fn extract_subdomain<'a>(host: &'a str, base_domain: &str) -> Option<&'a str> {
     let suffix = format!(".{base_domain}");
@@ -99,7 +99,7 @@ mod tests {
     #[test]
     fn test_extract_subdomain_basic() {
         assert_eq!(
-            extract_subdomain("foo.desktop-17.pwagner.net", "desktop-17.pwagner.net"),
+            extract_subdomain("foo.myhost.example.com", "myhost.example.com"),
             Some("foo")
         );
     }
@@ -107,11 +107,11 @@ mod tests {
     #[test]
     fn test_extract_subdomain_no_match() {
         assert_eq!(
-            extract_subdomain("desktop-17.pwagner.net", "desktop-17.pwagner.net"),
+            extract_subdomain("myhost.example.com", "myhost.example.com"),
             None
         );
         assert_eq!(
-            extract_subdomain("other.example.com", "desktop-17.pwagner.net"),
+            extract_subdomain("other.example.com", "myhost.example.com"),
             None
         );
     }
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn test_extract_subdomain_multi_level_rejected() {
         assert_eq!(
-            extract_subdomain("a.b.desktop-17.pwagner.net", "desktop-17.pwagner.net"),
+            extract_subdomain("a.b.myhost.example.com", "myhost.example.com"),
             None
         );
     }
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn test_extract_subdomain_empty_rejected() {
         assert_eq!(
-            extract_subdomain(".desktop-17.pwagner.net", "desktop-17.pwagner.net"),
+            extract_subdomain(".myhost.example.com", "myhost.example.com"),
             None
         );
     }
