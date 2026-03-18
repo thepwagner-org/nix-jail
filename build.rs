@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or("unknown");
     println!("cargo:rustc-env=NIX_JAIL_VERSION={}", version);
     println!("cargo:rerun-if-changed=version.toml");
+    println!("cargo:rerun-if-changed=proto/jail.proto");
 
     tonic_prost_build::configure()
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")

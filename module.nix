@@ -75,6 +75,7 @@
     ${lib.optionalString (cfg.otlpEndpoint != null) ''otlp_endpoint = "${cfg.otlpEndpoint}"''}
     ${lib.optionalString (cfg.metricsPort != null) ''metrics_port = ${toString cfg.metricsPort}''}
     ${lib.optionalString (cfg.metricsPort != null) ''metrics_bind_address = "${cfg.metricsBindAddress}"''}
+    ${lib.optionalString (cfg.gitEmailDomain != null) ''git_email_domain = "${cfg.gitEmailDomain}"''}
     proxy_binary = "${cfg.alicePackage}/bin/alice"
 
     ${lib.concatMapStringsSep "\n" (cred: ''
@@ -274,6 +275,18 @@ in {
           };
         }
       '';
+    };
+
+    gitEmailDomain = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Domain used for git author identities written into sandbox ~/.gitconfig.
+        When set and git is present in the job closure, a ~/.gitconfig is written
+        with name = nix-jail[project] and email = nix-jail+project@<domain>.
+        For root-level jobs with no project, name = nix-jail and email = nix-jail@<domain>.
+      '';
+      example = "example.com";
     };
   };
 

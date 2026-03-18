@@ -134,9 +134,9 @@ pub async fn create_pull_request(
     );
 
     let title = if commits.is_empty() {
-        "Auto-PR: Changes from nix-jail".to_string()
+        "Changes from nix-jail".to_string()
     } else {
-        format!("Auto-PR: {}", commits[0])
+        commits[0].clone()
     };
 
     let commit_list = if commits.is_empty() {

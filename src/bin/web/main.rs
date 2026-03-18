@@ -16,29 +16,34 @@
 //! ```
 
 mod api;
+mod cache;
+mod events;
 mod proxy;
 mod sse;
 mod templates;
 mod util;
 
 use api::{api_cancel_job, api_list_jobs, api_retry_job, api_submit_job};
+use cache::JobCache;
 use clap::Parser;
+use events::api_events;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use proxy::{
-    handle_websocket_upgrade, lookup_job_backend, new_asset_cache, proxy_http, AssetCache,
+    handle_websocket_upgrade, lookup_subdomain, new_asset_cache, proxy_http, AssetCache,
+    SubdomainState,
 };
 use sse::api_stream_job;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use templates::{landing_page, log_page};
+use templates::{completed_page, failed_page, landing_page, loading_page, log_page};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
-use util::{error_response, extract_subdomain, BoxedBody};
+use util::{error_response, extract_subdomain, json_ok, BoxedBody, LogLine};
 
 #[derive(Parser, Debug)]
 #[command(name = "nj-web", about = "nix-jail web reverse proxy")]
@@ -63,6 +68,7 @@ struct AppState {
     daemon: Arc<String>,
     base_domain: Arc<String>,
     asset_cache: AssetCache,
+    job_cache: Arc<JobCache>,
 }
 
 #[tokio::main]
@@ -79,10 +85,14 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(listen_addr).await?;
     info!(addr = %listen_addr, base_domain = %args.base_domain, "nj-web listening");
 
+    let job_cache = Arc::new(JobCache::new());
+    cache::spawn_cache_sync(args.daemon.clone(), job_cache.clone());
+
     let state = AppState {
         daemon: Arc::new(args.daemon),
         base_domain: Arc::new(args.base_domain),
         asset_cache: new_asset_cache(),
+        job_cache,
     };
 
     loop {
@@ -104,6 +114,11 @@ async fn main() -> anyhow::Result<()> {
         }));
     }
 }
+
+/// Path on subdomain routes that returns a JSON status snapshot.
+///
+/// Polled by the loading page JS to detect when the job backend becomes ready.
+const STATUS_PATH: &str = "/.well-known/nj/status";
 
 async fn handle(
     req: Request<Incoming>,
@@ -129,20 +144,23 @@ async fn handle(
     };
 
     if subdomain == "home" {
-        return home_handler(req, &state.daemon).await;
+        return home_handler(req, &state).await;
     }
 
-    debug!(subdomain = %subdomain, path = %req.uri().path(), peer = %peer_addr, "routing request");
+    // Extract metadata from the request before it may be consumed.
+    let path = req.uri().path().to_owned();
+    let scheme = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("https")
+        .to_owned();
+    let home_base = format!("{scheme}://home.{}", state.base_domain);
 
-    let backend = match lookup_job_backend(&state.daemon, subdomain).await {
-        Ok(Some(b)) => b,
-        Ok(None) => {
-            info!(subdomain = %subdomain, "no running job found for subdomain");
-            return Ok(error_response(
-                StatusCode::NOT_FOUND,
-                &format!("no running job for subdomain '{subdomain}'"),
-            ));
-        }
+    debug!(subdomain = %subdomain, path = %path, peer = %peer_addr, "routing request");
+
+    let subdomain_state = match lookup_subdomain(&state.job_cache, &state.daemon, subdomain).await {
+        Ok(s) => s,
         Err(e) => {
             error!(subdomain = %subdomain, error = %e, "failed to query daemon");
             return Ok(error_response(
@@ -152,37 +170,135 @@ async fn handle(
         }
     };
 
-    let is_upgrade = req
-        .headers()
-        .get(hyper::header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_ascii_lowercase().contains("websocket"))
-        .unwrap_or(false);
+    match subdomain_state {
+        SubdomainState::Ready(backend) => {
+            // Intercept the status endpoint before proxying: return JSON directly.
+            if path == STATUS_PATH {
+                let j = backend.job_id.as_str();
+                return Ok(json_ok(format!(r#"{{"state":"ready","job_id":"{j}"}}"#)));
+            }
 
-    if is_upgrade {
-        return handle_websocket_upgrade(req, backend.addr, peer_addr).await;
+            let is_upgrade = req
+                .headers()
+                .get(hyper::header::UPGRADE)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_ascii_lowercase().contains("websocket"))
+                .unwrap_or(false);
+
+            if is_upgrade {
+                return handle_websocket_upgrade(req, backend.addr, peer_addr).await;
+            }
+
+            proxy_http(
+                req,
+                &backend.addr,
+                subdomain,
+                backend.path.as_deref(),
+                &state.asset_cache,
+            )
+            .await
+        }
+
+        SubdomainState::Loading { job_id } => {
+            info!(subdomain = %subdomain, job_id = %job_id, "serving loading page");
+            if path == STATUS_PATH {
+                return Ok(json_ok(format!(
+                    r#"{{"state":"loading","job_id":"{job_id}"}}"#
+                )));
+            }
+            Ok(loading_page(subdomain, &job_id, &home_base))
+        }
+
+        SubdomainState::Failed { job_id } => {
+            info!(subdomain = %subdomain, job_id = %job_id, "serving failed page");
+            if path == STATUS_PATH {
+                return Ok(json_ok(format!(
+                    r#"{{"state":"failed","job_id":"{job_id}"}}"#
+                )));
+            }
+            let logs = fetch_tail_logs(&state.daemon, &job_id, 80).await;
+            Ok(failed_page(subdomain, &job_id, &logs, &home_base))
+        }
+
+        SubdomainState::Completed { job_id } => {
+            info!(subdomain = %subdomain, job_id = %job_id, "serving completed page");
+            if path == STATUS_PATH {
+                return Ok(json_ok(format!(
+                    r#"{{"state":"completed","job_id":"{job_id}"}}"#
+                )));
+            }
+            let logs = fetch_tail_logs(&state.daemon, &job_id, 80).await;
+            Ok(completed_page(subdomain, &job_id, &logs, &home_base))
+        }
+
+        SubdomainState::NotFound => {
+            info!(subdomain = %subdomain, "no job found for subdomain");
+            Ok(error_response(
+                StatusCode::NOT_FOUND,
+                &format!("no job for subdomain '{subdomain}'"),
+            ))
+        }
     }
+}
 
-    proxy_http(
-        req,
-        &backend.addr,
-        subdomain,
-        backend.path.as_deref(),
-        &state.asset_cache,
-    )
-    .await
+/// Fetch the last `n` log lines for a finished job, for server-side rendering.
+async fn fetch_tail_logs(daemon: &str, job_id: &str, n: u32) -> Vec<LogLine> {
+    use nix_jail::jail::jail_service_client::JailServiceClient;
+    use nix_jail::jail::{LogSource, StreamRequest};
+
+    let mut client = match JailServiceClient::connect(daemon.to_string()).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(job_id = %job_id, error = %e, "failed to connect to daemon for log fetch");
+            return vec![];
+        }
+    };
+
+    let mut stream = match client
+        .stream_job(StreamRequest {
+            job_id: job_id.to_owned(),
+            tail_lines: Some(n),
+            follow: false,
+        })
+        .await
+    {
+        Ok(r) => r.into_inner(),
+        Err(e) => {
+            warn!(job_id = %job_id, error = %e, "stream_job rpc failed for log fetch");
+            return vec![];
+        }
+    };
+
+    let mut lines = Vec::new();
+    while let Ok(Some(entry)) = stream.message().await {
+        let source = match entry.source {
+            s if s == LogSource::JobStdout as i32 => "stdout",
+            s if s == LogSource::JobStderr as i32 => "stderr",
+            s if s == LogSource::ProxyStdout as i32 => "proxy",
+            s if s == LogSource::ProxyStderr as i32 => "proxy",
+            s if s == LogSource::System as i32 => "system",
+            _ => "stdout",
+        };
+        lines.push(LogLine {
+            source,
+            content: entry.content,
+        });
+    }
+    lines
 }
 
 async fn home_handler(
     req: Request<Incoming>,
-    daemon: &str,
+    state: &AppState,
 ) -> Result<Response<BoxedBody>, Infallible> {
     let path = req.uri().path().to_owned();
     let method = req.method().clone();
+    let daemon = state.daemon.as_str();
 
     match (method, path.as_str()) {
         (Method::GET, "/") => landing_page(daemon).await,
         (Method::GET, "/api/jobs") => api_list_jobs(daemon).await,
+        (Method::GET, "/api/events") => api_events(state.job_cache.clone()).await,
         (Method::POST, "/api/jobs") => api_submit_job(req, daemon).await,
         _ if path.starts_with("/api/jobs/") && path.ends_with("/stream") => {
             let job_id = path

@@ -482,8 +482,56 @@ async fn execute_job_inner(
         }
     };
 
-    // Detect flake source (local flake.nix or .envrc with use flake)
-    let flake_source = workspace::flake::detect_flake_source(&workspace_dir);
+    // Detect flake source(s) for the primary path and any extra_paths.
+    // If multiple projects have flakes, generate a composite flake.nix that
+    // merges their devShells via inputsFrom.
+    let flake_source = {
+        let primary = workspace::flake::detect_flake_source(&workspace_dir);
+
+        if extra_paths.is_empty() {
+            primary
+        } else {
+            // Collect all flake sources: primary + extra_paths
+            let workspace_root = &job_dir.workspace;
+            let mut all_sources: Vec<(String, workspace::flake::FlakeSource)> = Vec::new();
+
+            if let Some(source) = primary {
+                all_sources.push((path.clone(), source));
+            }
+
+            let extra_sources =
+                workspace::flake::detect_flake_sources(workspace_root, &extra_paths);
+            all_sources.extend(extra_sources);
+
+            match all_sources.len() {
+                0 => None,
+                1 => all_sources.into_iter().next().map(|(_, s)| s),
+                _ => {
+                    log_sink.info(
+                        &job_id,
+                        &format!(
+                            "Composing {} devShells into unified environment",
+                            all_sources.len()
+                        ),
+                    );
+                    match workspace::flake::generate_composite_flake(workspace_root, &all_sources) {
+                        Ok(source) => Some(source),
+                        Err(e) => {
+                            log_sink.error(
+                                &job_id,
+                                &format!("Failed to generate composite flake: {}", e),
+                            );
+                            // Fall back to primary-only if composite fails
+                            all_sources
+                                .into_iter()
+                                .find(|(p, _)| *p == path)
+                                .map(|(_, s)| s)
+                        }
+                    }
+                }
+            }
+        }
+    };
 
     // Capture HEAD SHA before execution so we can detect new commits for PR creation
     let head_before = if job.push && !repo.is_empty() {
@@ -691,6 +739,32 @@ async fn execute_job_inner(
     if let Err(e) = crate::executor::exec::create_home_directory(&job_dir.root, sandbox_user) {
         log_sink.error(&job_id, &format!("Failed to create home directory: {}", e));
         // Non-fatal: continue execution
+    }
+
+    // Write ~/.gitconfig if git is in the closure and an email domain is configured
+    if let Some(ref domain) = config.git_email_domain {
+        let has_git = closure.iter().any(|p| p.join("bin/git").exists());
+        if has_git {
+            let project_name = job
+                .cwd
+                .as_deref()
+                .or(if path.is_empty() {
+                    None
+                } else {
+                    Some(path.as_str())
+                })
+                .and_then(|p| std::path::Path::new(p).file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if let Err(e) = crate::executor::exec::create_gitconfig(
+                &job_dir.root,
+                sandbox_user,
+                project_name,
+                domain,
+            ) {
+                log_sink.error(&job_id, &format!("Failed to write .gitconfig: {}", e));
+            }
+        }
     }
 
     // Phase 2: Start alice proxy now that root exists (writes cert to root/etc/ssl/certs/)
@@ -943,6 +1017,7 @@ async fn execute_job_inner(
                 &executor,
                 &job_dir,
                 &workspace_dir,
+                &log_sink,
                 &env,
                 &closure,
                 &store_setup,
@@ -1106,9 +1181,21 @@ async fn execute_job_inner(
         hardening_profile,
         interactive,
         pty_size: None, // Server mode uses WebSocket for terminal size
-        cwd: job.cwd.as_ref().map(|c| workspace_dir.join(c)),
+        cwd: job.cwd.as_ref().map(|c| job_dir.workspace.join(c)),
         cache_mounts,
     };
+
+    // Log the first 256 chars of the script for debugging
+    {
+        let s = exec_config.command.get(2).map(|s| s.as_str()).unwrap_or("");
+        let preview: String = s
+            .chars()
+            .take(256)
+            .map(|c| if c == '\n' { ' ' } else { c })
+            .collect();
+        let suffix = if s.chars().count() > 256 { "…" } else { "" };
+        log_sink.info(&job_id, &format!("script: {}{}", preview.trim(), suffix));
+    }
 
     // Execute job using platform-specific executor (created earlier)
     let handle = match executor
@@ -1354,26 +1441,36 @@ async fn execute_job_inner(
     // so clients stop waiting while we clean up
     registry.remove(&job_id).await;
 
-    // Cleanup root directory and workspace
-    // Try executor-specific cleanup first (handles privilege escalation and btrfs on Linux)
-    if let Err(e) = executor
-        .cleanup_root(&job_dir.root)
-        .instrument(tracing::info_span!("cleanup_root"))
-        .await
-    {
-        tracing::warn!(error = %e, "executor cleanup failed, trying direct cleanup");
-        if let Err(e) = job_root.cleanup(&job_dir.root) {
-            tracing::warn!(error = %e, "failed to cleanup root directory");
+    // Cleanup root directory and workspace (skipped if no_cleanup is set)
+    if job.no_cleanup {
+        log_sink.info(
+            &job_id,
+            &format!(
+                "no_cleanup: job directory preserved at {}",
+                job_dir.base.display()
+            ),
+        );
+    } else {
+        // Try executor-specific cleanup first (handles privilege escalation and btrfs on Linux)
+        if let Err(e) = executor
+            .cleanup_root(&job_dir.root)
+            .instrument(tracing::info_span!("cleanup_root"))
+            .await
+        {
+            tracing::warn!(error = %e, "executor cleanup failed, trying direct cleanup");
+            if let Err(e) = job_root.cleanup(&job_dir.root) {
+                tracing::warn!(error = %e, "failed to cleanup root directory");
+            }
         }
-    }
-    if let Err(e) = executor
-        .cleanup_workspace(&job_dir.workspace)
-        .instrument(tracing::info_span!("cleanup_workspace"))
-        .await
-    {
-        tracing::warn!(error = %e, "executor workspace cleanup failed, trying direct cleanup");
-        if let Err(e) = job_workspace.cleanup(&job_dir.workspace) {
-            tracing::warn!(error = %e, "failed to cleanup workspace");
+        if let Err(e) = executor
+            .cleanup_workspace(&job_dir.workspace)
+            .instrument(tracing::info_span!("cleanup_workspace"))
+            .await
+        {
+            tracing::warn!(error = %e, "executor workspace cleanup failed, trying direct cleanup");
+            if let Err(e) = job_workspace.cleanup(&job_dir.workspace) {
+                tracing::warn!(error = %e, "failed to cleanup workspace");
+            }
         }
     }
 }
@@ -1537,6 +1634,7 @@ async fn run_populate_phase(
     executor: &Arc<dyn Executor>,
     job_dir: &JobDirectory,
     working_dir: &Path,
+    log_sink: &Arc<dyn LogSink>,
     env: &HashMap<String, String>,
     closure: &[PathBuf],
     store_setup: &crate::root::StoreSetup,
@@ -1633,6 +1731,9 @@ async fn run_populate_phase(
             output = ?output_lines,
             "populate phase failed"
         );
+        for line in &output_lines {
+            log_sink.error(job_id, line);
+        }
     } else {
         tracing::debug!(
             job_id = %job_id,
@@ -1790,6 +1891,40 @@ async fn find_packages(
         }
 
         for installable in &flake {
+            let path = std::path::Path::new(installable);
+
+            // A nix-shell env file (produced by pkgs.mkShell) is a single file,
+            // not a directory — appending /bin to it yields a nonexistent path.
+            // Detect these files early and expand their buildInputs instead of
+            // trying to resolve them as flake installables.
+            if workspace::is_nix_shell_file(path) {
+                let build_inputs = workspace::expand_nix_shell_file(path);
+                tracing::info!(
+                    path = %installable,
+                    count = build_inputs.len(),
+                    "expanded nix-shell file into buildInputs store paths"
+                );
+                log_sink.info(
+                    job_id,
+                    &format!(
+                        "Expanded nix-shell file {} into {} store paths",
+                        installable,
+                        build_inputs.len()
+                    ),
+                );
+                if build_inputs.is_empty() {
+                    log_sink.error(
+                        job_id,
+                        &format!(
+                            "nix-shell file '{}' has no buildInputs; opencode will not be in PATH",
+                            installable
+                        ),
+                    );
+                }
+                all_paths.extend(build_inputs);
+                continue;
+            }
+
             match workspace::resolve_flake_installable(installable).await {
                 Ok(path) => match workspace::compute_combined_closure(&[path]).await {
                     Ok(closure) => all_paths.extend(closure),
@@ -2339,7 +2474,7 @@ async fn handle_pr_creation(
         &format!("Pushing branch '{}' to remote...", pr_branch),
     );
 
-    workspace::git_refs::push_branch(repo_dir, &pr_branch, &token)?;
+    workspace::git_refs::push_branch(repo_dir, repo_url, &pr_branch, &token)?;
 
     // Create PR: job-${jobID} -> main
     let base_branch = "main";
@@ -2422,6 +2557,10 @@ pub struct LocalExecutionConfig {
 
     /// Explicit path to alice proxy binary (overrides PATH lookup)
     pub proxy_binary: Option<PathBuf>,
+
+    /// Domain for git author emails (e.g. "example.com").
+    /// When set and `git` is in the job closure, a `~/.gitconfig` is written.
+    pub git_email_domain: Option<String>,
 }
 
 impl std::fmt::Debug for LocalExecutionConfig {
@@ -2542,6 +2681,28 @@ pub async fn execute_local(
     if let Err(e) = crate::executor::exec::create_home_directory(&job_dir.root, sandbox_user) {
         log_sink.error(&job_id, &format!("Failed to create home directory: {}", e));
         // Non-fatal: continue execution
+    }
+
+    // Write ~/.gitconfig if git is in the closure and an email domain is configured
+    if let Some(ref domain) = config.git_email_domain {
+        let has_git = closure.iter().any(|p| p.join("bin/git").exists());
+        if has_git {
+            let project_name = config
+                .cwd
+                .as_deref()
+                .and_then(|p| p.file_name())
+                .or_else(|| config.working_dir.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if let Err(e) = crate::executor::exec::create_gitconfig(
+                &job_dir.root,
+                sandbox_user,
+                project_name,
+                domain,
+            ) {
+                log_sink.error(&job_id, &format!("Failed to write .gitconfig: {}", e));
+            }
+        }
     }
 
     // Phase 4: Start alice proxy if configured

@@ -28,6 +28,26 @@ pub fn error_response(status: StatusCode, msg: &str) -> Response<BoxedBody> {
         })
 }
 
+/// A single log line for server-side rendering in status pages.
+pub struct LogLine {
+    /// Source label: `"stdout"`, `"stderr"`, `"proxy"`, or `"system"`.
+    pub source: &'static str,
+    /// Raw log text (may contain arbitrary characters; callers must HTML-escape).
+    pub content: String,
+}
+
+/// Build an `application/json` OK response.
+pub fn json_ok(body: impl Into<String>) -> Response<BoxedBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header("Cache-Control", "no-store")
+        .body(full_body(body.into()))
+        .unwrap_or_else(|_| {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "json response failed")
+        })
+}
+
 /// Build an `application/json` error response.
 pub fn json_error(status: StatusCode, msg: &str) -> Response<BoxedBody> {
     let msg_escaped = msg.replace('"', "\\\"");

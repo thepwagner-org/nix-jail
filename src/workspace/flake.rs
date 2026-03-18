@@ -146,6 +146,154 @@ pub fn detect_flake_source(dir: &Path) -> Option<FlakeSource> {
     None
 }
 
+/// Detect flake sources for multiple project paths within a workspace
+///
+/// Calls `detect_flake_source` for each path's resolved directory. Returns
+/// only paths where a flake was actually found.
+///
+/// # Arguments
+/// * `workspace_root` - Root directory of the workspace (git checkout root)
+/// * `paths` - Project paths relative to workspace_root
+///
+/// # Returns
+/// Vec of (relative_path, FlakeSource) for each path that has a flake
+pub fn detect_flake_sources(
+    workspace_root: &Path,
+    paths: &[impl AsRef<str>],
+) -> Vec<(String, FlakeSource)> {
+    let mut sources = Vec::new();
+    for path in paths {
+        let path_str = path.as_ref();
+        if path_str.is_empty() || path_str == "." {
+            continue;
+        }
+        let dir = workspace_root.join(path_str);
+        if !dir.is_dir() {
+            tracing::debug!(path = %path_str, "skipping non-existent path for flake detection");
+            continue;
+        }
+        if let Some(source) = detect_flake_source(&dir) {
+            tracing::info!(path = %path_str, source = %source, "detected flake for extra path");
+            sources.push((path_str.to_string(), source));
+        }
+    }
+    sources
+}
+
+/// Generate a composite flake.nix that merges multiple project devShells
+///
+/// Writes a wrapper flake to `workspace_root/flake.nix` that uses `inputsFrom`
+/// to combine all detected devShells. The first project's nixpkgs is used as
+/// the base via `follows`.
+///
+/// # Arguments
+/// * `workspace_root` - Where to write the composite flake.nix
+/// * `sources` - (relative_path, FlakeSource) pairs from `detect_flake_sources`
+///
+/// # Returns
+/// A FlakeSource::Local pointing at the workspace root, or an error if the
+/// wrapper could not be written.
+///
+/// # Panics
+/// Panics if `sources` is empty (caller should handle single-source case directly)
+pub fn generate_composite_flake(
+    workspace_root: &Path,
+    sources: &[(String, FlakeSource)],
+) -> Result<FlakeSource, WorkspaceError> {
+    assert!(
+        !sources.is_empty(),
+        "generate_composite_flake called with no sources"
+    );
+
+    let system = get_system_arch();
+
+    // Build input declarations and devShell references
+    // Use alphabetic labels: a, b, c, ...
+    let mut input_lines = Vec::new();
+    let mut input_names = Vec::new();
+    let mut devshell_refs = Vec::new();
+
+    for (i, (path, source)) in sources.iter().enumerate() {
+        let label = (b'a' + i as u8) as char;
+        let label_str = label.to_string();
+
+        // Determine the flake directory relative to workspace root.
+        // For Local sources, the flake_dir IS the project dir (same as path).
+        // For Envrc sources, flake_dir may point elsewhere (e.g. monorepo root).
+        let flake_dir = match source {
+            FlakeSource::Local { flake_dir } => flake_dir,
+            FlakeSource::Envrc { flake_dir, .. } => flake_dir,
+        };
+
+        // Try to strip workspace_root prefix to get a relative path.
+        // Fall back to the project path if the flake_dir is outside the workspace
+        // (shouldn't happen in practice since the workspace contains all projects).
+        let rel = flake_dir
+            .strip_prefix(workspace_root)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| PathBuf::from(path));
+
+        input_lines.push(format!("    {label}.url = \"path:./{}\";", rel.display()));
+
+        let output_name = match source {
+            FlakeSource::Envrc { output, .. } => output.as_deref().unwrap_or("default"),
+            FlakeSource::Local { .. } => "default",
+        };
+
+        devshell_refs.push(format!(
+            "          {label}.devShells.{system}.{output_name}"
+        ));
+
+        input_names.push(label_str);
+    }
+
+    // First project's nixpkgs is inherited via follows
+    let first_label = &input_names[0];
+    input_lines.push(format!("    nixpkgs.follows = \"{first_label}/nixpkgs\";"));
+
+    let inputs_block = input_lines.join("\n");
+    let input_params = input_names
+        .iter()
+        .map(|n| n.as_str())
+        .chain(std::iter::once("nixpkgs"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let devshells_block = devshell_refs.join("\n");
+
+    let flake_content = format!(
+        r#"{{
+  inputs = {{
+{inputs_block}
+  }};
+  outputs = {{ {input_params}, ... }}: {{
+    devShells.{system}.default = nixpkgs.legacyPackages.{system}.mkShell {{
+      inputsFrom = [
+{devshells_block}
+      ];
+    }};
+  }};
+}}"#
+    );
+
+    let flake_path = workspace_root.join("flake.nix");
+    fs::write(&flake_path, &flake_content).map_err(|e| {
+        WorkspaceError::IoError(std::io::Error::other(format!(
+            "failed to write composite flake.nix: {}",
+            e
+        )))
+    })?;
+
+    tracing::info!(
+        path = %flake_path.display(),
+        project_count = sources.len(),
+        "wrote composite flake.nix"
+    );
+
+    Ok(FlakeSource::Local {
+        flake_dir: workspace_root.to_path_buf(),
+    })
+}
+
 /// Get the current system architecture string
 ///
 /// Returns the Nix system identifier (e.g., "aarch64-darwin", "x86_64-linux")
@@ -467,6 +615,135 @@ mod tests {
 
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         assert_eq!(system, "x86_64-linux");
+    }
+
+    #[test]
+    fn test_detect_flake_sources_multiple() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let root = temp_dir.path();
+
+        // Create two project dirs with flakes
+        let proj_a = root.join("projects/alpha");
+        let proj_b = root.join("projects/beta");
+        fs::create_dir_all(&proj_a).unwrap();
+        fs::create_dir_all(&proj_b).unwrap();
+
+        fs::write(proj_a.join("flake.nix"), "{}").unwrap();
+        fs::write(proj_b.join("flake.nix"), "{}").unwrap();
+
+        // Create a project dir WITHOUT a flake
+        let proj_c = root.join("projects/gamma");
+        fs::create_dir_all(&proj_c).unwrap();
+
+        let sources =
+            detect_flake_sources(root, &["projects/alpha", "projects/beta", "projects/gamma"]);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].0, "projects/alpha");
+        assert_eq!(sources[1].0, "projects/beta");
+        assert!(matches!(sources[0].1, FlakeSource::Local { .. }));
+        assert!(matches!(sources[1].1, FlakeSource::Local { .. }));
+    }
+
+    #[test]
+    fn test_detect_flake_sources_skips_nonexistent() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sources = detect_flake_sources(temp_dir.path(), &["does/not/exist"]);
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn test_detect_flake_sources_skips_dot_and_empty() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let sources = detect_flake_sources(temp_dir.path(), &[".", ""]);
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn test_generate_composite_flake_two_projects() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let root = temp_dir.path();
+
+        let proj_a = root.join("projects/meow");
+        let proj_b = root.join("projects/nix-jail");
+        fs::create_dir_all(&proj_a).unwrap();
+        fs::create_dir_all(&proj_b).unwrap();
+
+        let sources = vec![
+            (
+                "projects/meow".to_string(),
+                FlakeSource::Local {
+                    flake_dir: proj_a.clone(),
+                },
+            ),
+            (
+                "projects/nix-jail".to_string(),
+                FlakeSource::Local {
+                    flake_dir: proj_b.clone(),
+                },
+            ),
+        ];
+
+        let result = generate_composite_flake(root, &sources).unwrap();
+        assert!(matches!(result, FlakeSource::Local { .. }));
+
+        let flake_content = fs::read_to_string(root.join("flake.nix")).unwrap();
+
+        // Should reference both projects as inputs
+        assert!(flake_content.contains("a.url = \"path:./projects/meow\""));
+        assert!(flake_content.contains("b.url = \"path:./projects/nix-jail\""));
+
+        // Should use follows for nixpkgs from first input
+        assert!(flake_content.contains("nixpkgs.follows = \"a/nixpkgs\""));
+
+        // Should have inputsFrom with both devShells
+        assert!(flake_content.contains("inputsFrom"));
+        assert!(flake_content.contains("a.devShells."));
+        assert!(flake_content.contains("b.devShells."));
+    }
+
+    #[test]
+    fn test_generate_composite_flake_with_envrc() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let root = temp_dir.path();
+
+        let flake_root = root.join("nix");
+        let proj_a = root.join("projects/alpha");
+        fs::create_dir_all(&flake_root).unwrap();
+        fs::create_dir_all(&proj_a).unwrap();
+
+        let sources = vec![
+            (
+                "projects/alpha".to_string(),
+                FlakeSource::Envrc {
+                    flake_dir: flake_root.clone(),
+                    output: Some("alpha".to_string()),
+                },
+            ),
+            (
+                "projects/beta".to_string(),
+                FlakeSource::Local {
+                    flake_dir: root.join("projects/beta"),
+                },
+            ),
+        ];
+
+        // Create the beta dir so strip_prefix works
+        fs::create_dir_all(root.join("projects/beta")).unwrap();
+
+        let result = generate_composite_flake(root, &sources).unwrap();
+        assert!(matches!(result, FlakeSource::Local { .. }));
+
+        let flake_content = fs::read_to_string(root.join("flake.nix")).unwrap();
+
+        // Envrc source should point at the flake root, not the project dir
+        assert!(flake_content.contains("a.url = \"path:./nix\""));
+        // And use the named output
+        assert!(flake_content.contains("a.devShells."));
+        assert!(flake_content.contains(".alpha"));
+
+        // Local source uses project path directly
+        assert!(flake_content.contains("b.url = \"path:./projects/beta\""));
+        assert!(flake_content.contains("b.devShells."));
     }
 
     #[tokio::test]

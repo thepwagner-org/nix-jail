@@ -21,6 +21,7 @@ service_port = 3337
 # cd to /workspace so opencode picks it up as the project root (opencode uses $PWD)
 script = """
 #!/usr/bin/env bash
+set -x
 cd /workspace
 exec opencode serve --port 3337 --hostname 0.0.0.0 --print-logs
 """

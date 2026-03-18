@@ -43,6 +43,10 @@ pub struct ServerConfig {
     /// provides a set of tools.  Profiles reference shells by name via the `shell`
     /// field; the resolved store path is appended to the job's package list.
     pub shells: std::collections::HashMap<String, PathBuf>,
+    /// Domain used for generating git author emails in the sandbox.
+    /// When set and `git` is in the job closure, a `~/.gitconfig` is written with
+    /// `user.name = nix-jail[project]` and `user.email = nix-jail+project@<domain>`.
+    pub git_email_domain: Option<String>,
 }
 
 /// Type of credential for determining setup requirements
@@ -194,6 +198,7 @@ impl Default for ServerConfig {
             proxy_binary: None,
             profile_dir: None,
             shells: std::collections::HashMap::new(),
+            git_email_domain: None,
         }
     }
 }
@@ -459,6 +464,8 @@ struct ServerSection {
     proxy_binary: Option<String>,
     /// Directory containing job profile TOML files.
     profile_dir: Option<String>,
+    /// Domain for git author emails in sandboxes (e.g. "example.com").
+    git_email_domain: Option<String>,
 }
 
 impl Default for ServerSection {
@@ -475,6 +482,7 @@ impl Default for ServerSection {
             default_env: Vec::new(),
             proxy_binary: None,
             profile_dir: None,
+            git_email_domain: None,
         }
     }
 }
@@ -552,6 +560,7 @@ impl ServerConfig {
                 .into_iter()
                 .map(|(k, v)| (k, PathBuf::from(v)))
                 .collect(),
+            git_email_domain: config.server.git_email_domain,
         })
     }
 

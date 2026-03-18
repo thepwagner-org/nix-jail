@@ -7,6 +7,7 @@
 //!   subdomain requests so the backend is only hit once per asset.
 //! - Response hop-by-hop header stripping.
 
+use crate::cache::JobCache;
 use crate::util::{error_response, full_body, percent_decode, percent_encode, BoxedBody};
 use http_body_util::BodyExt;
 use hyper::body::{Bytes, Incoming};
@@ -47,28 +48,66 @@ pub fn new_asset_cache() -> AssetCache {
 // Backend lookup
 // ---------------------------------------------------------------------------
 
-/// Information about a job's backend, returned by [`lookup_job_backend`].
+/// Information about a ready job's backend.
 pub struct JobBackend {
+    /// Job ID.
+    pub job_id: String,
     /// Host:port of alice's reverse proxy for this job.
     pub addr: String,
     /// The job's `path` field (e.g. `"projects/nix-jail"`), if any.
     pub path: Option<String>,
 }
 
-/// Query nixjaild for a running job with the given subdomain.
+/// State of a subdomain as observed by an incoming request.
+pub enum SubdomainState {
+    /// Job is running and alice's reverse proxy port is bound — ready to serve.
+    Ready(JobBackend),
+    /// Job is running but alice hasn't bound its reverse proxy port yet.
+    Loading { job_id: String },
+    /// Job exited with a non-zero exit code or a setup error.
+    Failed { job_id: String },
+    /// Job exited successfully (exit code 0).
+    Completed { job_id: String },
+    /// No job with this subdomain exists.
+    NotFound,
+}
+
+/// Query the job cache (and, on miss, nixjaild) for the state of the given subdomain.
 ///
-/// Returns `None` when the job exists but the reverse proxy port isn't ready yet,
-/// or when no job matches the subdomain.
-pub async fn lookup_job_backend(
+/// Fast path: running jobs are served entirely from the in-process cache —
+/// no gRPC call required.
+///
+/// Slow path: when no running job matches (job is completed/failed or not yet
+/// known to the cache), falls back to a single `ListJobs` gRPC call to find
+/// terminal-state jobs.
+pub async fn lookup_subdomain(
+    cache: &JobCache,
     daemon: &str,
     subdomain: &str,
-) -> anyhow::Result<Option<JobBackend>> {
-    let mut client = JailServiceClient::connect(daemon.to_string()).await?;
+) -> anyhow::Result<SubdomainState> {
+    // Fast path: in-memory cache (no gRPC)
+    if let Some(job) = cache.lookup_subdomain(subdomain).await {
+        if let Some(port) = job.reverse_proxy_port {
+            return Ok(SubdomainState::Ready(JobBackend {
+                job_id: job.job_id,
+                addr: format!("127.0.0.1:{port}"),
+                path: job.path,
+            }));
+        }
+        warn!(
+            subdomain = %subdomain,
+            job_id = %job.job_id,
+            "job found in cache but reverse_proxy_port not set yet"
+        );
+        return Ok(SubdomainState::Loading { job_id: job.job_id });
+    }
 
+    // Slow path: completed/failed jobs are not in the cache; query the daemon
+    let mut client = JailServiceClient::connect(daemon.to_string()).await?;
     let resp = client
         .list_jobs(ListJobsRequest {
-            status: Some("running".to_string()),
-            limit: Some(100),
+            status: None,
+            limit: Some(500),
             offset: None,
         })
         .await?
@@ -76,23 +115,15 @@ pub async fn lookup_job_backend(
 
     for job in resp.jobs {
         if job.subdomain.as_deref() == Some(subdomain) {
-            if let Some(port) = job.reverse_proxy_port {
-                return Ok(Some(JobBackend {
-                    addr: format!("127.0.0.1:{port}"),
-                    path: job.path,
-                }));
-            }
-            // Job found but no reverse proxy port yet (still starting up)
-            warn!(
-                subdomain = %subdomain,
-                job_id = %job.job_id,
-                "job found but reverse_proxy_port not set yet"
-            );
-            return Ok(None);
+            return Ok(match job.status.as_str() {
+                "failed" => SubdomainState::Failed { job_id: job.job_id },
+                "completed" => SubdomainState::Completed { job_id: job.job_id },
+                _ => SubdomainState::Loading { job_id: job.job_id },
+            });
         }
     }
 
-    Ok(None)
+    Ok(SubdomainState::NotFound)
 }
 
 // ---------------------------------------------------------------------------

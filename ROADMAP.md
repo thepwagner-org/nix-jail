@@ -119,19 +119,17 @@ the refresh invalidated the old token (Anthropic does this), session B breaks.
 ### Options
 
 - **Shared credential file + alice file-watch**: alice re-reads credentials from
-  a shared file on each request (or inotify watch).  When it captures a refreshed
-  token, it writes it back to the shared file.  All alice instances re-read it
-  automatically.  Simplest approach for 1–3 sessions.
-
+a shared file on each request (or inotify watch).  When it captures a refreshed
+token, it writes it back to the shared file.  All alice instances re-read it
+automatically.  Simplest approach for 1–3 sessions.
 - **Credential broker in nixjaild**: nixjaild holds a `CredentialStore`.  alice
-  instances connect to a unix socket, report captured tokens, and query for
-  current tokens.  Nixjaild broadcasts updates.  Clean architecture but adds
-  a new IPC protocol between alice and nixjaild.
-
+instances connect to a unix socket, report captured tokens, and query for
+current tokens.  Nixjaild broadcasts updates.  Clean architecture but adds
+a new IPC protocol between alice and nixjaild.
 - **Writeback to opencode's `auth.json`**: alice writes the refreshed real token
-  back to the host's `~/.local/share/opencode/auth.json`.  All new sessions pick
-  up the fresh token on spawn.  Does not help sessions already running with the
-  old token.
+back to the host's `~/.local/share/opencode/auth.json`.  All new sessions pick
+up the fresh token on spawn.  Does not help sessions already running with the
+old token.
 
 For 1–3 concurrent sessions with Anthropic OAuth, the practical workaround is
 to restart the older session after a refresh occurs.

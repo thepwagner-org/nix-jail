@@ -8,15 +8,34 @@
 //! - Push branches to remote
 
 use super::WorkspaceError;
-use git2::{Cred, PushOptions, RemoteCallbacks, Repository};
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 
+/// Build a `git -C <repo_dir>` command that runs as the directory's owner.
+///
+/// The daemon runs as root, but workspaces are owned by the sandbox user.
+/// Running git as root triggers the safe.directory ownership check.  Since
+/// root can setuid to any UID, we simply drop to the workspace owner instead.
+fn git_cmd(repo_dir: &Path) -> Result<Command, WorkspaceError> {
+    let uid = std::fs::metadata(repo_dir)
+        .map_err(|e| {
+            WorkspaceError::IoError(std::io::Error::other(format!(
+                "failed to stat repo dir: {}",
+                e
+            )))
+        })?
+        .uid();
+
+    let mut cmd = Command::new("git");
+    let _ = cmd.uid(uid).arg("-C").arg(repo_dir);
+    Ok(cmd)
+}
+
 /// Get the current HEAD commit SHA
 pub fn get_head_commit(repo_dir: &Path) -> Result<String, WorkspaceError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
+    let output = git_cmd(repo_dir)?
         .arg("rev-parse")
         .arg("HEAD")
         .output()
@@ -41,9 +60,7 @@ pub fn get_head_commit(repo_dir: &Path) -> Result<String, WorkspaceError> {
 /// Get the current branch name
 /// Returns error if in detached HEAD state
 pub fn get_current_branch(repo_dir: &Path) -> Result<String, WorkspaceError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
+    let output = git_cmd(repo_dir)?
         .arg("branch")
         .arg("--show-current")
         .output()
@@ -76,9 +93,7 @@ pub fn create_and_checkout_branch(
     repo_dir: &Path,
     branch_name: &str,
 ) -> Result<(), WorkspaceError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
+    let output = git_cmd(repo_dir)?
         .arg("checkout")
         .arg("-b")
         .arg(branch_name)
@@ -110,9 +125,7 @@ pub fn get_commits_between(
 ) -> Result<Vec<String>, WorkspaceError> {
     let range = format!("{}..{}", old_sha, new_sha);
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
+    let output = git_cmd(repo_dir)?
         .arg("log")
         .arg("--format=%s")
         .arg(&range)
@@ -139,45 +152,65 @@ pub fn get_commits_between(
     Ok(commits)
 }
 
-/// Push a branch to remote using git2 library with authentication
-pub fn push_branch(repo_dir: &Path, branch: &str, token: &str) -> Result<(), WorkspaceError> {
-    let repo = Repository::open(repo_dir).map_err(|e| {
-        WorkspaceError::IoError(std::io::Error::other(format!(
-            "Failed to open repository: {}",
-            e
-        )))
-    })?;
+/// Push a branch to the remote using a subprocess git.
+///
+/// Authenticates via `https://git:{token}@host/repo` — the same pattern used
+/// by forgejo-nix-ci.  We avoid libgit2 here because it performs its own
+/// owner-validation check that fails when the daemon (root) opens a workspace
+/// owned by the sandbox user.
+pub fn push_branch(
+    repo_dir: &Path,
+    repo_url: &str,
+    branch: &str,
+    token: &str,
+) -> Result<(), WorkspaceError> {
+    // Embed credentials in the remote URL so that all git operations —
+    // including promisor-remote fetches that happen during push — use the
+    // same authenticated URL.  The workspace is disposable so we don't
+    // bother restoring the original URL.
+    // trufflehog:ignore
+    let auth_url = repo_url.replacen("https://", &format!("https://git:{}@", token), 1);
 
-    let mut remote = repo.find_remote("origin").map_err(|e| {
-        WorkspaceError::IoError(std::io::Error::other(format!(
-            "Failed to find origin remote: {}",
-            e
-        )))
-    })?;
-
-    // Set up authentication callback
-    let mut callbacks = RemoteCallbacks::new();
-    let token_owned = token.to_string();
-
-    let _ = callbacks.credentials(move |_url, username_from_url, _allowed_types| {
-        // HTTPS token auth: token as password (works for GitHub, Forgejo, Gitea)
-        Cred::userpass_plaintext(username_from_url.unwrap_or("git"), &token_owned)
-    });
-
-    let mut push_options = PushOptions::new();
-    let _ = push_options.remote_callbacks(callbacks);
-
-    // Push the branch
-    let refspec = format!("refs/heads/{}:refs/heads/{}", branch, branch);
-    remote
-        .push(&[&refspec], Some(&mut push_options))
+    let set_url_output = git_cmd(repo_dir)?
+        .arg("remote")
+        .arg("set-url")
+        .arg("origin")
+        .arg(&auth_url)
+        .output()
         .map_err(|e| {
             WorkspaceError::IoError(std::io::Error::other(format!(
-                "Failed to push branch: {}",
+                "failed to run git remote set-url: {}",
                 e
             )))
         })?;
 
-    tracing::info!(branch = %branch, "Pushed branch to remote");
+    if !set_url_output.status.success() {
+        return Err(WorkspaceError::IoError(std::io::Error::other(format!(
+            "git remote set-url failed: {}",
+            String::from_utf8_lossy(&set_url_output.stderr)
+        ))));
+    }
+
+    let refspec = format!("refs/heads/{}:refs/heads/{}", branch, branch);
+    let output = git_cmd(repo_dir)?
+        .arg("push")
+        .arg("origin")
+        .arg(&refspec)
+        .output()
+        .map_err(|e| {
+            WorkspaceError::IoError(std::io::Error::other(format!(
+                "failed to run git push: {}",
+                e
+            )))
+        })?;
+
+    if !output.status.success() {
+        return Err(WorkspaceError::IoError(std::io::Error::other(format!(
+            "git push failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))));
+    }
+
+    tracing::info!(branch = %branch, "pushed branch to remote");
     Ok(())
 }

@@ -16,6 +16,7 @@ use nix_jail::jail::{
     NetworkPattern, NetworkPolicy, NetworkRule,
 };
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use tracing::{error, info};
 
@@ -149,6 +150,18 @@ struct SubmitRequest {
     path: String,
     /// Git ref to check out (branch, tag, or commit SHA).  Defaults to HEAD.
     git_ref: Option<String>,
+    /// After successful execution, push commits to a new branch and open a PR.
+    push: Option<bool>,
+    /// Additional paths to include in sparse checkout (for multi-project sessions).
+    #[serde(default)]
+    extra_paths: Vec<String>,
+    /// Environment variables to set for this job.
+    #[serde(default)]
+    env: HashMap<String, String>,
+    /// Working directory relative to the workspace root (e.g. `"projects/meow"`).
+    cwd: Option<String>,
+    /// Skip filesystem cleanup after job exits (preserves root/ and workspace/ for inspection).
+    no_cleanup: Option<bool>,
 }
 
 pub async fn api_submit_job(
@@ -182,6 +195,7 @@ pub async fn api_submit_job(
     }
 
     let network_policy = build_network_policy(&parsed.hosts);
+    let base_subdomain = parsed.subdomain.clone();
 
     let job_req = JobRequest {
         script: parsed.script,
@@ -193,10 +207,15 @@ pub async fn api_submit_job(
         repo: parsed.repo.unwrap_or_default(),
         path: parsed.path,
         git_ref: parsed.git_ref,
+        push: parsed.push,
+        extra_paths: parsed.extra_paths,
+        env: parsed.env,
+        cwd: parsed.cwd,
+        no_cleanup: parsed.no_cleanup,
         ..Default::default()
     };
 
-    submit_job_request(daemon, job_req, None).await
+    submit_job_request(daemon, job_req, None, base_subdomain).await
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +321,7 @@ pub async fn api_retry_job(daemon: &str, job_id: &str) -> Result<Response<BoxedB
         ..Default::default()
     };
 
-    submit_job_request(daemon, job_req, Some(job_id)).await
+    submit_job_request(daemon, job_req, Some(job_id), None).await
 }
 
 // ---------------------------------------------------------------------------
@@ -333,12 +352,17 @@ fn build_network_policy(hosts: &[String]) -> Option<NetworkPolicy> {
     Some(NetworkPolicy { rules })
 }
 
-/// Submit a `JobRequest` and return a JSON response with the new `job_id`.
+/// Submit a `JobRequest` and return a JSON response with `job_id` and, when a
+/// base subdomain was requested, the server-assigned suffixed `subdomain`.
+///
 /// `original_job_id` is used only for log context (retry path).
+/// `base_subdomain` is the subdomain value from the HTTP request *before* the
+/// server appends its job-ID suffix — used to reconstruct the final name.
 async fn submit_job_request(
     daemon: &str,
     job_req: JobRequest,
     original_job_id: Option<&str>,
+    base_subdomain: Option<String>,
 ) -> Result<Response<BoxedBody>, Infallible> {
     let mut client = match JailServiceClient::connect(daemon.to_string()).await {
         Ok(c) => c,
@@ -363,10 +387,24 @@ async fn submit_job_request(
             } else {
                 info!(job_id = %new_job_id, "submitted job via web ui");
             }
+            // Reconstruct the final subdomain.  service.rs appends the last 6
+            // characters of the job ID (lowercased) to prevent collisions:
+            //   "{base}-{job_id[-6..].to_lowercase()}"
+            let subdomain_json = base_subdomain
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|base| {
+                    let n = new_job_id.len();
+                    let suffix = new_job_id[n.saturating_sub(6)..].to_ascii_lowercase();
+                    format!(",\"subdomain\":\"{base}-{suffix}\"")
+                })
+                .unwrap_or_default();
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(hyper::header::CONTENT_TYPE, "application/json")
-                .body(full_body(format!(r#"{{"job_id":"{new_job_id}"}}"#)))
+                .body(full_body(format!(
+                    r#"{{"job_id":"{new_job_id}"{subdomain_json}}}"#
+                )))
                 .unwrap_or_else(|_| {
                     error_response(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
                 }))

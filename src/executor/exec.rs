@@ -165,6 +165,44 @@ pub fn create_home_directory(
     Ok(())
 }
 
+/// Writes a `~/.gitconfig` in the sandbox home directory with a per-project
+/// git identity so agents don't have to invent one themselves.
+///
+/// # Arguments
+/// * `root_dir` - The root directory for the chroot
+/// * `sandbox_user` - Optional (user, group) tuple, same as `create_home_directory`
+/// * `project_name` - Used in the author name/email (e.g. `"meow"` -> `nix-jail[meow]`)
+/// * `email_domain` - Domain for the email address (e.g. `"example.com"`)
+pub fn create_gitconfig(
+    root_dir: &Path,
+    sandbox_user: Option<(&str, &str)>,
+    project_name: &str,
+    email_domain: &str,
+) -> std::io::Result<()> {
+    let user = sandbox_user.map(|(u, _)| u).unwrap_or("sandbox");
+    let home_dir = root_dir.join(format!("home/{}", user));
+
+    let (name, email) = if project_name.is_empty() {
+        ("nix-jail".to_string(), format!("nix-jail@{}", email_domain))
+    } else {
+        (
+            format!("nix-jail[{}]", project_name),
+            format!("nix-jail+{}@{}", project_name, email_domain),
+        )
+    };
+
+    let content = format!("[user]\n\tname = {}\n\temail = {}\n", name, email);
+
+    std::fs::write(home_dir.join(".gitconfig"), &content)?;
+
+    tracing::debug!(
+        name = %name,
+        email = %email,
+        "wrote sandbox .gitconfig"
+    );
+    Ok(())
+}
+
 /// Creates a minimal /etc/hosts with only localhost entries:
 /// - 127.0.0.1 localhost
 /// - ::1 localhost

@@ -660,6 +660,7 @@ async fn exec_job(
         subdomain: None,    // CLI doesn't support web routing yet
         service_port: None, // CLI doesn't support web routing yet
         profiles,
+        no_cleanup: None, // CLI doesn't support no_cleanup yet
     });
 
     let job_id = {
@@ -943,7 +944,7 @@ async fn run_local(
 
             // Compute cache key for volume name
             let cache_key =
-                CachedJobWorkspace::compute_cache_key(repo_url, &commit_sha, path.as_deref());
+                CachedJobWorkspace::compute_cache_key(repo_url, &commit_sha, path.as_deref(), &[]);
             let volume_name = format!("nix-jail-ws-{}", &cache_key[..16]);
 
             // Check if volume already exists (cache hit)
@@ -1190,6 +1191,7 @@ git checkout"#,
         insecure_credentials,
         otlp_endpoint,
         proxy_binary: None,
+        git_email_domain: None,
     };
 
     // Create executor and job root

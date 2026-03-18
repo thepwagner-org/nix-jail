@@ -109,6 +109,11 @@ message JobRequest {
   // wins. Additive fields (packages, env, network rules) accumulate across
   // all profiles. Explicit request fields always take precedence.
   repeated string profiles = 18;
+
+  // Skip filesystem cleanup after job exits (root/ and workspace/ are preserved).
+  // The job directory is logged at completion so you can inspect it.
+  // Intended for debugging — the daemon's startup GC will still sweep it on restart.
+  optional bool no_cleanup = 19;
 }
 
 // A credential provided by the client, valid only for this job
@@ -365,6 +370,34 @@ message GcResponse {
   uint32 deleted_count = 1;
 }
 
+// Request to stream global job lifecycle events.
+// On connect the server replays one event per currently-running job, then
+// sends a replay_complete sentinel, then streams live events as they occur.
+message StreamJobEventsRequest {}
+
+// A single job lifecycle event emitted on the global event stream.
+message JobLifecycleEvent {
+  // Event type:
+  //   "started"          — job registered and running (replay + live)
+  //   "port_ready"       — alice reverse proxy port is now known
+  //   "stopped"          — job removed from registry (completed, failed, or cancelled)
+  //   "replay_complete"  — sentinel after replaying all running jobs on connect
+  string event_type = 1;
+
+  // Job identifier (always set except for replay_complete).
+  string job_id = 2;
+
+  // DNS subdomain label for web routing (mirrors JobRequest.subdomain).
+  optional string subdomain = 3;
+
+  // Port of alice's reverse proxy listener on the host.
+  // Only set for port_ready events.
+  optional uint32 reverse_proxy_port = 4;
+
+  // Path within the repository (mirrors JobRequest.path).
+  optional string path = 5;
+}
+
 // The jail service for managing sandboxed jobs
 service JailService {
   // Submit a new job and get back a job ID
@@ -381,4 +414,9 @@ service JailService {
 
   // Run garbage collection to clear the cache
   rpc Gc(GcRequest) returns (GcResponse);
+
+  // Stream global job lifecycle events (started, stopped, port_ready).
+  // On connect: replays one event per running job, then sends replay_complete,
+  // then streams live events until the client disconnects.
+  rpc StreamJobEvents(StreamJobEventsRequest) returns (stream JobLifecycleEvent);
 }

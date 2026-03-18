@@ -1,10 +1,10 @@
-//! HTML page renderers for the home subdomain.
+//! HTML page renderers for the home subdomain and subdomain status pages.
 //!
 //! Each function returns a complete HTML document as a hyper response.
 //! Dynamic data is substituted via simple string replacement into static
 //! template constants — no templating engine required.
 
-use crate::util::{error_response, full_body, BoxedBody};
+use crate::util::{error_response, full_body, BoxedBody, LogLine};
 use hyper::{Response, StatusCode};
 use std::convert::Infallible;
 use tracing::error;
@@ -760,4 +760,262 @@ es.onerror = () => { es.close(); };
         .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
         .body(full_body(html))
         .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "render failed")))
+}
+
+// ---------------------------------------------------------------------------
+// Subdomain status pages (loading / failed / completed)
+// ---------------------------------------------------------------------------
+
+/// Shared CSS variables for subdomain status pages.
+const STATUS_CSS_VARS: &str = r#"
+  *, *::before, *::after { box-sizing: border-box; }
+  :root {
+    --bg:      #000000;
+    --surface: #111116;
+    --border:  #222228;
+    --fg:      #c8c8d0;
+    --muted:   #60606a;
+    --purple:  #7c6af7;
+    --green:   #5dbf5d;
+    --red:     #d9534f;
+    --font:    "SF Mono", "Cascadia Code", "Fira Code", ui-monospace, monospace;
+  }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--fg);
+    font-family: var(--font); font-size: 13px; line-height: 1.6;
+  }
+  a { color: var(--purple); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+"#;
+
+/// Escape a string for safe embedding in HTML text content.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Map a log source label to a CSS class name.
+fn log_class(source: &str) -> &'static str {
+    match source {
+        "stderr" => "log-stderr",
+        "proxy" => "log-proxy",
+        "system" => "log-system",
+        _ => "log-stdout",
+    }
+}
+
+/// Render a slice of `LogLine`s as HTML `<span>` elements.
+fn render_log_lines(logs: &[LogLine]) -> String {
+    if logs.is_empty() {
+        return r#"<span class="log-system">(no output)</span>"#.to_owned();
+    }
+    logs.iter()
+        .map(|line| {
+            let cls = log_class(line.source);
+            let escaped = html_escape(&line.content);
+            format!(r#"<span class="{cls}">{escaped}</span>"#)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// GET {subdomain}.{base} — loading page (job starting up)
+// ---------------------------------------------------------------------------
+
+/// Serve a dark-mode "starting…" spinner page for a job whose backend isn't
+/// ready yet. Polls `/.well-known/nj/status` every 2 s and redirects to `/`
+/// when the job transitions to the ready state.
+pub fn loading_page(subdomain: &str, job_id: &str, home_base: &str) -> Response<BoxedBody> {
+    static HTML: &str = r###"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>starting · __SUBDOMAIN__</title>
+<style>
+__STATUS_CSS_VARS__
+  .page {
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; min-height: 100vh; gap: 1.5rem; padding: 2rem;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner {
+    width: 36px; height: 36px;
+    border: 3px solid var(--border);
+    border-top-color: var(--purple);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+  .label { color: var(--muted); font-size: .85rem; }
+  .subdomain { color: var(--purple); }
+  .log-link { font-size: .8rem; color: var(--muted); }
+  .log-link a { color: var(--muted); }
+  .log-link a:hover { color: var(--purple); }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="spinner"></div>
+  <div class="label">starting <span class="subdomain">__SUBDOMAIN__</span>&hellip;</div>
+  <div class="log-link"><a href="__HOME_BASE__/logs/__JOB_ID__">view logs</a></div>
+</div>
+<script>
+(function() {
+  var POLL_MS = 2000;
+  function poll() {
+    fetch('/.well-known/nj/status', { redirect: 'follow' })
+      .then(function(r) {
+        if (r.status === 200) {
+          return r.json().then(function(d) {
+            if (d.state === 'loading') { setTimeout(poll, POLL_MS); return; }
+            if (d.state === 'failed' || d.state === 'completed') { location.reload(); return; }
+            // ready or unknown state — redirect to the app
+            location.replace('/');
+          }).catch(function() {
+            // 200 but not JSON — backend is up and proxied the request
+            location.replace('/');
+          });
+        }
+        if (r.status === 502) {
+          // daemon temporarily unreachable, keep waiting
+          setTimeout(poll, POLL_MS);
+          return;
+        }
+        // 404 or other — request was proxied to the backend (job is ready)
+        location.replace('/');
+      })
+      .catch(function() {
+        // network error — try redirecting, might be ready
+        location.replace('/');
+      });
+  }
+  setTimeout(poll, POLL_MS);
+})();
+</script>
+</body>
+</html>
+"###;
+
+    let html = HTML
+        .replace("__STATUS_CSS_VARS__", STATUS_CSS_VARS)
+        .replace("__SUBDOMAIN__", subdomain)
+        .replace("__JOB_ID__", job_id)
+        .replace("__HOME_BASE__", home_base);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .body(full_body(html))
+        .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "render failed"))
+}
+
+// ---------------------------------------------------------------------------
+// GET {subdomain}.{base} — terminal pages (failed / completed)
+// ---------------------------------------------------------------------------
+
+/// Shared HTML skeleton for failed and completed job pages.
+///
+/// Placeholders: `__SUBDOMAIN__`, `__JOB_ID__`, `__HOME_BASE__`,
+/// `__DOT_CLASS__`, `__STATUS_LABEL__`, `__STATUS_CSS__`, `__LOG_LINES__`.
+static TERMINAL_HTML: &str = r###"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__STATUS_LABEL__ · __SUBDOMAIN__</title>
+<style>
+__STATUS_CSS_VARS__
+  .page { max-width: 900px; margin: 0 auto; padding: 2rem 1.5rem; }
+  .header { display: flex; align-items: center; gap: .75rem; margin-bottom: 1.5rem; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+  .dot-failed    { background: var(--red); }
+  .dot-completed { background: var(--green); }
+  .title { font-size: .95rem; }
+  .subdomain { color: var(--purple); }
+  .status-label { font-size: .8rem; __STATUS_CSS__ }
+  .log-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 4px; padding: 1rem 1.25rem;
+    overflow-x: auto; margin-bottom: 1.5rem;
+    font-size: .8rem; line-height: 1.5;
+  }
+  .log-box span { display: block; white-space: pre; }
+  .log-stdout { color: var(--fg); }
+  .log-stderr { color: #d98047; }
+  .log-proxy  { color: #4a9dd4; }
+  .log-system { color: var(--muted); }
+  .links { font-size: .8rem; display: flex; gap: 1.5rem; }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="header">
+    <div class="dot __DOT_CLASS__"></div>
+    <div class="title">
+      <span class="subdomain">__SUBDOMAIN__</span>
+      <span class="status-label">__STATUS_LABEL__</span>
+    </div>
+  </div>
+  <div class="log-box">__LOG_LINES__</div>
+  <div class="links">
+    <a href="__HOME_BASE__/logs/__JOB_ID__">full log viewer &rarr;</a>
+    <a href="__HOME_BASE__">home &rarr;</a>
+  </div>
+</div>
+</body>
+</html>
+"###;
+
+/// Render a page for a job that exited with a non-zero code or setup error.
+pub fn failed_page(
+    subdomain: &str,
+    job_id: &str,
+    logs: &[LogLine],
+    home_base: &str,
+) -> Response<BoxedBody> {
+    let html = TERMINAL_HTML
+        .replace("__STATUS_CSS_VARS__", STATUS_CSS_VARS)
+        .replace("__SUBDOMAIN__", subdomain)
+        .replace("__JOB_ID__", job_id)
+        .replace("__HOME_BASE__", home_base)
+        .replace("__DOT_CLASS__", "dot-failed")
+        .replace("__STATUS_LABEL__", "failed")
+        .replace("__STATUS_CSS__", "color: var(--red);")
+        .replace("__LOG_LINES__", &render_log_lines(logs));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .body(full_body(html))
+        .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "render failed"))
+}
+
+/// Render a page for a job that exited with code 0.
+pub fn completed_page(
+    subdomain: &str,
+    job_id: &str,
+    logs: &[LogLine],
+    home_base: &str,
+) -> Response<BoxedBody> {
+    let html = TERMINAL_HTML
+        .replace("__STATUS_CSS_VARS__", STATUS_CSS_VARS)
+        .replace("__SUBDOMAIN__", subdomain)
+        .replace("__JOB_ID__", job_id)
+        .replace("__HOME_BASE__", home_base)
+        .replace("__DOT_CLASS__", "dot-completed")
+        .replace("__STATUS_LABEL__", "completed")
+        .replace("__STATUS_CSS__", "color: var(--green);")
+        .replace("__LOG_LINES__", &render_log_lines(logs));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(hyper::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .body(full_body(html))
+        .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "render failed"))
 }

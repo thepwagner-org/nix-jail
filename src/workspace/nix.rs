@@ -505,6 +505,60 @@ pub async fn compute_combined_closure(
     .await
 }
 
+/// Check if a store path is a nix-shell env file (single file, not a directory).
+///
+/// `pkgs.mkShell` produces a single-file derivation at the store path itself
+/// (e.g. `/nix/store/<hash>-nix-shell`). These files contain `declare -x`
+/// assignments and are NOT directories with a `bin/` subdirectory, so they
+/// must be handled differently from normal package derivations.
+pub fn is_nix_shell_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.ends_with("-nix-shell"))
+            .unwrap_or(false)
+}
+
+/// Parse a nix-shell env file and extract the `buildInputs` store paths.
+///
+/// A nix-shell file (produced by `pkgs.mkShell`) contains lines like:
+/// ```text
+/// declare -x buildInputs="/nix/store/AAA-foo /nix/store/BBB-bar"
+/// ```
+/// This function reads that line and returns the space-separated store paths.
+/// Returns an empty vec if the line is absent or cannot be parsed.
+pub fn expand_nix_shell_file(path: &Path) -> Vec<PathBuf> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "failed to read nix-shell file");
+            return vec![];
+        }
+    };
+
+    for line in content.lines() {
+        // Match: declare -x buildInputs="..."
+        let stripped = line
+            .trim()
+            .strip_prefix("declare -x buildInputs=\"")
+            .and_then(|s| s.strip_suffix('"'));
+        if let Some(value) = stripped {
+            return value
+                .split_whitespace()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect();
+        }
+    }
+
+    tracing::warn!(
+        path = %path.display(),
+        "nix-shell file has no buildInputs line; no packages extracted"
+    );
+    vec![]
+}
+
 /// Build a PATH environment variable from multiple package store paths
 ///
 /// Appends /bin to each store path and joins with colons.
@@ -647,4 +701,55 @@ pub fn find_shell(store_paths: &[PathBuf]) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_expand_nix_shell_file_parses_build_inputs() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmp,
+            r#"declare -x HOME="/homeless-shelter"
+declare -x buildInputs="/nix/store/aaa-opencode /nix/store/bbb-zsh /nix/store/ccc-git"
+declare -x name="nix-shell"
+"#
+        )
+        .unwrap();
+
+        let paths = expand_nix_shell_file(tmp.path());
+        assert_eq!(paths.len(), 3);
+        assert_eq!(paths[0], PathBuf::from("/nix/store/aaa-opencode"));
+        assert_eq!(paths[1], PathBuf::from("/nix/store/bbb-zsh"));
+        assert_eq!(paths[2], PathBuf::from("/nix/store/ccc-git"));
+    }
+
+    #[test]
+    fn test_expand_nix_shell_file_missing_build_inputs() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, r#"declare -x name="nix-shell""#).unwrap();
+
+        let paths = expand_nix_shell_file(tmp.path());
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_is_nix_shell_file_detects_single_file() {
+        let mut tmp = tempfile::Builder::new()
+            .suffix("-nix-shell")
+            .tempfile()
+            .unwrap();
+        write!(tmp, "content").unwrap();
+        assert!(is_nix_shell_file(tmp.path()));
+    }
+
+    #[test]
+    fn test_is_nix_shell_file_rejects_non_nix_shell_name() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, "content").unwrap();
+        assert!(!is_nix_shell_file(tmp.path()));
+    }
 }

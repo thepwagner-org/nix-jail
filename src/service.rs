@@ -9,7 +9,8 @@ use crate::cache::CacheManager;
 use crate::config;
 use crate::jail::jail_service_server::JailService;
 use crate::jail::{
-    CancelJobRequest, CancelJobResponse, JobRequest, JobResponse, LogEntry, StreamRequest,
+    CancelJobRequest, CancelJobResponse, JobLifecycleEvent, JobRequest, JobResponse, LogEntry,
+    StreamJobEventsRequest, StreamRequest,
 };
 use crate::job_workspace::JobWorkspace;
 use crate::orchestration;
@@ -217,6 +218,7 @@ impl JailService for JailServiceImpl {
             cwd: req.cwd.clone(),
             subdomain: req.subdomain.clone(),
             service_port: req.service_port,
+            no_cleanup: req.no_cleanup.unwrap_or(false),
             status: JobStatus::Running,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -296,19 +298,15 @@ impl JailService for JailServiceImpl {
             .instrument(exec_span),
         );
 
-        // Register the running job and get the broadcast sender
-        // Note: register creates its own channel, but we need to use our own
-        // so we have the sender to pass to execute_job. We'll need to refactor this.
-        // For now, let's manually insert into the registry.
-        use crate::job_registry::RunningJob;
-        let running_job = RunningJob {
-            log_tx,
-            task_handle,
-            reverse_proxy_port: None, // set later by execute_job after alice starts
-            subdomain: req.subdomain.clone(),
+        // Register the running job and emit a lifecycle "started" event.
+        let job_path = if req.path.is_empty() || req.path == "." {
+            None
+        } else {
+            Some(req.path.clone())
         };
-        let mut jobs = this.registry.jobs.write().await;
-        let _ = jobs.insert(job_id.clone(), running_job);
+        this.registry
+            .register_job(job_id.clone(), log_tx, task_handle, req.subdomain.clone(), job_path)
+            .await;
 
         Ok(Response::new(JobResponse {
             job_id,
@@ -625,6 +623,91 @@ impl JailService for JailServiceImpl {
         Ok(Response::new(crate::jail::GcResponse {
             deleted_count: total_deleted as u32,
         }))
+    }
+
+    type StreamJobEventsStream =
+        tokio_stream::wrappers::ReceiverStream<Result<JobLifecycleEvent, Status>>;
+
+    async fn stream_job_events(
+        &self,
+        request: Request<StreamJobEventsRequest>,
+    ) -> Result<Response<Self::StreamJobEventsStream>, Status> {
+        let parent_context = extract_trace_context(&request);
+        let span = tracing::info_span!("grpc.stream_job_events");
+        let _ = span.set_parent(parent_context);
+        let _guard = span.enter();
+
+        tracing::info!("job events stream connected");
+
+        // Subscribe to the lifecycle broadcast BEFORE taking a snapshot so we
+        // don't miss events that fire between the snapshot and the loop start.
+        let mut lifecycle_rx = self.registry.subscribe_lifecycle();
+
+        // Snapshot currently-running jobs for the replay burst.
+        let running = self.registry.snapshot_running_jobs().await;
+        let replay_ids: std::collections::HashSet<String> =
+            running.iter().map(|(id, ..)| id.clone()).collect();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(config::CHANNEL_BUFFER_SIZE);
+
+        drop(tokio::spawn(async move {
+            // 1. Replay all running jobs
+            for (job_id, subdomain, reverse_proxy_port, path) in running {
+                let event = JobLifecycleEvent {
+                    event_type: "started".to_string(),
+                    job_id,
+                    subdomain,
+                    reverse_proxy_port: reverse_proxy_port.map(|p| p as u32),
+                    path,
+                };
+                if tx.send(Ok(event)).await.is_err() {
+                    return; // client disconnected during replay
+                }
+            }
+
+            // 2. Sentinel: client can now reconcile
+            if tx
+                .send(Ok(JobLifecycleEvent {
+                    event_type: "replay_complete".to_string(),
+                    job_id: String::new(),
+                    subdomain: None,
+                    reverse_proxy_port: None,
+                    path: None,
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            // 3. Stream live events, deduplicating starts already in the replay
+            loop {
+                match lifecycle_rx.recv().await {
+                    Ok(event) => {
+                        // Skip "started" events for jobs already replayed to avoid
+                        // double-open on the client side for jobs that started just
+                        // before we subscribed but were captured in the snapshot.
+                        if event.event_type == "started" && replay_ids.contains(&event.job_id) {
+                            continue;
+                        }
+                        if tx.send(Ok(event)).await.is_err() {
+                            break; // client disconnected
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "job events stream lagged, skipping events");
+                        // continue — client will re-connect and get a fresh replay
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break; // registry dropped, daemon shutting down
+                    }
+                }
+            }
+        }));
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn cancel_job(

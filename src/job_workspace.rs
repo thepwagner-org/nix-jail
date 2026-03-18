@@ -177,8 +177,14 @@ impl CachedJobWorkspace {
     /// Compute cache key for a git clone/checkout
     ///
     /// When path is provided, includes it in the hash (for sparse checkouts).
-    /// This ensures different sparse paths have different cache entries.
-    pub fn compute_cache_key(repo: &str, commit_sha: &str, path: Option<&str>) -> String {
+    /// Extra paths are also included so that different sparse path sets get
+    /// different cache entries.
+    pub fn compute_cache_key(
+        repo: &str,
+        commit_sha: &str,
+        path: Option<&str>,
+        extra_paths: &[String],
+    ) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(repo.as_bytes());
@@ -187,6 +193,14 @@ impl CachedJobWorkspace {
         if let Some(p) = path {
             hasher.update(b"\n");
             hasher.update(p.as_bytes());
+        }
+        if !extra_paths.is_empty() {
+            let mut sorted: Vec<&str> = extra_paths.iter().map(|s| s.as_str()).collect();
+            sorted.sort();
+            for p in sorted {
+                hasher.update(b"\n");
+                hasher.update(p.as_bytes());
+            }
         }
         format!("{:x}", hasher.finalize())
     }
@@ -361,8 +375,12 @@ impl JobWorkspace for CachedJobWorkspace {
 
         // Step 2: Determine cache key and strategy
         let use_sparse = self.use_sparse_checkout(path);
-        let cache_key =
-            Self::compute_cache_key(repo, &commit_sha, if use_sparse { path } else { None });
+        let cache_key = Self::compute_cache_key(
+            repo,
+            &commit_sha,
+            if use_sparse { path } else { None },
+            if use_sparse { extra_paths } else { &[] },
+        );
 
         tracing::info!(
             repo = %repo,

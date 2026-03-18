@@ -82,6 +82,9 @@ pub struct JobMetadata {
     /// Port the job's web service listens on inside the sandbox
     #[serde(default)]
     pub service_port: Option<u32>,
+    /// Skip filesystem cleanup after job exits (preserves root/ and workspace/)
+    #[serde(default)]
+    pub no_cleanup: bool,
     pub status: JobStatus,
     pub created_at: SystemTime,
     pub completed_at: Option<SystemTime>,
@@ -404,6 +407,7 @@ impl JobStorage {
                     cwd: None,           // Legacy jobs don't have cwd
                     subdomain: None,     // Legacy jobs don't have subdomain
                     service_port: None,  // Legacy jobs don't have service_port
+                    no_cleanup: false,   // Legacy jobs default to normal cleanup
                     status: JobStatus::from_string(&status_str)?,
                     created_at: SystemTime::UNIX_EPOCH
                         + std::time::Duration::from_secs(created_at_secs as u64),
@@ -632,6 +636,7 @@ impl JobStorage {
             cwd: None,           // Legacy jobs don't have cwd
             subdomain: None,     // Legacy jobs don't have subdomain
             service_port: None,  // Legacy jobs don't have service_port
+            no_cleanup: false,   // Legacy jobs default to normal cleanup
             status,
             created_at,
             completed_at,
@@ -1014,6 +1019,7 @@ mod tests {
             cwd: None,
             subdomain: None,
             service_port: None,
+            no_cleanup: false,
             status: JobStatus::Pending,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -1055,6 +1061,7 @@ mod tests {
             cwd: None,
             subdomain: None,
             service_port: None,
+            no_cleanup: false,
             status: JobStatus::Pending,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -1092,6 +1099,7 @@ mod tests {
             cwd: None,
             subdomain: None,
             service_port: None,
+            no_cleanup: false,
             status: JobStatus::Running,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -1143,6 +1151,7 @@ mod tests {
             cwd: None,
             subdomain: None,
             service_port: None,
+            no_cleanup: false,
             status: JobStatus::Running,
             created_at: SystemTime::now(),
             completed_at: None,
@@ -1193,6 +1202,7 @@ mod tests {
             cwd: None,
             subdomain: None,
             service_port: None,
+            no_cleanup: false,
             status: JobStatus::Pending,
             created_at: SystemTime::now(),
             completed_at: None,
