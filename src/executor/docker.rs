@@ -293,6 +293,40 @@ impl DockerExecutor {
         Ok(())
     }
 
+    /// Ensure Docker image is pulled before running a container.
+    ///
+    /// Separates image pull from `docker run` so that:
+    /// - Pull progress output doesn't pollute command stderr
+    /// - Execution timeout only covers actual command runtime, not download time
+    async fn ensure_image(&self, image: &str) -> Result<(), ExecutorError> {
+        let status = Command::new("docker")
+            .args(["image", "inspect", image])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map_err(|e| ExecutorError::SpawnFailed(format!("docker image inspect: {}", e)))?;
+
+        if !status.success() {
+            tracing::info!(image = %image, "pulling docker image");
+            let status = Command::new("docker")
+                .args(["pull", "--quiet", image])
+                .stdout(Stdio::null())
+                .status()
+                .await
+                .map_err(|e| ExecutorError::SpawnFailed(format!("docker pull: {}", e)))?;
+
+            if !status.success() {
+                return Err(ExecutorError::SpawnFailed(format!(
+                    "failed to pull docker image '{}'",
+                    image
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Get the gateway IP of the Docker network for proxy access
     #[allow(dead_code)] // Used in tests; may be used for dynamic gateway discovery
     async fn get_network_gateway(&self) -> Result<String, ExecutorError> {
@@ -553,6 +587,11 @@ impl Executor for DockerExecutor {
             crate::root::StoreSetup::DockerVolume { .. } => "busybox",
             _ => "nixos/nix:latest",
         };
+
+        // Pre-pull image so pull progress doesn't pollute stderr and
+        // download time doesn't eat into the execution timeout
+        self.ensure_image(base_image).await?;
+
         docker_args.push(base_image.to_string());
 
         // Command to execute
