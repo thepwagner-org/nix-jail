@@ -205,6 +205,37 @@ pub fn generate_composite_flake(
         "generate_composite_flake called with no sources"
     );
 
+    // Check if any source's flake_dir resolves to workspace_root itself.
+    // If so, writing the wrapper to workspace_root/flake.nix would overwrite
+    // the original and create a circular `path:./` import.  Instead, write
+    // the wrapper to a sibling directory outside the git tree.
+    let any_source_is_root = sources.iter().any(|(_, source)| {
+        let flake_dir = match source {
+            FlakeSource::Local { flake_dir } => flake_dir,
+            FlakeSource::Envrc { flake_dir, .. } => flake_dir,
+        };
+        flake_dir == workspace_root
+    });
+
+    let (wrapper_dir, use_absolute) = if any_source_is_root {
+        let parent = workspace_root.parent().ok_or_else(|| {
+            WorkspaceError::IoError(std::io::Error::other(
+                "workspace_root has no parent directory",
+            ))
+        })?;
+        let wrapper = parent.join("composite");
+        fs::create_dir_all(&wrapper).map_err(WorkspaceError::IoError)?;
+
+        // Wrapper lives outside the workspace tree. Nix copies the flake
+        // directory to the store before evaluating, so relative paths like
+        // `../workspace` would resolve against /nix/store/<hash>-source/
+        // rather than the filesystem. Use absolute paths instead — Nix
+        // fetches `path:/absolute/...` inputs from the host before eval.
+        (wrapper, true)
+    } else {
+        (workspace_root.to_path_buf(), false)
+    };
+
     let system = get_system_arch();
 
     // Build input declarations and devShell references
@@ -233,7 +264,25 @@ pub fn generate_composite_flake(
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| PathBuf::from(path));
 
-        input_lines.push(format!("    {label}.url = \"path:./{}\";", rel.display()));
+        // When the wrapper lives outside the workspace, use absolute paths
+        // so Nix resolves them on the host filesystem before copying to the
+        // store. Relative paths like `../workspace` would break because Nix
+        // evaluates them relative to the store copy.
+        let input_path = if use_absolute {
+            if rel.as_os_str().is_empty() {
+                workspace_root.to_path_buf()
+            } else {
+                workspace_root.join(&rel)
+            }
+        } else {
+            // Wrapper is at workspace root — use ./ + rel (safe: inputs are inside the flake tree)
+            PathBuf::from(".").join(&rel)
+        };
+
+        input_lines.push(format!(
+            "    {label}.url = \"path:{}\";",
+            input_path.display()
+        ));
 
         let output_name = match source {
             FlakeSource::Envrc { output, .. } => output.as_deref().unwrap_or("default"),
@@ -275,7 +324,7 @@ pub fn generate_composite_flake(
 }}"#
     );
 
-    let flake_path = workspace_root.join("flake.nix");
+    let flake_path = wrapper_dir.join("flake.nix");
     fs::write(&flake_path, &flake_content).map_err(|e| {
         WorkspaceError::IoError(std::io::Error::other(format!(
             "failed to write composite flake.nix: {}",
@@ -290,7 +339,7 @@ pub fn generate_composite_flake(
     );
 
     Ok(FlakeSource::Local {
-        flake_dir: workspace_root.to_path_buf(),
+        flake_dir: wrapper_dir,
     })
 }
 
@@ -744,6 +793,150 @@ mod tests {
         // Local source uses project path directly
         assert!(flake_content.contains("b.url = \"path:./projects/beta\""));
         assert!(flake_content.contains("b.devShells."));
+    }
+
+    #[test]
+    fn test_generate_composite_flake_avoids_circular_root_import() {
+        // Reproduces the circular import bug: when extra_paths have .envrc
+        // pointing back to the workspace root (e.g. `use flake ../..#media`),
+        // the composite wrapper must NOT be written to workspace_root/flake.nix
+        // because the input `path:./` would reference the wrapper itself.
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+        // Simulate job directory: {base}/workspace/
+        let base = temp_dir.path().join("job-base");
+        let workspace = base.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        // Write an original root flake.nix (this should NOT be overwritten)
+        fs::write(workspace.join("flake.nix"), "{ /* original root flake */ }").unwrap();
+
+        // Both sources point at workspace root with different outputs
+        // (monorepo pattern: projects/media/.envrc → use flake ../..#media)
+        let sources = vec![
+            (
+                "projects/media".to_string(),
+                FlakeSource::Envrc {
+                    flake_dir: workspace.clone(),
+                    output: Some("media".to_string()),
+                },
+            ),
+            (
+                "projects/typedown".to_string(),
+                FlakeSource::Envrc {
+                    flake_dir: workspace.clone(),
+                    output: Some("typedown".to_string()),
+                },
+            ),
+        ];
+
+        let result = generate_composite_flake(&workspace, &sources).unwrap();
+
+        // Wrapper should be written to a sibling directory, not workspace root
+        match &result {
+            FlakeSource::Local { flake_dir } => {
+                assert_ne!(
+                    flake_dir, &workspace,
+                    "wrapper must not be at workspace root"
+                );
+                assert_eq!(flake_dir, &base.join("composite"));
+            }
+            _ => panic!("expected FlakeSource::Local"),
+        }
+
+        // Original root flake.nix should be preserved
+        let original = fs::read_to_string(workspace.join("flake.nix")).unwrap();
+        assert!(
+            original.contains("original root flake"),
+            "root flake.nix was overwritten"
+        );
+
+        // Wrapper should use absolute paths to the workspace, not relative paths
+        // that would break when Nix copies the flake to the store
+        let wrapper = fs::read_to_string(base.join("composite/flake.nix")).unwrap();
+        assert!(
+            !wrapper.contains("path:./"),
+            "wrapper must not self-reference: {}",
+            wrapper
+        );
+        assert!(
+            !wrapper.contains("path:../"),
+            "wrapper must not use relative paths outside its tree: {}",
+            wrapper
+        );
+        let ws_str = workspace.display().to_string();
+        assert!(
+            wrapper.contains(&format!("path:{ws_str}")),
+            "wrapper should reference workspace via absolute path: {}",
+            wrapper
+        );
+
+        // Both outputs should be referenced
+        assert!(
+            wrapper.contains(".media"),
+            "missing media output: {}",
+            wrapper
+        );
+        assert!(
+            wrapper.contains(".typedown"),
+            "missing typedown output: {}",
+            wrapper
+        );
+    }
+
+    #[test]
+    fn test_generate_composite_flake_mixed_root_and_local() {
+        // One source at workspace root (via envrc), one with a local flake
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let base = temp_dir.path().join("job-base");
+        let workspace = base.join("workspace");
+        let proj_local = workspace.join("projects/local-proj");
+        fs::create_dir_all(&proj_local).unwrap();
+
+        // Write original root flake
+        fs::write(workspace.join("flake.nix"), "{ /* root */ }").unwrap();
+
+        let sources = vec![
+            (
+                "projects/media".to_string(),
+                FlakeSource::Envrc {
+                    flake_dir: workspace.clone(),
+                    output: Some("media".to_string()),
+                },
+            ),
+            (
+                "projects/local-proj".to_string(),
+                FlakeSource::Local {
+                    flake_dir: proj_local.clone(),
+                },
+            ),
+        ];
+
+        let result = generate_composite_flake(&workspace, &sources).unwrap();
+
+        // Should redirect to composite dir since one source is at root
+        match &result {
+            FlakeSource::Local { flake_dir } => {
+                assert_eq!(flake_dir, &base.join("composite"));
+            }
+            _ => panic!("expected FlakeSource::Local"),
+        }
+
+        let wrapper = fs::read_to_string(base.join("composite/flake.nix")).unwrap();
+        let ws_str = workspace.display().to_string();
+
+        // Root source: absolute path to workspace
+        assert!(
+            wrapper.contains(&format!("path:{ws_str}\"")),
+            "root source path wrong: {}",
+            wrapper
+        );
+        // Local source: absolute path to workspace/projects/local-proj
+        assert!(
+            wrapper.contains(&format!("path:{ws_str}/projects/local-proj")),
+            "local source path wrong: {}",
+            wrapper
+        );
     }
 
     #[tokio::test]
